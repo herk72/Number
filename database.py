@@ -109,6 +109,16 @@ async def mark_session_invalid(phone: str):
         )
         await db.commit()
 
+# --- الدالة التي تمت إضافتها من الكود الثاني ---
+async def delete_session(phone: str):
+    """دالة الحذف النهائي للجلسة من قاعدة البيانات"""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "DELETE FROM sessions WHERE phone=?", (phone,)
+        )
+        await db.commit()
+# ----------------------------------------------
+
 
 async def update_session_username(phone: str, username: str):
     async with aiosqlite.connect(DB_PATH) as db:
