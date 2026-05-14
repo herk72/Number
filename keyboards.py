@@ -83,8 +83,11 @@ def sessions_keyboard(
         except Exception:
             valid = True
         label = f"{'✅' if valid else '❌'} {phone}"
+        
+        # --- الإضافة من الكود الثاني: زر الحذف بجانب كل جلسة ---
         buttons.append([
-            InlineKeyboardButton(text=label, callback_data=f"session_{phone}")
+            InlineKeyboardButton(text=label, callback_data=f"session_{phone}"),
+            InlineKeyboardButton(text="🗑", callback_data=f"del_session_{phone}")
         ])
 
     # أزرار التنقل بين الصفحات
@@ -100,11 +103,19 @@ def sessions_keyboard(
     if nav:
         buttons.append(nav)
 
-    # زر تصفير الذاكرة — موجود في الكود الأول، مفقود في الثاني
+    # زر تصفير الذاكرة — موجود في الكود الأول
     buttons.append([
         InlineKeyboardButton(
             text="♻️ تصفير ذاكرة العمليات",
             callback_data="reset_mail_mem"
+        )
+    ])
+    
+    # --- الإضافة من الكود الثاني: زر سحب الجلسات كملف TXT ---
+    buttons.append([
+        InlineKeyboardButton(
+            text="📥 سحب كل الجلسات (TXT)", 
+            callback_data="export_all_txt"
         )
     ])
 
