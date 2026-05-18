@@ -182,13 +182,53 @@ async def can_admin_access_session(admin_id: int, phone: str, super_admin_id: in
     return not row_flag(session, "a1_only")
 
 
-async def get_session_by_phone(phone: str):
+def normalize_phone(phone: str) -> str:
+    p = (phone or "").strip().replace(" ", "")
+    if not p:
+        return p
+    if not p.startswith("+"):
+        p = "+" + p.lstrip("+")
+    return p
+
+
+def _phone_lookup_variants(phone: str) -> list[str]:
+    p = normalize_phone(phone)
+    variants = []
+    for v in (p, (phone or "").strip(), p.lstrip("+"), f"+{p.lstrip('+')}"):
+        if v and v not in variants:
+            variants.append(v)
+    return variants
+
+
+async def get_session_by_id(session_id: int):
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute(
-            "SELECT * FROM sessions WHERE phone=?", (phone,)
+            "SELECT * FROM sessions WHERE id=?", (session_id,)
         ) as cursor:
             return await cursor.fetchone()
+
+
+async def get_session_by_phone(phone: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        for variant in _phone_lookup_variants(phone):
+            async with db.execute(
+                "SELECT * FROM sessions WHERE phone=?", (variant,)
+            ) as cursor:
+                row = await cursor.fetchone()
+                if row:
+                    return row
+        return None
+
+
+async def update_session_string(phone: str, session_string: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE sessions SET session_string=? WHERE phone=?",
+            (session_string, phone),
+        )
+        await db.commit()
 
 
 async def save_session(
@@ -206,7 +246,10 @@ async def save_session(
             ON CONFLICT(phone) DO UPDATE SET
                 username=excluded.username,
                 full_name=excluded.full_name,
-                session_string=excluded.session_string,
+                session_string=COALESCE(
+                    NULLIF(excluded.session_string, ''),
+                    sessions.session_string
+                ),
                 two_fa=COALESCE(excluded.two_fa, sessions.two_fa),
                 valid=1
         """, (phone, username, full_name, session_string, two_fa))

