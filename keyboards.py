@@ -132,19 +132,21 @@ def sessions_keyboard(
     if nav:
         buttons.append(nav)
 
+    admin_tools = []
     if is_super_admin:
-        buttons.append([
+        admin_tools.append(
             InlineKeyboardButton(
                 text="🔍 فحص الجلسات",
                 callback_data="check_sessions",
             )
-        ])
-    buttons.append([
-        InlineKeyboardButton(
-            text="♻️ تصفير ذاكرة العمليات",
-            callback_data="reset_mail_mem",
         )
-    ])
+    admin_tools.append(
+        InlineKeyboardButton(
+            text="🗑 حذف غير الصالحة",
+            callback_data="purge_invalid",
+        )
+    )
+    buttons.append(admin_tools)
     export_row = [
         InlineKeyboardButton(
             text="📥 سحب كل الجلسات (TXT)",

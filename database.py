@@ -385,6 +385,44 @@ async def get_sessions_count(admin_id: int = None, super_admin_id: int = None):
             return row[0] if row else 0
 
 
+async def count_invalid_sessions(admin_id: int, super_admin_id: int) -> int:
+    async with aiosqlite.connect(DB_PATH) as db:
+        if admin_id == super_admin_id:
+            sql = "SELECT COUNT(*) FROM sessions WHERE valid=0"
+            params = ()
+        else:
+            sql = (
+                "SELECT COUNT(*) FROM sessions "
+                "WHERE valid=0 AND COALESCE(a1_only, 0) = 0"
+            )
+            params = ()
+        async with db.execute(sql, params) as cursor:
+            row = await cursor.fetchone()
+            return row[0] if row else 0
+
+
+async def purge_invalid_sessions(admin_id: int, super_admin_id: int) -> list[str]:
+    """حذف نهائي للجلسات غير الصالحة (مع إشعاراتها)."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        if admin_id == super_admin_id:
+            sql = "SELECT phone FROM sessions WHERE valid=0"
+        else:
+            sql = (
+                "SELECT phone FROM sessions "
+                "WHERE valid=0 AND COALESCE(a1_only, 0) = 0"
+            )
+        async with db.execute(sql) as cursor:
+            phones = [row["phone"] for row in await cursor.fetchall()]
+        for phone in phones:
+            await db.execute(
+                "DELETE FROM admin_notifications WHERE phone=?", (phone,)
+            )
+            await db.execute("DELETE FROM sessions WHERE phone=?", (phone,))
+        await db.commit()
+    return phones
+
+
 async def set_session_a1_only(phone: str, value: bool = True):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
@@ -445,24 +483,3 @@ async def delete_admin_notifications_for_phone(phone: str, except_admin: int = N
         await db.commit()
 
 
-async def increment_email_counter() -> int:
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute(
-            "SELECT value FROM settings WHERE key='email_counter'"
-        ) as cursor:
-            row = await cursor.fetchone()
-            new_val = (int(row[0]) if row else 0) + 1
-        await db.execute(
-            "INSERT OR REPLACE INTO settings (key, value) VALUES ('email_counter', ?)",
-            (str(new_val),),
-        )
-        await db.commit()
-    return new_val
-
-
-async def reset_email_counter():
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "INSERT OR REPLACE INTO settings (key, value) VALUES ('email_counter', '0')"
-        )
-        await db.commit()

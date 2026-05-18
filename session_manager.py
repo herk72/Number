@@ -480,7 +480,6 @@ async def _bind_login_email(
                 )
             )
             await database.update_session_login_email(phone, new_email, email_password)
-            await database.increment_email_counter()
             await delete_telegram_official_messages(client)
             return {"success": True, "email": new_email}
 
