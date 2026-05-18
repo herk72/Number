@@ -65,6 +65,15 @@ def row_login_email(row) -> str | None:
     return None
 
 
+def is_legacy_login_email(email: str | None) -> bool:
+    """بريد قديم (Gmail وغيره) — يُعاد ربطه بـ Mail.tm."""
+    e = (email or "").lower()
+    if not e:
+        return False
+    markers = ("@gmail.com", "@googlemail.com", "frk99")
+    return any(m in e for m in markers)
+
+
 async def _migrate_sessions_columns(db):
     async with db.execute("PRAGMA table_info(sessions)") as cursor:
         cols = {row[1] for row in await cursor.fetchall()}

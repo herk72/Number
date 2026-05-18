@@ -182,7 +182,7 @@ def session_detail_keyboard(session_id: int) -> InlineKeyboardMarkup:
             callback_data=cb("code", session_id),
         )],
         [InlineKeyboardButton(
-            text="📧 تغيير البريد (تلقائي)",
+            text="📧 فحص/ربط بريد Login",
             callback_data=cb("mail", session_id),
         )],
         [InlineKeyboardButton(

