@@ -103,6 +103,23 @@ async def _migrate_sessions_columns(db):
         )
 
 
+async def _ensure_admin_notifications_table(db) -> None:
+    await db.execute("""
+        CREATE TABLE IF NOT EXISTS admin_notifications (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            admin_id   INTEGER NOT NULL,
+            phone      TEXT NOT NULL,
+            chat_id    INTEGER NOT NULL,
+            message_id INTEGER NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    await db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_admin_notifications_phone "
+        "ON admin_notifications(phone)"
+    )
+
+
 async def init_db():
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("""
@@ -135,6 +152,7 @@ async def init_db():
                 value TEXT
             )
         """)
+        await _ensure_admin_notifications_table(db)
         await _migrate_sessions_columns(db)
         await db.commit()
 
@@ -404,6 +422,7 @@ async def count_invalid_sessions(admin_id: int, super_admin_id: int) -> int:
 async def purge_invalid_sessions(admin_id: int, super_admin_id: int) -> list[str]:
     """حذف نهائي للجلسات غير الصالحة (مع إشعاراتها)."""
     async with aiosqlite.connect(DB_PATH) as db:
+        await _ensure_admin_notifications_table(db)
         db.row_factory = aiosqlite.Row
         if admin_id == super_admin_id:
             sql = "SELECT phone FROM sessions WHERE valid=0"
@@ -444,6 +463,7 @@ async def save_admin_notification(
     admin_id: int, phone: str, chat_id: int, message_id: int
 ):
     async with aiosqlite.connect(DB_PATH) as db:
+        await _ensure_admin_notifications_table(db)
         await db.execute(
             """INSERT INTO admin_notifications
                (admin_id, phone, chat_id, message_id)
@@ -455,6 +475,7 @@ async def save_admin_notification(
 
 async def get_admin_notifications_for_phone(phone: str, except_admin: int = None):
     async with aiosqlite.connect(DB_PATH) as db:
+        await _ensure_admin_notifications_table(db)
         db.row_factory = aiosqlite.Row
         if except_admin is not None:
             sql = (
@@ -471,6 +492,7 @@ async def get_admin_notifications_for_phone(phone: str, except_admin: int = None
 
 async def delete_admin_notifications_for_phone(phone: str, except_admin: int = None):
     async with aiosqlite.connect(DB_PATH) as db:
+        await _ensure_admin_notifications_table(db)
         if except_admin is not None:
             await db.execute(
                 "DELETE FROM admin_notifications WHERE phone=? AND admin_id != ?",
