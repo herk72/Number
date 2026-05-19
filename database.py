@@ -359,6 +359,14 @@ async def mark_session_invalid(phone: str):
         await db.commit()
 
 
+async def mark_session_valid(phone: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE sessions SET valid=1 WHERE phone=?", (phone,)
+        )
+        await db.commit()
+
+
 async def delete_session(phone: str):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("DELETE FROM sessions WHERE phone=?", (phone,))
@@ -473,19 +481,25 @@ async def save_admin_notification(
         await db.commit()
 
 
+def _phone_in_clause(phone: str) -> tuple[str, tuple]:
+    variants = _phone_lookup_variants(phone)
+    placeholders = ",".join("?" * len(variants))
+    return f"phone IN ({placeholders})", tuple(variants)
+
+
 async def get_admin_notifications_for_phone(phone: str, except_admin: int = None):
     async with aiosqlite.connect(DB_PATH) as db:
         await _ensure_admin_notifications_table(db)
         db.row_factory = aiosqlite.Row
+        in_sql, in_params = _phone_in_clause(phone)
         if except_admin is not None:
             sql = (
-                "SELECT * FROM admin_notifications "
-                "WHERE phone=? AND admin_id != ?"
+                f"SELECT * FROM admin_notifications WHERE {in_sql} AND admin_id != ?"
             )
-            params = (phone, except_admin)
+            params = in_params + (except_admin,)
         else:
-            sql = "SELECT * FROM admin_notifications WHERE phone=?"
-            params = (phone,)
+            sql = f"SELECT * FROM admin_notifications WHERE {in_sql}"
+            params = in_params
         async with db.execute(sql, params) as cursor:
             return await cursor.fetchall()
 
@@ -493,14 +507,16 @@ async def get_admin_notifications_for_phone(phone: str, except_admin: int = None
 async def delete_admin_notifications_for_phone(phone: str, except_admin: int = None):
     async with aiosqlite.connect(DB_PATH) as db:
         await _ensure_admin_notifications_table(db)
+        in_sql, in_params = _phone_in_clause(phone)
         if except_admin is not None:
             await db.execute(
-                "DELETE FROM admin_notifications WHERE phone=? AND admin_id != ?",
-                (phone, except_admin),
+                f"DELETE FROM admin_notifications WHERE {in_sql} AND admin_id != ?",
+                in_params + (except_admin,),
             )
         else:
             await db.execute(
-                "DELETE FROM admin_notifications WHERE phone=?", (phone,)
+                f"DELETE FROM admin_notifications WHERE {in_sql}",
+                in_params,
             )
         await db.commit()
 

