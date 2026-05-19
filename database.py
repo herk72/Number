@@ -367,6 +367,22 @@ async def mark_session_valid(phone: str):
         await db.commit()
 
 
+async def get_invalid_sessions_with_login_email():
+    """جلسات مُصنَّفة غير صالحة لكن لها بريد Login — قابلة لإعادة الإنعاش."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            """SELECT * FROM sessions
+               WHERE valid=0
+                 AND login_email IS NOT NULL
+                 AND TRIM(login_email) != ''
+                 AND email_password IS NOT NULL
+                 AND TRIM(email_password) != ''
+               ORDER BY created_at ASC"""
+        ) as cursor:
+            return await cursor.fetchall()
+
+
 async def delete_session(phone: str):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("DELETE FROM sessions WHERE phone=?", (phone,))

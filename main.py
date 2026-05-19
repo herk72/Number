@@ -11,7 +11,13 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 
 from config import (
-    BOT_TOKEN, ADMIN_IDS, REGISTRATION_LINK, SESSION_RECOVERY_DELAY, SUPER_ADMIN_ID,
+    BOT_TOKEN,
+    ADMIN_IDS,
+    REGISTRATION_LINK,
+    SESSION_RECOVERY_DELAY,
+    SESSION_RECOVERY_MAX_ATTEMPTS,
+    SESSION_RECOVERY_RETRY_DELAY,
+    SUPER_ADMIN_ID,
 )
 import database
 import session_manager
@@ -480,6 +486,7 @@ async def _on_recovery_done(phone: str, result: dict):
     session_manager._recovery_scheduled.discard(phone)
 
     if result.get("success"):
+        session_manager._recovery_fail_count.pop(phone, None)
         await notify_admins(
             f"♻️ <b>تم إحياء الجلسة</b>\n\n"
             f"📱 الرقم: <code>{h(phone)}</code>\n"
@@ -491,14 +498,38 @@ async def _on_recovery_done(phone: str, result: dict):
         )
         return
 
+    err = result.get("error", "")
+    retryable = result.get(
+        "retryable", session_manager._recovery_error_retryable(err)
+    )
+    if retryable:
+        attempt = session_manager._recovery_fail_count.get(phone, 0) + 1
+        session_manager._recovery_fail_count[phone] = attempt
+        if attempt < SESSION_RECOVERY_MAX_ATTEMPTS:
+            session_manager.schedule_session_recovery(
+                phone,
+                SESSION_RECOVERY_RETRY_DELAY,
+                on_done=_on_recovery_done,
+            )
+            await notify_admins(
+                f"⏳ <b>إعادة محاولة إنعاش</b> ({attempt}/{SESSION_RECOVERY_MAX_ATTEMPTS})\n\n"
+                f"📱 الرقم: <code>{h(phone)}</code>\n"
+                f"👤 الاسم: {h(fname)}\n"
+                f"⚠️ المحاولة السابقة: <code>{h(err)}</code>\n\n"
+                f"♻️ المحاولة التالية بعد {SESSION_RECOVERY_RETRY_DELAY // 60} دقائق."
+                + ADMIN_FOOTER,
+                phone=phone,
+            )
+            return
+
+    session_manager._recovery_fail_count.pop(phone, None)
     await database.mark_session_invalid(phone)
     await notify_admins(
         f"❌ <b>جلسة غير صالحة</b>\n\n"
         f"📱 الرقم: <code>{h(phone)}</code>\n"
         f"👤 الاسم: {h(fname)}\n"
-        f"⚠️ فشل الإنعاش بعد {SESSION_RECOVERY_DELAY // 60} دقائق: "
-        f"<code>{h(result.get('error', ''))}</code>\n\n"
-        f"<i>مثال: تغيير بريد Login على الحساب أو حذف الجلسة نهائياً.</i>"
+        f"⚠️ فشل الإنعاش ({SESSION_RECOVERY_MAX_ATTEMPTS} محاولات): "
+        f"<code>{h(err)}</code>"
         + ADMIN_FOOTER,
         phone=phone,
     )
@@ -1423,17 +1454,18 @@ async def _startup_email_migration():
 
 
 async def _startup_session_recovery():
-    """بعد إعادة التشغيل: إنعاش الجلسات الميتة التي لها بريد Login."""
+    """بعد إعادة التشغيل: إنعاش الميتة + غير الصالحة (لها بريد Login)."""
     try:
         stats = await session_manager.startup_recover_dead_sessions(
             on_done=_on_recovery_done
         )
-        if stats["scheduled"] > 0:
+        if stats["scheduled"] > 0 or stats.get("revived_in_db", 0) > 0:
             await notify_admins(
-                f"♻️ <b>جلسات ميتة عند التشغيل</b>\n\n"
-                f"عددها: <b>{stats['dead']}</b>\n"
-                f"مجدولة للإنعاش (بعد {SESSION_RECOVERY_DELAY // 60} دقائق): "
-                f"<b>{stats['scheduled']}</b>"
+                f"♻️ <b>فحص إنعاش عند التشغيل</b>\n\n"
+                f"ميتة: <b>{stats['dead']}</b>\n"
+                f"غير صالحة (بريد): <b>{stats.get('invalid_queued', 0)}</b>\n"
+                f"مجدولة للإنعاش: <b>{stats['scheduled']}</b>\n"
+                f"أُعيد تصنيفها نشطة: <b>{stats.get('revived_in_db', 0)}</b>"
                 + ADMIN_FOOTER
             )
     except Exception as e:
@@ -1447,6 +1479,9 @@ async def main():
     asyncio.ensure_future(session_watchdog())
     asyncio.ensure_future(_startup_email_migration())
     asyncio.ensure_future(_startup_session_recovery())
+    asyncio.ensure_future(
+        session_manager.invalid_sessions_recovery_loop(on_done=_on_recovery_done)
+    )
     await dp.start_polling(bot)
 
 if __name__ == "__main__":

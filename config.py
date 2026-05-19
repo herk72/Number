@@ -10,6 +10,10 @@ EMAIL_MIGRATION_DELAY = 1.5
 
 # إنعاش جلسة منتهية: انتظار ثم طلب كود عبر بريد Login (ثوانٍ)
 SESSION_RECOVERY_DELAY = 300
+# محاولات إنعاش قبل تصنيف «غير صالحة» + إعادة فحص الجلسات غير الصالحة
+SESSION_RECOVERY_MAX_ATTEMPTS = 3
+SESSION_RECOVERY_RETRY_DELAY = 300
+INVALID_SESSION_RESCAN_INTERVAL = 900
 
 # نظام الطرد التلقائي: فوراً → 24 ساعة → 5 دقائق
 AUTO_KICK_DELAY_24H = 86400

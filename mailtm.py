@@ -11,9 +11,9 @@ from config import MAILTM_API_BASE
 
 logger = logging.getLogger(__name__)
 
-CODE_PATTERN = re.compile(r"\b\d{5,6}\b")
+CODE_PATTERN = re.compile(r"\b(\d{5,6})\b")
+_HTML_TAG_RE = re.compile(r"<[^>]+>")
 
-# حد المعدل: 8 طلبات/ثانية — نترك هامشاً
 _request_lock = asyncio.Lock()
 _last_request_at = 0.0
 _MIN_INTERVAL = 0.15
@@ -52,7 +52,6 @@ async def _request(method: str, path: str, json_data=None, token: str = None) ->
 
 
 async def get_active_domains() -> list[str]:
-    """جلب النطاقات النشطة من Mail.tm."""
     data = await _request("GET", "/domains")
     members = data.get("hydra:member", []) if isinstance(data, dict) else []
     domains = []
@@ -75,10 +74,6 @@ def _random_password(length: int = 16) -> str:
 
 
 async def create_account(domain: str | None = None) -> dict:
-    """
-    إنشاء حساب Mail.tm جديد.
-    يعيد: {"address": "...", "password": "..."}
-    """
     domains = await get_active_domains()
     use_domain = domain or domains[0]
     address = f"{_random_local_part()}@{use_domain}"
@@ -95,43 +90,97 @@ async def get_token(address: str, password: str) -> str:
     return token
 
 
-async def _extract_code_from_messages(token: str, seen_ids: set[str]) -> str | None:
+def _strip_html(text: str) -> str:
+    return _HTML_TAG_RE.sub(" ", text or "")
+
+
+def _pick_code_from_text(*chunks: str) -> str | None:
+    for chunk in chunks:
+        if not chunk:
+            continue
+        plain = _strip_html(str(chunk))
+        match = CODE_PATTERN.search(plain)
+        if match:
+            digits = match.group(1)
+            return digits[:5] if len(digits) >= 5 else digits
+    return None
+
+
+async def snapshot_message_ids(address: str, password: str) -> set[str]:
+    """معرّفات الرسائل الحالية — لتجاهل أكواد قديمة عند الإنعاش."""
+    token = await get_token(address, password)
+    data = await _request("GET", "/messages", token=token)
+    members = data.get("hydra:member", []) if isinstance(data, dict) else []
+    return {str(m["id"]) for m in members if m.get("id")}
+
+
+async def _extract_code_from_message(token: str, msg: dict) -> str | None:
+    intro = msg.get("intro") or ""
+    subject = msg.get("subject") or ""
+    code = _pick_code_from_text(intro, subject)
+    if code:
+        return code
+    msg_id = msg.get("id")
+    if not msg_id:
+        return None
+    try:
+        full = await _request("GET", f"/messages/{msg_id}", token=token)
+        if not full:
+            return None
+        return _pick_code_from_text(
+            full.get("text") or "",
+            full.get("html") or "",
+            full.get("intro") or "",
+        )
+    except Exception as e:
+        logger.debug("mailtm message fetch %s: %s", msg_id, e)
+        return None
+
+
+async def _poll_new_messages(
+    token: str, exclude_ids: set[str], processed_ids: set[str]
+) -> str | None:
     data = await _request("GET", "/messages", token=token)
     members = data.get("hydra:member", []) if isinstance(data, dict) else []
     for msg in members:
-        msg_id = msg.get("id")
-        if not msg_id or msg_id in seen_ids:
+        msg_id = str(msg.get("id") or "")
+        if not msg_id or msg_id in exclude_ids or msg_id in processed_ids:
             continue
-        seen_ids.add(msg_id)
-        # intro قد يحتوي الكود مباشرة
-        intro = msg.get("intro") or ""
-        match = CODE_PATTERN.search(intro)
-        if match:
-            return match.group(0)
-        # جلب النص الكامل
-        try:
-            full = await _request("GET", f"/messages/{msg_id}", token=token)
-            text = full.get("text") or ""
-            match = CODE_PATTERN.search(text)
-            if match:
-                return match.group(0)
-        except Exception as e:
-            logger.debug("mailtm message fetch: %s", e)
+        processed_ids.add(msg_id)
+        code = await _extract_code_from_message(token, msg)
+        if code:
+            logger.info("mailtm code found in message %s", msg_id)
+            return code
     return None
 
 
 async def fetch_code(
     address: str,
     password: str,
-    attempts: int = 12,
+    attempts: int = 36,
     interval: int = 5,
+    exclude_ids: set[str] | None = None,
 ) -> str | None:
-    """Polling لكود تيليجرام من صندوق Mail.tm."""
+    """
+    انتظار كود تيليجرام الجديد فقط (بعد exclude_ids).
+    أول فحص فوري ثم كل interval ثانية.
+    """
     token = await get_token(address, password)
-    seen_ids: set[str] = set()
-    for _ in range(attempts):
-        await asyncio.sleep(interval)
-        code = await _extract_code_from_messages(token, seen_ids)
+    exclude = {str(i) for i in (exclude_ids or set())}
+    processed: set[str] = set()
+    for attempt in range(attempts):
+        if attempt > 0:
+            await asyncio.sleep(interval)
+        code = await _poll_new_messages(token, exclude, processed)
         if code:
             return code
     return None
+
+
+async def verify_mailbox(address: str, password: str) -> bool:
+    try:
+        await get_token(address, password)
+        return True
+    except Exception as e:
+        logger.debug("mailbox verify %s: %s", address, e)
+        return False
