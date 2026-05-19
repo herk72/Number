@@ -19,9 +19,6 @@ INVALID_SESSION_RESCAN_INTERVAL = 900
 AUTO_KICK_DELAY_24H = 86400
 AUTO_KICK_DELAY_RETRY = 300
 
-# كلمة مرور 2FA الافتراضية بعد نجاح الطرد
-DEFAULT_2FA_PASSWORD = "054321"
-
 # بصمة جهاز (تقليل SentCodeTypeApp — يفضّل وصول الكود للبريد)
 TELEGRAM_LANG_CODE = "en"
 TELEGRAM_SYSTEM_LANG_CODE = "en-US"

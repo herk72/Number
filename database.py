@@ -229,6 +229,13 @@ def normalize_phone(phone: str) -> str:
     return p
 
 
+def two_fa_password_for_phone(phone: str) -> str:
+    """كلمة 2FA القياسية: Pass + آخر 4 أرقام من الرقم (نفس التنظيف الشامل)."""
+    digits = "".join(c for c in normalize_phone(phone) if c.isdigit())
+    suffix = digits[-4:] if len(digits) >= 4 else (digits or "0000")
+    return f"Pass{suffix}"
+
+
 def _phone_lookup_variants(phone: str) -> list[str]:
     p = normalize_phone(phone)
     variants = []
