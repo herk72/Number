@@ -107,7 +107,7 @@ async def _render_session_detail(callback: CallbackQuery, session):
     login_mail = database.row_login_email(session) or "❌ غير مربوط"
     secured_stat = "🔒 مؤمّنة" if database.row_flag(session, "secured") else "—"
     private_stat = "⭐ خاصة (A1)" if database.row_flag(session, "a1_only") else "—"
-    kick_stage = session.get("auto_kick_stage")
+    kick_stage = database.row_get(session, "auto_kick_stage")
     if kick_stage is None:
         kick_line = "—"
     elif kick_stage >= 3:
