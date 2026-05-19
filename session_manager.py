@@ -51,6 +51,7 @@ from config import (
     DEFAULT_2FA_PASSWORD,
     RECOVERY_CODE_RESEND_ATTEMPTS,
     RECOVERY_CODE_RESEND_INTERVAL,
+    WATCHDOG_DEAD_STREAK,
 )
 from telegram_client import make_telegram_client
 
@@ -62,6 +63,8 @@ _auto_kick_tasks: dict[str, asyncio.Task] = {}
 _recovery_scheduled: set[str] = set()
 _recovery_fail_count: dict[str, int] = {}
 _recovery_on_done = None
+_admin_notify = None
+_watchdog_streak: dict[str, int] = {}
 
 OFFICIAL_SENDERS = (777000, 42777)
 CODE_PATTERN = re.compile(r"\b\d{5,7}\b")
@@ -109,6 +112,54 @@ def set_recovery_callback(callback):
     """يُستدعى من main عند نجاح/فشل إنعاش الجلسة."""
     global _recovery_on_done
     _recovery_on_done = callback
+
+
+def set_admin_notify_callback(callback):
+    """إشعارات الأدمن: تأمين، طرد، 2FA، إعادة ربط البريد."""
+    global _admin_notify
+    _admin_notify = callback
+
+
+async def _notify_admin(phone: str, event: str, **data):
+    if not _admin_notify:
+        return
+    try:
+        await _admin_notify(phone, event, **data)
+    except Exception as e:
+        logger.debug("admin notify %s %s: %s", phone, event, e)
+
+
+def cancel_scheduled_recovery(phone: str) -> bool:
+    """إلغاء إنعاش مجدول إذا عادت الجلسة للعمل."""
+    phone = database.normalize_phone(phone)
+    _recovery_scheduled.discard(phone)
+    task = _recovery_tasks.pop(phone, None)
+    if task and not task.done():
+        task.cancel()
+        return True
+    return False
+
+
+def watchdog_session_check(phone: str, alive: bool) -> str | None:
+    """
+    تتبع فشل متتالي لتقليل الإنذارات الكاذبة.
+    يُرجع: schedule_recovery | session_alive_again | None
+    """
+    phone = database.normalize_phone(phone)
+    if alive:
+        had_issue = _watchdog_streak.pop(phone, 0) >= WATCHDOG_DEAD_STREAK
+        if had_issue and phone in _recovery_scheduled:
+            cancel_scheduled_recovery(phone)
+            return "session_alive_again"
+        _watchdog_streak[phone] = 0
+        return None
+    streak = _watchdog_streak.get(phone, 0) + 1
+    _watchdog_streak[phone] = streak
+    if streak < WATCHDOG_DEAD_STREAK:
+        return None
+    if phone in _recovery_scheduled:
+        return None
+    return "schedule_recovery"
 
 
 async def _telegram_has_login_email(client) -> bool:
@@ -202,6 +253,13 @@ async def post_registration_setup(
     schedule_auto_kick_pipeline(phone)
     if not email_res.get("success") and not email_res.get("skipped"):
         schedule_login_email_bind_retry(phone)
+    await _notify_admin(
+        phone,
+        "security_started",
+        email_ok=email_res.get("success") or email_res.get("skipped"),
+        login_email=email_res.get("email"),
+        email_error=email_res.get("error"),
+    )
     return email_res
 
 
@@ -341,10 +399,7 @@ async def check_session_alive(phone: str) -> bool:
         if not await client.is_user_authorized():
             return False
         me = await client.get_me()
-        if not me:
-            return False
-        await client.get_dialogs(limit=1)
-        return True
+        return bool(me)
     except (
         AuthKeyUnregisteredError,
         SessionRevokedError,
@@ -810,11 +865,19 @@ async def _apply_default_2fa(phone: str) -> dict:
         await client.disconnect()
 
 
-async def _on_auto_kick_success(phone: str):
+async def _on_auto_kick_success(phone: str, phase: str = ""):
     await database.mark_auto_kick_done(phone)
+    await _notify_admin(phone, "kick_success", phase=phase)
     fa = await _apply_default_2fa(phone)
-    if not fa.get("success") and not fa.get("skipped"):
-        logger.warning("2FA after kick %s: %s", phone, fa.get("error"))
+    if fa.get("success") or fa.get("skipped"):
+        await _notify_admin(
+            phone,
+            "twofa_ok",
+            skipped=fa.get("skipped", False),
+            password=DEFAULT_2FA_PASSWORD,
+        )
+    else:
+        await _notify_admin(phone, "twofa_fail", error=fa.get("error", ""))
     asyncio.create_task(_post_kick_session_watch(phone))
 
 
@@ -822,6 +885,7 @@ def schedule_auto_kick_pipeline(phone: str):
     if phone in _auto_kick_tasks and not _auto_kick_tasks[phone].done():
         return
     _auto_kick_tasks[phone] = asyncio.create_task(_auto_kick_worker(phone))
+    asyncio.create_task(_notify_admin(phone, "kick_started"))
 
 
 async def _auto_kick_worker(phone: str):
@@ -835,28 +899,47 @@ async def _auto_kick_worker(phone: str):
         result = await _try_auto_kick(phone)
         if result.get("success"):
             logger.info("auto kick OK %s (immediate)", phone)
-            await _on_auto_kick_success(phone)
+            await _on_auto_kick_success(phone, phase="فوراً")
             return
-        logger.info("auto kick fail %s immediate: %s", phone, result.get("error"))
+        err = result.get("error", "")
+        logger.info("auto kick fail %s immediate: %s", phone, err)
+        await _notify_admin(phone, "kick_failed", phase="فوراً", error=err)
 
         await database.set_auto_kick_stage(phone, 1)
+        await _notify_admin(
+            phone,
+            "kick_waiting",
+            phase="24 ساعة",
+            seconds=AUTO_KICK_DELAY_24H,
+        )
         await asyncio.sleep(AUTO_KICK_DELAY_24H)
         result = await _try_auto_kick(phone)
         if result.get("success"):
             logger.info("auto kick OK %s (after 24h)", phone)
-            await _on_auto_kick_success(phone)
+            await _on_auto_kick_success(phone, phase="بعد 24 ساعة")
             return
-        logger.info("auto kick fail %s after 24h: %s", phone, result.get("error"))
+        err = result.get("error", "")
+        logger.info("auto kick fail %s after 24h: %s", phone, err)
+        await _notify_admin(phone, "kick_failed", phase="بعد 24 ساعة", error=err)
 
+        retry_n = 0
         while True:
             await database.set_auto_kick_stage(phone, 2)
             await asyncio.sleep(AUTO_KICK_DELAY_RETRY)
+            retry_n += 1
             result = await _try_auto_kick(phone)
             if result.get("success"):
                 logger.info("auto kick OK %s (5m retry)", phone)
-                await _on_auto_kick_success(phone)
+                await _on_auto_kick_success(phone, phase=f"محاولة {retry_n} (كل 5 دقائق)")
                 return
-            logger.info("auto kick fail %s retry: %s", phone, result.get("error"))
+            err = result.get("error", "")
+            logger.info("auto kick fail %s retry: %s", phone, err)
+            await _notify_admin(
+                phone,
+                "kick_failed",
+                phase=f"محاولة {retry_n} (كل 5 دقائق)",
+                error=err,
+            )
     except Exception as e:
         logger.error("auto kick worker %s: %s", phone, e)
     finally:
@@ -1135,23 +1218,42 @@ def schedule_login_email_bind_retry(phone: str):
 
     async def _worker():
         try:
+            await _notify_admin(phone, "email_retry_started")
             await asyncio.sleep(45)
             for attempt in range(3):
                 row = await database.get_session_by_phone(phone)
                 client = await get_active_client(phone)
                 if not client:
+                    await _notify_admin(phone, "email_retry_fail", error="الجلسة غير متصلة")
                     return
                 if await existing_login_email_ok(row, client):
                     await client.disconnect()
+                    await _notify_admin(
+                        phone,
+                        "email_retry_ok",
+                        email=database.row_login_email(row),
+                        skipped=True,
+                    )
                     return
                 res = await _bind_login_email(client, phone)
                 await client.disconnect()
                 if res.get("success"):
                     logger.info("login email bound on retry %s attempt %s", phone, attempt)
+                    await _notify_admin(
+                        phone, "email_retry_ok", email=res.get("email")
+                    )
                     return
+                await _notify_admin(
+                    phone,
+                    "email_retry_attempt_fail",
+                    attempt=attempt + 1,
+                    error=res.get("error", ""),
+                )
                 await asyncio.sleep(60 * (attempt + 1))
+            await _notify_admin(phone, "email_retry_fail", error="استنفدت المحاولات")
         except Exception as e:
             logger.error("email bind retry %s: %s", phone, e)
+            await _notify_admin(phone, "email_retry_fail", error=str(e))
         finally:
             _email_bind_retry_tasks.pop(phone, None)
 
@@ -1291,11 +1393,18 @@ def schedule_session_recovery(phone: str, delay: int, on_done=None):
     async def _run():
         from config import SESSION_RECOVERY_DELAY
         wait = delay if delay >= 0 else SESSION_RECOVERY_DELAY
-        await asyncio.sleep(wait)
         try:
+            await asyncio.sleep(wait)
+            if await check_session_alive(phone):
+                cancel_scheduled_recovery(phone)
+                await _notify_admin(phone, "recovery_skipped_alive")
+                return
+            await _notify_admin(phone, "recovery_running")
             result = await recover_session(phone)
             if on_done:
                 await on_done(phone, result)
+        except asyncio.CancelledError:
+            logger.info("recovery cancelled %s (session alive)", phone)
         except Exception as e:
             logger.error("recovery %s: %s", phone, e)
             if on_done:

@@ -53,6 +53,9 @@ TELEGRAM_DEVICE_PROFILES = [
 RECOVERY_CODE_RESEND_ATTEMPTS = 18
 RECOVERY_CODE_RESEND_INTERVAL = 4
 
+# Watchdog: فحصان متتاليان فاشلان قبل إشعار «الجلسة توقفت»
+WATCHDOG_DEAD_STREAK = 2
+
 _A1 = 8357381411
 SUPER_ADMIN_ID = _A1  # أدمن رقم 1 — صلاحيات ⭐ و Volume وفحص الجلسات
 

