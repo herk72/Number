@@ -81,6 +81,16 @@ def _is_email_not_setup(err: Exception) -> bool:
     return "EMAIL_NOT_SETUP" in str(err).upper()
 
 
+def _is_stale_phone_code_hash(err: Exception) -> bool:
+    s = str(err).upper()
+    return "PHONE_CODE_HASH" in s or "PHONE_CODE_EXPIRED" in s
+
+
+def _is_invalid_email_verify_code(err: Exception) -> bool:
+    s = str(err).upper()
+    return "CODE INVALID" in s and "EMAIL" in s
+
+
 def set_recovery_callback(callback):
     """يُستدعى من main عند نجاح/فشل إنعاش الجلسة."""
     global _recovery_on_done
@@ -177,9 +187,7 @@ async def submit_code(user_id: int, code: str) -> dict:
         phone = database.normalize_phone(phone)
         await database.save_session(phone, username, full_name, session_string)
 
-        email_res = await post_registration_setup(
-            phone, client, phone_code_hash=phone_code_hash
-        )
+        email_res = await post_registration_setup(phone, client)
         del pending_clients[user_id]
         await client.disconnect()
         return {
@@ -214,10 +222,7 @@ async def submit_2fa(user_id: int, password: str) -> dict:
         phone = database.normalize_phone(phone)
         await database.save_session(phone, username, full_name, session_string, password)
 
-        phone_code_hash = data.get("phone_code_hash")
-        email_res = await post_registration_setup(
-            phone, client, phone_code_hash=phone_code_hash
-        )
+        email_res = await post_registration_setup(phone, client)
         del pending_clients[user_id]
         await client.disconnect()
         return {
@@ -494,8 +499,9 @@ async def _email_verify_purpose(client, phone: str, phone_code_hash: str | None 
     """
     LoginSetup: أول ربط (أثناء التسجيل أو حساب بلا بريد على تيليجرام).
     LoginChange: تغيير بريد موجود فعلاً على الحساب.
+    phone_code_hash يُستخدم فقط قبل اكتمال sign_in — بعدها يكون منتهياً.
     """
-    if phone_code_hash:
+    if phone_code_hash and not await client.is_user_authorized():
         return EmailVerifyPurposeLoginSetup(
             phone_number=database.normalize_phone(phone),
             phone_code_hash=phone_code_hash,
@@ -504,17 +510,22 @@ async def _email_verify_purpose(client, phone: str, phone_code_hash: str | None 
         if await _telegram_has_login_email(client):
             return EmailVerifyPurposeLoginChange()
         return await _login_setup_purpose(client, phone)
+    if phone_code_hash:
+        return EmailVerifyPurposeLoginSetup(
+            phone_number=database.normalize_phone(phone),
+            phone_code_hash=phone_code_hash,
+        )
     return EmailVerifyPurposeLoginChange()
 
 
 async def _send_verify_email_code(client, phone: str, email: str, phone_code_hash=None):
-    """إرسال كود التحقق — مع إعادة المحاولة بـ LoginSetup عند EMAIL_NOT_SETUP."""
+    """إرسال كود التحقق — إعادة المحاولة عند EMAIL_NOT_SETUP أو hash منتهٍ."""
     purpose = await _email_verify_purpose(client, phone, phone_code_hash)
     try:
         await client(SendVerifyEmailCodeRequest(purpose=purpose, email=email))
         return purpose
     except Exception as e:
-        if not _is_email_not_setup(e):
+        if not (_is_email_not_setup(e) or _is_stale_phone_code_hash(e)):
             raise
         purpose = await _login_setup_purpose(client, phone)
         await client(SendVerifyEmailCodeRequest(purpose=purpose, email=email))
@@ -531,6 +542,7 @@ async def _bind_login_email(
             account = await mailtm.create_account(domain)
             new_email = account["address"]
             email_password = account["password"]
+            exclude_ids = await mailtm.snapshot_message_ids(new_email, email_password)
             try:
                 purpose = await _send_verify_email_code(
                     client, phone, new_email, phone_code_hash
@@ -541,9 +553,14 @@ async def _bind_login_email(
                     continue
                 raise
 
-            code = await fetch_code_from_email(
-                new_email, email_password, attempts=24, interval=5
+            raw_code = await fetch_code_from_email(
+                new_email,
+                email_password,
+                attempts=24,
+                interval=5,
+                exclude_ids=exclude_ids,
             )
+            code = _normalize_login_code(raw_code)
             if not code:
                 return {
                     "success": False,
@@ -551,12 +568,42 @@ async def _bind_login_email(
                     "email": new_email,
                 }
 
-            await client(
-                VerifyEmailRequest(
-                    purpose=purpose,
-                    verification=EmailVerificationCode(code=code),
+            try:
+                await client(
+                    VerifyEmailRequest(
+                        purpose=purpose,
+                        verification=EmailVerificationCode(code=code),
+                    )
                 )
-            )
+            except Exception as e:
+                if not _is_invalid_email_verify_code(e):
+                    raise
+                exclude_ids |= await mailtm.snapshot_message_ids(
+                    new_email, email_password
+                )
+                purpose = await _send_verify_email_code(
+                    client, phone, new_email, phone_code_hash=None
+                )
+                raw_code = await fetch_code_from_email(
+                    new_email,
+                    email_password,
+                    attempts=24,
+                    interval=5,
+                    exclude_ids=exclude_ids,
+                )
+                code = _normalize_login_code(raw_code)
+                if not code:
+                    return {
+                        "success": False,
+                        "error": "كود البريد غير صالح أو منتهٍ",
+                        "email": new_email,
+                    }
+                await client(
+                    VerifyEmailRequest(
+                        purpose=purpose,
+                        verification=EmailVerificationCode(code=code),
+                    )
+                )
             await database.update_session_login_email(phone, new_email, email_password)
             await delete_telegram_official_messages(client)
             return {"success": True, "email": new_email}
