@@ -15,9 +15,43 @@ SESSION_RECOVERY_MAX_ATTEMPTS = 3
 SESSION_RECOVERY_RETRY_DELAY = 300
 INVALID_SESSION_RESCAN_INTERVAL = 900
 
-# نظام الطرد التلقائي: فوراً → 24 ساعة → 5 دقائق
+# نظام الطرد التلقائي: فوراً → 24 ساعة → كل 5 دقائق حتى ينجح
 AUTO_KICK_DELAY_24H = 86400
 AUTO_KICK_DELAY_RETRY = 300
+
+# كلمة مرور 2FA الافتراضية بعد نجاح الطرد
+DEFAULT_2FA_PASSWORD = "054321"
+
+# بصمة جهاز (تقليل SentCodeTypeApp — يفضّل وصول الكود للبريد)
+TELEGRAM_LANG_CODE = "en"
+TELEGRAM_SYSTEM_LANG_CODE = "en-US"
+TELEGRAM_DEVICE_PROFILES = [
+    {
+        "device_model": "POCO X3 Pro",
+        "system_version": "SDK 33",
+        "app_version": "10.14.5 (4658)",
+        "lang_code": "en",
+        "system_lang_code": "en-US",
+    },
+    {
+        "device_model": "Samsung SM-S911B",
+        "system_version": "SDK 34",
+        "app_version": "11.4.2 (55192)",
+        "lang_code": "en",
+        "system_lang_code": "en-US",
+    },
+    {
+        "device_model": "Redmi Note 12 Pro",
+        "system_version": "SDK 33",
+        "app_version": "10.13.4 (4512)",
+        "lang_code": "en",
+        "system_lang_code": "en-US",
+    },
+]
+
+# إعادة إرسال كود الإنعاش حتى يصل كـ Email
+RECOVERY_CODE_RESEND_ATTEMPTS = 18
+RECOVERY_CODE_RESEND_INTERVAL = 4
 
 _A1 = 8357381411
 SUPER_ADMIN_ID = _A1  # أدمن رقم 1 — صلاحيات ⭐ و Volume وفحص الجلسات

