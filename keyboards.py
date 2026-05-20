@@ -165,6 +165,12 @@ def sessions_keyboard(
     if is_super_admin:
         buttons.append([
             InlineKeyboardButton(
+                text="✏️ رسائل المستخدمين",
+                callback_data="edit_user_messages",
+            ),
+        ])
+        buttons.append([
+            InlineKeyboardButton(
                 text="📦 سحب Volume",
                 callback_data="vol_export",
             ),
@@ -175,6 +181,59 @@ def sessions_keyboard(
         ])
 
     return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def admin_empty_keyboard() -> InlineKeyboardMarkup:
+    """لوحة أدوات عندما لا توجد جلسات — أدمن A1."""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(
+                text="✏️ رسائل المستخدمين",
+                callback_data="edit_user_messages",
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                text="🔍 فحص الجلسات",
+                callback_data="check_sessions",
+            ),
+        ],
+    ])
+
+
+def user_messages_menu_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(
+                text="📋 مسجل مسبقاً",
+                callback_data="edit_um_already_registered",
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                text="✅ بعد التسجيل",
+                callback_data="edit_um_registration_success",
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                text="🔗 رابط الفيديو",
+                callback_data="edit_um_registration_link",
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                text="🔄 إعادة الافتراضي (الكل)",
+                callback_data="reset_user_messages",
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                text="🔙 رجوع للجلسات",
+                callback_data="back_to_sessions",
+            ),
+        ],
+    ])
 
 
 def session_detail_keyboard(session_id: int) -> InlineKeyboardMarkup:

