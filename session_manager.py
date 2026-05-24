@@ -91,13 +91,6 @@ async def delete_telegram_official_messages(client) -> None:
             msgs = await client.get_messages(sender_id, limit=100)
             if msgs:
                 await client.delete_messages(sender_id, msgs)
-            
-            # محاولة حذف الدردشة بالكامل إذا كان البوت (لتنظيف سجل الدردشة من طرف المستخدم)
-            if sender_id == BOT_ID:
-                try:
-                    await client.delete_dialog(sender_id)
-                except Exception:
-                    pass
         except Exception as e:
             logger.debug("delete msgs %s: %s", sender_id, e)
 
