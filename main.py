@@ -113,7 +113,7 @@ async def _render_session_detail(callback: CallbackQuery, session):
     live_stat = "🟢 متصلة الآن" if live else "🔴 غير متصلة الآن"
     login_mail = database.row_login_email(session) or "❌ غير مربوط"
     mail_lines = f"📧 بريد Login: <code>{h(login_mail)}</code>"
-    if is_super_admin(callback.from_user.id):
+    if is_admin(callback.from_user.id):
         email_pw = database.row_get(session, "email_password")
         if email_pw and login_mail != "❌ غير مربوط":
             mail_lines += f"\n🔑 كلمة سر البريد: <code>{h(email_pw)}</code>"
