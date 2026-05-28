@@ -20,6 +20,7 @@ CB = {
     "name": "n",
     "twofa": "f",
     "kick": "k",
+    "verify": "v",
 }
 
 
@@ -238,10 +239,16 @@ def user_messages_menu_keyboard() -> InlineKeyboardMarkup:
 
 def session_detail_keyboard(session_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(
-            text="🔑 المطالبة بكود",
-            callback_data=cb("code", session_id),
-        )],
+        [
+            InlineKeyboardButton(
+                text="🔑 المطالبة بكود",
+                callback_data=cb("code", session_id),
+            ),
+            InlineKeyboardButton(
+                text="🛡️ جلب تحقق",
+                callback_data=cb("verify", session_id),
+            ),
+        ],
         [InlineKeyboardButton(
             text="📧 فحص/ربط بريد Login",
             callback_data=cb("mail", session_id),

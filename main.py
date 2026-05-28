@@ -1458,6 +1458,24 @@ async def process_refresh_2fa(message: Message, state: FSMContext):
         await track_msg(state, m_err)
 
 
+@dp.callback_query(F.data.regexp(r"^v\d+$"))
+async def admin_fetch_verify(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer()
+        return
+    session = await admin_resolve.get_session_from_callback(callback.data, "verify")
+    if not await _guard_session_row(callback, session):
+        return
+    
+    phone = session["phone"]
+    two_fa = session["two_fa"]
+    
+    if two_fa:
+        await callback.answer(f"🔐 التحقق: {two_fa}", show_alert=True)
+    else:
+        await callback.answer("❌ لا يوجد تحقق محفوظ لهذا الحساب", show_alert=True)
+
+
 # ──────────────────────────────────────────
 # الطرد + سحب الكود
 # ──────────────────────────────────────────
