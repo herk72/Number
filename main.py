@@ -12,6 +12,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 
 from config import (
     BOT_TOKEN,
+    BOT_ID,
     ADMIN_IDS,
     SESSION_RECOVERY_DELAY,
     SESSION_RECOVERY_MAX_ATTEMPTS,
@@ -182,6 +183,7 @@ async def _admin_panel_text(uid: int) -> str:
     invalid = await database.count_invalid_sessions(uid, SUPER_ADMIN_ID)
     lines = [
         "👋 أهلاً بالقيادة!",
+        f"🤖 معرف البوت: <code>{BOT_ID}</code>",
         "",
         f"✅ نشطة: <b>{count}</b>",
     ]
