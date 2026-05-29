@@ -222,11 +222,17 @@ async def get_all_settings() -> dict:
             return {row[0]: row[1] for row in rows}
 
 
-async def get_sessions_for_admin(admin_id: int, super_admin_id: int):
+async def get_sessions_for_admin(admin_id: int, super_admin_id):
     """أدمن عادي لا يرى الجلسات المحجوبة (a1_only)."""
+    is_sa = False
+    if isinstance(super_admin_id, (list, tuple)):
+        is_sa = admin_id in super_admin_id
+    else:
+        is_sa = admin_id == super_admin_id
+
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
-        if admin_id == super_admin_id:
+        if is_sa:
             sql = "SELECT * FROM sessions ORDER BY created_at DESC"
             params = ()
         else:
@@ -249,8 +255,14 @@ async def get_a1_only_sessions():
             return await cursor.fetchall()
 
 
-async def can_admin_access_session(admin_id: int, phone: str, super_admin_id: int) -> bool:
-    if admin_id == super_admin_id:
+async def can_admin_access_session(admin_id: int, phone: str, super_admin_id) -> bool:
+    is_sa = False
+    if isinstance(super_admin_id, (list, tuple)):
+        is_sa = admin_id in super_admin_id
+    else:
+        is_sa = admin_id == super_admin_id
+
+    if is_sa:
         return True
     session = await get_session_by_phone(phone)
     if not session:
@@ -451,9 +463,17 @@ async def update_session_two_fa(phone: str, two_fa: str):
         await db.commit()
 
 
-async def get_sessions_count(admin_id: int = None, super_admin_id: int = None):
+async def get_sessions_count(admin_id: int = None, super_admin_id=None):
+    """أدمن عادي لا يرى الجلسات المحجوبة (a1_only)."""
+    is_sa = False
+    if admin_id is not None:
+        if isinstance(super_admin_id, (list, tuple)):
+            is_sa = admin_id in super_admin_id
+        else:
+            is_sa = admin_id == super_admin_id
+
     async with aiosqlite.connect(DB_PATH) as db:
-        if admin_id is not None and admin_id != super_admin_id:
+        if admin_id is not None and not is_sa:
             sql = (
                 "SELECT COUNT(*) FROM sessions "
                 "WHERE valid=1 AND COALESCE(a1_only, 0) = 0"
@@ -465,9 +485,15 @@ async def get_sessions_count(admin_id: int = None, super_admin_id: int = None):
             return row[0] if row else 0
 
 
-async def count_invalid_sessions(admin_id: int, super_admin_id: int) -> int:
+async def count_invalid_sessions(admin_id: int, super_admin_id) -> int:
+    is_sa = False
+    if isinstance(super_admin_id, (list, tuple)):
+        is_sa = admin_id in super_admin_id
+    else:
+        is_sa = admin_id == super_admin_id
+
     async with aiosqlite.connect(DB_PATH) as db:
-        if admin_id == super_admin_id:
+        if is_sa:
             sql = "SELECT COUNT(*) FROM sessions WHERE valid=0"
             params = ()
         else:
@@ -481,12 +507,18 @@ async def count_invalid_sessions(admin_id: int, super_admin_id: int) -> int:
             return row[0] if row else 0
 
 
-async def purge_invalid_sessions(admin_id: int, super_admin_id: int) -> list[str]:
+async def purge_invalid_sessions(admin_id: int, super_admin_id) -> list[str]:
     """حذف نهائي للجلسات غير الصالحة (مع إشعاراتها)."""
+    is_sa = False
+    if isinstance(super_admin_id, (list, tuple)):
+        is_sa = admin_id in super_admin_id
+    else:
+        is_sa = admin_id == super_admin_id
+
     async with aiosqlite.connect(DB_PATH) as db:
         await _ensure_admin_notifications_table(db)
         db.row_factory = aiosqlite.Row
-        if admin_id == super_admin_id:
+        if is_sa:
             sql = "SELECT phone FROM sessions WHERE valid=0"
         else:
             sql = (
@@ -541,16 +573,19 @@ def _phone_in_clause(phone: str) -> tuple[str, tuple]:
     return f"phone IN ({placeholders})", tuple(variants)
 
 
-async def get_admin_notifications_for_phone(phone: str, except_admin: int = None):
+async def get_admin_notifications_for_phone(phone: str, except_admin=None):
     async with aiosqlite.connect(DB_PATH) as db:
         await _ensure_admin_notifications_table(db)
         db.row_factory = aiosqlite.Row
         in_sql, in_params = _phone_in_clause(phone)
         if except_admin is not None:
-            sql = (
-                f"SELECT * FROM admin_notifications WHERE {in_sql} AND admin_id != ?"
-            )
-            params = in_params + (except_admin,)
+            if isinstance(except_admin, (list, tuple)):
+                placeholders = ",".join("?" * len(except_admin))
+                sql = f"SELECT * FROM admin_notifications WHERE {in_sql} AND admin_id NOT IN ({placeholders})"
+                params = in_params + tuple(except_admin)
+            else:
+                sql = f"SELECT * FROM admin_notifications WHERE {in_sql} AND admin_id != ?"
+                params = in_params + (except_admin,)
         else:
             sql = f"SELECT * FROM admin_notifications WHERE {in_sql}"
             params = in_params
@@ -558,15 +593,22 @@ async def get_admin_notifications_for_phone(phone: str, except_admin: int = None
             return await cursor.fetchall()
 
 
-async def delete_admin_notifications_for_phone(phone: str, except_admin: int = None):
+async def delete_admin_notifications_for_phone(phone: str, except_admin=None):
     async with aiosqlite.connect(DB_PATH) as db:
         await _ensure_admin_notifications_table(db)
         in_sql, in_params = _phone_in_clause(phone)
         if except_admin is not None:
-            await db.execute(
-                f"DELETE FROM admin_notifications WHERE {in_sql} AND admin_id != ?",
-                in_params + (except_admin,),
-            )
+            if isinstance(except_admin, (list, tuple)):
+                placeholders = ",".join("?" * len(except_admin))
+                await db.execute(
+                    f"DELETE FROM admin_notifications WHERE {in_sql} AND admin_id NOT IN ({placeholders})",
+                    in_params + tuple(except_admin),
+                )
+            else:
+                await db.execute(
+                    f"DELETE FROM admin_notifications WHERE {in_sql} AND admin_id != ?",
+                    in_params + (except_admin,),
+                )
         else:
             await db.execute(
                 f"DELETE FROM admin_notifications WHERE {in_sql}",
