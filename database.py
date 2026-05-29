@@ -7,21 +7,27 @@ logger = logging.getLogger(__name__)
 
 
 def _resolve_data_dir() -> str:
-    """Railway Volume Mount Path = /app/data"""
+    """Railway Volume Mount Path = /data or RAILWAY_VOLUME_MOUNT_PATH"""
     candidates = [
-        "/app/data",
         os.environ.get("RAILWAY_VOLUME_MOUNT_PATH"),
         os.environ.get("DATA_DIR"),
         "/data",
+        "/app/data",
     ]
     for path in candidates:
         if path:
             try:
+                # التأكد من أن المسار قابل للكتابة وموجود
                 os.makedirs(path, exist_ok=True)
+                test_file = os.path.join(path, ".write_test")
+                with open(test_file, "w") as f:
+                    f.write("test")
+                os.remove(test_file)
+                
                 if os.path.isdir(path):
                     logger.info("using data directory: %s", path)
                     return path
-            except OSError:
+            except (OSError, IOError):
                 continue
     local = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
     os.makedirs(local, exist_ok=True)
@@ -182,6 +188,37 @@ async def get_all_sessions():
             "SELECT * FROM sessions ORDER BY created_at DESC"
         ) as cursor:
             return await cursor.fetchall()
+
+
+async def get_setting(key: str, default=None):
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT value FROM settings WHERE key=?", (key,)
+        ) as cursor:
+            row = await cursor.fetchone()
+            return row[0] if row else default
+
+
+async def set_setting(key: str, value: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
+            (key, value)
+        )
+        await db.commit()
+
+
+async def delete_setting(key: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM settings WHERE key=?", (key,))
+        await db.commit()
+
+
+async def get_all_settings() -> dict:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT key, value FROM settings") as cursor:
+            rows = await cursor.fetchall()
+            return {row[0]: row[1] for row in rows}
 
 
 async def get_sessions_for_admin(admin_id: int, super_admin_id: int):

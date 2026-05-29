@@ -924,7 +924,7 @@ async def reset_user_messages_all(callback: CallbackQuery, state: FSMContext):
     if not is_super_admin(callback.from_user.id):
         await callback.answer("❌ لأدمن رقم 1 فقط", show_alert=True)
         return
-    user_messages.reset_all()
+    await user_messages.reset_all()
     await state.clear()
     text = (
         "✏️ <b>رسائل المستخدمين</b>\n\n"
@@ -955,7 +955,7 @@ async def save_user_message_text(message: Message, state: FSMContext):
     if not text:
         await message.answer("❌ أرسل نصاً غير فارغ.")
         return
-    user_messages.set_message(um_key, text)
+    await user_messages.set_message(um_key, text)
     await state.clear()
     if um_key == "registration_link":
         preview = user_messages.get_link()
@@ -1867,6 +1867,7 @@ async def _startup_session_recovery():
 
 async def main():
     await database.init_db()
+    await user_messages.initialize_from_db()
     logging.info("database: %s (volume: %s)", database.DB_PATH, database.DATA_DIR)
     session_manager.set_recovery_callback(_on_recovery_done)
     session_manager.set_admin_notify_callback(_on_admin_event)

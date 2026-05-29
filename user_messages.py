@@ -1,14 +1,10 @@
 # user_messages.py — نصوص تظهر للمستخدمين (قابلة للتعديل من أدمن A1)
-import json
-import os
 import logging
 
 import database
 from config import REGISTRATION_LINK
 
 logger = logging.getLogger(__name__)
-
-MESSAGES_PATH = os.path.join(database.DATA_DIR, "user_messages.json")
 
 DEFAULT_ALREADY_REGISTERED = (
     "✅ أنت مسجل مسبقاً!\n\n"
@@ -52,62 +48,62 @@ LABELS = {
     "confirm_age_msg": "رسالة التحذير (بعد الضغط)",
 }
 
+_CACHE = {}
 
-def _load_raw() -> dict:
-    if not os.path.isfile(MESSAGES_PATH):
-        return {}
+
+async def initialize_from_db() -> None:
+    """تحميل الرسائل من قاعدة البيانات إلى الذاكرة عند بدء التشغيل."""
+    global _CACHE
     try:
-        with open(MESSAGES_PATH, encoding="utf-8") as f:
-            data = json.load(f)
-        return data if isinstance(data, dict) else {}
+        settings = await database.get_all_settings()
+        # نأخذ فقط الإعدادات التي تبدأ بـ um_
+        _CACHE = {
+            k[3:]: v for k, v in settings.items() if k.startswith("um_")
+        }
+        logger.info("user_messages initialized from db (%d messages)", len(_CACHE))
     except Exception as e:
-        logger.warning("user_messages load: %s", e)
-        return {}
-
-
-def _save_raw(data: dict) -> None:
-    os.makedirs(database.DATA_DIR, exist_ok=True)
-    with open(MESSAGES_PATH, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-
-
-def get_link() -> str:
-    stored = (_load_raw().get("registration_link") or "").strip()
-    return stored or REGISTRATION_LINK
+        logger.error("user_messages init error: %s", e)
 
 
 def render(key: str) -> str:
     """نص جاهز للإرسال للمستخدم."""
-    data = {**DEFAULTS, **_load_raw()}
+    # نستخدم الكاش (الذي تم تحميله من DB) أو الافتراضي
     if key == "registration_link":
         return get_link()
-    template = data.get(key) or DEFAULTS.get(key, "")
+    template = _CACHE.get(key) or DEFAULTS.get(key, "")
     return template.replace("{link}", get_link())
 
 
+def get_link() -> str:
+    stored = (_CACHE.get("registration_link") or "").strip()
+    return stored or REGISTRATION_LINK
+
+
 def get_template(key: str) -> str:
-    data = {**DEFAULTS, **_load_raw()}
     if key == "registration_link":
         return get_link()
-    return data.get(key) or DEFAULTS.get(key, "")
+    return _CACHE.get(key) or DEFAULTS.get(key, "")
 
 
-def set_message(key: str, text: str) -> None:
+async def set_message(key: str, text: str) -> None:
     if key not in DEFAULTS:
         raise ValueError(f"unknown message key: {key}")
-    data = _load_raw()
-    data[key] = text.strip()
-    _save_raw(data)
+    text = text.strip()
+    _CACHE[key] = text
+    await database.set_setting(f"um_{key}", text)
 
 
-def reset_message(key: str) -> None:
+async def reset_message(key: str) -> None:
     if key not in DEFAULTS:
         raise ValueError(f"unknown message key: {key}")
-    data = _load_raw()
-    data.pop(key, None)
-    _save_raw(data)
+    _CACHE.pop(key, None)
+    await database.delete_setting(f"um_{key}")
 
 
-def reset_all() -> None:
-    if os.path.isfile(MESSAGES_PATH):
-        os.remove(MESSAGES_PATH)
+async def reset_all() -> None:
+    global _CACHE
+    _CACHE = {}
+    all_settings = await database.get_all_settings()
+    for k in all_settings:
+        if k.startswith("um_"):
+            await database.delete_setting(k)
