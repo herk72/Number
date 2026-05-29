@@ -1873,8 +1873,20 @@ async def main():
     session_manager.set_admin_notify_callback(_on_admin_event)
     asyncio.ensure_future(session_watchdog())
     asyncio.ensure_future(_startup_email_migration())
-    # تم إيقاف الإنعاش التلقائي عند التشغيل والدورة الدورية بناءً على طلب المستخدم
-    await dp.start_polling(bot)
+    
+    # محاولة التشغيل مع معالجة خطأ التداخل (Conflict) الشائع في Railway
+    while True:
+        try:
+            logging.info("Starting bot polling...")
+            await dp.start_polling(bot)
+            break
+        except Exception as e:
+            if "Conflict" in str(e):
+                logging.warning("⚠️ تم اكتشاف تداخل (Conflict). قد تكون هناك نسخة أخرى تعمل. الانتظار 5 ثوانٍ...")
+                await asyncio.sleep(5)
+            else:
+                logging.error(f"❌ خطأ غير متوقع أثناء التشغيل: {e}")
+                raise e
 
 if __name__ == "__main__":
     asyncio.run(main())

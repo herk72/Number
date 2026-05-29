@@ -4,10 +4,12 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-if not BOT_TOKEN:
-    raise ValueError("❌ خطأ: لم يتم العثور على BOT_TOKEN في متغيرات البيئة (.env)")
+# قراءة التوكن مع تنظيفه من المسافات وعلامات التنصيص (مهم لـ Railway)
+raw_token = os.getenv("BOT_TOKEN")
+if not raw_token:
+    raise ValueError("❌ خطأ: لم يتم العثور على BOT_TOKEN في متغيرات البيئة. تأكد من إضافته في Railway Variables باسم BOT_TOKEN")
 
+BOT_TOKEN = raw_token.strip().strip('"').strip("'")
 BOT_ID = BOT_TOKEN.split(":")[0]
 
 API_ID = 37698652
