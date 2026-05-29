@@ -23,8 +23,7 @@ def build_volume_zip() -> tuple[bytes, str]:
                 arcname = file_path.relative_to(root).as_posix()
                 zf.write(file_path, arcname)
     buffer.seek(0)
-    # اسم الملف يحتوي على BOT_ID لتمييز النسخة
-    filename = f"volume_{BOT_ID}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
+    filename = f"volume_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
     return buffer.getvalue(), filename
 
 

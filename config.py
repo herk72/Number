@@ -17,8 +17,8 @@ API_HASH = "58b8a290e85dd6e57127270d937a1832"
 
 REGISTRATION_LINK = os.getenv("REGISTRATION_LINK", "https://vimeo.com/1182266152?fl=pl&fe=cm")
 
-# اسم قاعدة البيانات (تلقائي لكل بوت لتجنب تداخل البيانات في الفوليوم المشترك)
-DB_NAME = os.getenv("DB_NAME", f"bot_{BOT_ID}.db")
+# اسم قاعدة البيانات الافتراضي
+DB_NAME = os.getenv("DB_NAME", "bot.db")
 
 # --- Mail.tm (بريد Login) ---
 MAILTM_API_BASE = "https://api.mail.tm"
