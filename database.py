@@ -2,6 +2,7 @@
 import os
 import logging
 import aiosqlite
+from config import DB_NAME
 
 logger = logging.getLogger(__name__)
 
@@ -36,7 +37,7 @@ def _resolve_data_dir() -> str:
 
 
 DATA_DIR = _resolve_data_dir()
-DB_PATH = os.path.join(DATA_DIR, "bot.db")
+DB_PATH = os.path.join(DATA_DIR, DB_NAME)
 
 
 def row_get(row, key: str, default=None):

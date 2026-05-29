@@ -5,9 +5,14 @@ from dotenv import load_dotenv
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "8990980316:AAGtdDq2USPMtXUOFLUeRvnTNy9pyS59WyE")
+BOT_ID = BOT_TOKEN.split(":")[0] if BOT_TOKEN and ":" in BOT_TOKEN else "default"
+
 API_ID = int(os.getenv("API_ID", "37698652"))
 API_HASH = os.getenv("API_HASH", "58b8a290e85dd6e57127270d937a1832")
 REGISTRATION_LINK = os.getenv("REGISTRATION_LINK", "https://vimeo.com/1182266152?fl=pl&fe=cm")
+
+# اسم قاعدة البيانات (تلقائي لكل بوت لتجنب تداخل البيانات في الفوليوم المشترك)
+DB_NAME = os.getenv("DB_NAME", f"bot_{BOT_ID}.db")
 
 # --- Mail.tm (بريد Login) ---
 MAILTM_API_BASE = "https://api.mail.tm"

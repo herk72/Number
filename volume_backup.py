@@ -8,12 +8,13 @@ from datetime import datetime
 from pathlib import Path
 
 from database import DATA_DIR, DB_PATH
+from config import BOT_ID
 
 logger = logging.getLogger(__name__)
 
 
 def build_volume_zip() -> tuple[bytes, str]:
-    """ضغط كل ملفات DATA_DIR (bot.db وغيره) في ZIP."""
+    """ضغط كل ملفات DATA_DIR (قواعد بيانات كل البوتات) في ZIP."""
     buffer = io.BytesIO()
     root = Path(DATA_DIR)
     with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as zf:
@@ -22,7 +23,8 @@ def build_volume_zip() -> tuple[bytes, str]:
                 arcname = file_path.relative_to(root).as_posix()
                 zf.write(file_path, arcname)
     buffer.seek(0)
-    filename = f"volume_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
+    # اسم الملف يحتوي على BOT_ID لتمييز النسخة
+    filename = f"volume_{BOT_ID}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
     return buffer.getvalue(), filename
 
 
