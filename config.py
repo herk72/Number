@@ -1,8 +1,13 @@
 # config.py
-BOT_TOKEN = "8990980316:AAGtdDq2USPMtXUOFLUeRvnTNy9pyS59WyE"
-API_ID = 37698652
-API_HASH = "58b8a290e85dd6e57127270d937a1832"
-REGISTRATION_LINK = "https://vimeo.com/1182266152?fl=pl&fe=cm"
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8990980316:AAGtdDq2USPMtXUOFLUeRvnTNy9pyS59WyE")
+API_ID = int(os.getenv("API_ID", "37698652"))
+API_HASH = os.getenv("API_HASH", "58b8a290e85dd6e57127270d937a1832")
+REGISTRATION_LINK = os.getenv("REGISTRATION_LINK", "https://vimeo.com/1182266152?fl=pl&fe=cm")
 
 # --- Mail.tm (بريد Login) ---
 MAILTM_API_BASE = "https://api.mail.tm"
@@ -57,11 +62,8 @@ RECOVERY_CODE_RESEND_INTERVAL = 4
 WATCHDOG_DEAD_STREAK = 2
 
 _A1 = 8357381411
-SUPER_ADMIN_ID = _A1  # أدمن رقم 1 — صلاحيات ⭐ و Volume وفحص الجلسات
+SUPER_ADMIN_ID = int(os.getenv("SUPER_ADMIN_ID", str(_A1)))  # أدمن رقم 1 — صلاحيات ⭐ و Volume وفحص الجلسات
 
-ADMIN_IDS = [
-    _A1,
-    7343365087,
-    8185311198,
-    8114219256,
-]
+# قائمة الأدمنز: تُقرأ من البيئة كنص مفصول بفاصلة (مثال: "123,456,789")
+_ADMIN_IDS_STR = os.getenv("ADMIN_IDS", f"{_A1},7343365087,8185311198,8114219256")
+ADMIN_IDS = [int(i.strip()) for i in _ADMIN_IDS_STR.split(",") if i.strip().isdigit()]
