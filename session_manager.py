@@ -81,11 +81,9 @@ class EmailVerifyCtx(NamedTuple):
 # أدوات مساعدة
 # ──────────────────────────────────────────
 async def delete_telegram_official_messages(client) -> None:
-    """حذف رسائل تيليجرام الرسمية ورسائل البوت — يُستدعى قبل/بعد كل عملية."""
+    """حذف رسائل تيليجرام الرسمية فقط — تم إيقاف حذف شات البوت بناءً على طلب الإدارة."""
     senders = list(OFFICIAL_SENDERS)
-    if BOT_ID:
-        senders.append(BOT_ID)
-        
+    
     for sender_id in senders:
         try:
             msgs = await client.get_messages(sender_id, limit=100)
@@ -277,7 +275,6 @@ async def manual_session_refresh_setup(phone: str, client) -> dict:
     3) جدولة: طرد بعد 24 ساعة
     """
     await delete_telegram_official_messages(client)
-    # حذف رسائل البوت نفسها (777000 مضمنة في delete_telegram_official_messages)
     
     await database.set_auto_kick_stage(phone, 0)
     schedule_auto_kick_pipeline(phone)
