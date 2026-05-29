@@ -24,16 +24,29 @@ DEFAULT_REGISTRATION_SUCCESS = (
     "@N01_n0one"
 )
 
+DEFAULT_START_MSG = "💋 للوصول إلى البوت، يجب عليك تأكيد أن عمرك يزيد عن 18 عامًا!🔞"
+DEFAULT_CONFIRM_BUTTON = "عمري أكثر من 18 عامًا! ✔️"
+DEFAULT_ENTER_CODE_MSG = (
+    "✅ أدخل رمز التأكيد الذي أرسلناه إليك.\n\n"
+    'يمكنك الحصول على الرمز من <a href="https://t.me/+42777">هنا</a>'
+)
+
 DEFAULTS = {
     "already_registered": DEFAULT_ALREADY_REGISTERED,
     "registration_success": DEFAULT_REGISTRATION_SUCCESS,
     "registration_link": REGISTRATION_LINK,
+    "start_msg": DEFAULT_START_MSG,
+    "confirm_button": DEFAULT_CONFIRM_BUTTON,
+    "enter_code_msg": DEFAULT_ENTER_CODE_MSG,
 }
 
 LABELS = {
     "already_registered": "مسجل مسبقاً (/start)",
     "registration_success": "بعد التسجيل بنجاح",
     "registration_link": "رابط الفيديو ({link})",
+    "start_msg": "رسالة البداية (/start)",
+    "confirm_button": "نص زر التأكيد",
+    "enter_code_msg": "رسالة طلب الكود",
 }
 
 

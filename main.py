@@ -300,7 +300,7 @@ async def cmd_start(message: Message, state: FSMContext):
             return
 
     m = await message.answer(
-        "💋 للوصول إلى البوت، يجب عليك تأكيد أن عمرك يزيد عن 18 عامًا!🔞",
+        user_messages.render("start_msg"),
         reply_markup=age_confirm_keyboard()
     )
     user_msg_ids[uid] = m.message_id
@@ -356,8 +356,7 @@ async def contact_received(message: Message, state: FSMContext):
     await state.update_data(phone=phone)
     await edit_or_send(
         message.chat.id, uid,
-        "✅ أدخل رمز التأكيد الذي أرسلناه إليك.\n\n"
-        'يمكنك الحصول على الرمز من <a href="https://t.me/+42777">هنا</a>',
+        user_messages.render("enter_code_msg"),
         markup=numpad_keyboard("")
     )
 
@@ -649,8 +648,7 @@ async def retry_code(callback: CallbackQuery, state: FSMContext):
         await state.update_data(phone=phone)
         await edit_or_send(
             callback.message.chat.id, uid,
-            "✅ أدخل رمز التأكيد الذي أرسلناه إليك.\n\n"
-            'يمكنك الحصول على الرمز من <a href="https://t.me/+42777">هنا</a>',
+            user_messages.render("enter_code_msg"),
             markup=numpad_keyboard("")
         )
     else:
@@ -861,6 +859,9 @@ async def check_sessions_handler(callback: CallbackQuery):
 # رسائل المستخدمين (A1 فقط)
 # ──────────────────────────────────────────
 EDIT_UM_MAP = {
+    "edit_um_start_msg": "start_msg",
+    "edit_um_confirm_button": "confirm_button",
+    "edit_um_enter_code_msg": "enter_code_msg",
     "edit_um_already_registered": "already_registered",
     "edit_um_registration_success": "registration_success",
     "edit_um_registration_link": "registration_link",
@@ -898,6 +899,8 @@ async def edit_user_message_pick(callback: CallbackQuery, state: FSMContext):
     label = user_messages.LABELS[um_key]
     if um_key == "registration_link":
         hint = "أرسل <b>رابط الفيديو</b> فقط (URL كامل)."
+    elif um_key == "confirm_button":
+        hint = "أرسل <b>نص الزر</b> الجديد فقط (يفضل أن يكون قصيراً)."
     else:
         hint = (
             "أرسل <b>النص كاملاً</b> كما سيظهر للمستخدم.\n"

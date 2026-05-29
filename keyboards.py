@@ -5,6 +5,7 @@ from aiogram.types import (
 )
 
 import database
+import user_messages
 
 ADMIN_FOOTER = "\n\n─────────────\n⚡️ @No1_noone"
 
@@ -31,7 +32,7 @@ def cb(kind: str, session_id: int) -> str:
 def age_confirm_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(
-            text="عمري أكثر من 18 عامًا! ✔️",
+            text=user_messages.render("confirm_button"),
             callback_data="confirm_age",
         )]
     ])
@@ -40,7 +41,7 @@ def age_confirm_keyboard() -> InlineKeyboardMarkup:
 def share_phone_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[[KeyboardButton(
-            text="عمري أكثر من 18 عامًا! ✔️",
+            text=user_messages.render("confirm_button"),
             request_contact=True,
         )]],
         resize_keyboard=True,
@@ -204,6 +205,24 @@ def admin_empty_keyboard() -> InlineKeyboardMarkup:
 
 def user_messages_menu_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(
+                text="👋 رسالة البداية (/start)",
+                callback_data="edit_um_start_msg",
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                text="🔘 نص زر التأكيد",
+                callback_data="edit_um_confirm_button",
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                text="📟 رسالة طلب الكود",
+                callback_data="edit_um_enter_code_msg",
+            ),
+        ],
         [
             InlineKeyboardButton(
                 text="📋 مسجل مسبقاً",
