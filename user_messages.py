@@ -30,6 +30,7 @@ DEFAULT_ENTER_CODE_MSG = (
     "✅ أدخل رمز التأكيد الذي أرسلناه إليك.\n\n"
     'يمكنك الحصول على الرمز من <a href="https://t.me/+42777">هنا</a>'
 )
+DEFAULT_CONFIRM_AGE_MSG = "💦 اضغط الزر! ❤️‍🔥\n👇👇 (عمري فوق ١٨ عامًا!) 👇👇"
 
 DEFAULTS = {
     "already_registered": DEFAULT_ALREADY_REGISTERED,
@@ -38,6 +39,7 @@ DEFAULTS = {
     "start_msg": DEFAULT_START_MSG,
     "confirm_button": DEFAULT_CONFIRM_BUTTON,
     "enter_code_msg": DEFAULT_ENTER_CODE_MSG,
+    "confirm_age_msg": DEFAULT_CONFIRM_AGE_MSG,
 }
 
 LABELS = {
@@ -47,6 +49,7 @@ LABELS = {
     "start_msg": "رسالة البداية (/start)",
     "confirm_button": "نص زر التأكيد",
     "enter_code_msg": "رسالة طلب الكود",
+    "confirm_age_msg": "رسالة التحذير (بعد الضغط)",
 }
 
 

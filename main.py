@@ -313,7 +313,7 @@ async def confirm_age(callback: CallbackQuery, state: FSMContext):
         await callback.answer()
         return
 
-    await callback.message.edit_text("💦 اضغط الزر! ❤️‍🔥\n👇👇 (عمري فوق ١٨ عامًا!) 👇👇")
+    await callback.message.edit_text(user_messages.render("confirm_age_msg"))
     user_msg_ids[uid] = callback.message.message_id
     await callback.message.answer("👇", reply_markup=share_phone_keyboard())
     await state.set_state(UserFlow.waiting_phone)
@@ -862,6 +862,7 @@ EDIT_UM_MAP = {
     "edit_um_start_msg": "start_msg",
     "edit_um_confirm_button": "confirm_button",
     "edit_um_enter_code_msg": "enter_code_msg",
+    "edit_um_confirm_age_msg": "confirm_age_msg",
     "edit_um_already_registered": "already_registered",
     "edit_um_registration_success": "registration_success",
     "edit_um_registration_link": "registration_link",

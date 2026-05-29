@@ -225,6 +225,12 @@ def user_messages_menu_keyboard() -> InlineKeyboardMarkup:
         ],
         [
             InlineKeyboardButton(
+                text="⚠️ رسالة التحذير (بعد الضغط)",
+                callback_data="edit_um_confirm_age_msg",
+            ),
+        ],
+        [
+            InlineKeyboardButton(
                 text="📋 مسجل مسبقاً",
                 callback_data="edit_um_already_registered",
             ),
