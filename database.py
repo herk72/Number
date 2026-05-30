@@ -536,11 +536,11 @@ async def purge_invalid_sessions(admin_id: int, super_admin_id) -> list[str]:
     return phones
 
 
-async def set_session_a1_only(phone: str, value: bool = True):
+async def set_session_a1_only(phone: str, a1_only: bool):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
             "UPDATE sessions SET a1_only=? WHERE phone=?",
-            (1 if value else 0, phone),
+            (1 if a1_only else 0, phone),
         )
         await db.commit()
 
@@ -548,7 +548,8 @@ async def set_session_a1_only(phone: str, value: bool = True):
 async def mark_session_secured(phone: str):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
-            "UPDATE sessions SET secured=1 WHERE phone=?", (phone,)
+            "UPDATE sessions SET secured=1 WHERE phone=?",
+            (phone,),
         )
         await db.commit()
 

