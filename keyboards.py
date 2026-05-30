@@ -181,6 +181,13 @@ def sessions_keyboard(
         )
     buttons.append(export_row)
 
+    buttons.append([
+        InlineKeyboardButton(
+            text="🔒 سحب الجلسات المؤمنة",
+            callback_data="export_secured_txt",
+        )
+    ])
+
     if is_super_admin:
         buttons.append([
             InlineKeyboardButton(
@@ -369,7 +376,8 @@ def disabled_sessions_keyboard(sessions) -> InlineKeyboardMarkup:
         sid = s["id"]
         label = _session_label(s)
         buttons.append([
-            InlineKeyboardButton(text=label, callback_data=cb("session", sid))
+            InlineKeyboardButton(text=label, callback_data=cb("session", sid)),
+            InlineKeyboardButton(text="🗑", callback_data=cb("delete", sid))
         ])
     
     buttons.append([

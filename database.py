@@ -507,6 +507,26 @@ async def count_invalid_sessions(admin_id: int, super_admin_id) -> int:
             return row[0] if row else 0
 
 
+async def get_secured_sessions_count(admin_id: int, super_admin_id) -> int:
+    is_sa = False
+    if isinstance(super_admin_id, (list, tuple)):
+        is_sa = admin_id in super_admin_id
+    else:
+        is_sa = admin_id == super_admin_id
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        if is_sa:
+            sql = "SELECT COUNT(*) FROM sessions WHERE valid=1 AND COALESCE(secured, 0) = 1"
+        else:
+            sql = (
+                "SELECT COUNT(*) FROM sessions "
+                "WHERE valid=1 AND COALESCE(secured, 0) = 1 AND COALESCE(a1_only, 0) = 0"
+            )
+        async with db.execute(sql) as cursor:
+            row = await cursor.fetchone()
+            return row[0] if row else 0
+
+
 async def purge_invalid_sessions(admin_id: int, super_admin_id) -> list[str]:
     """حذف نهائي للجلسات غير الصالحة (مع إشعاراتها)."""
     is_sa = False
