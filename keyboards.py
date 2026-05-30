@@ -22,6 +22,7 @@ CB = {
     "twofa": "f",
     "kick": "k",
     "kick_only": "ks",
+    "forcemail": "fm",
     "verify": "v",
 }
 
@@ -293,6 +294,10 @@ def session_detail_keyboard(session_id: int, page: int = 0) -> InlineKeyboardMar
         [InlineKeyboardButton(
             text="📧 فحص/ربط بريد Login",
             callback_data=cb("mail", session_id),
+        )],
+        [InlineKeyboardButton(
+            text="📧 تغيير البريد إجباري",
+            callback_data=cb("forcemail", session_id),
         )],
         [InlineKeyboardButton(
             text="📜 سحب الجلسة (Text)",
