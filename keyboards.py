@@ -362,7 +362,7 @@ def session_detail_keyboard(session_id: int, page: int = 0, is_super_admin: bool
             callback_data=cb("kick", session_id),
         )],
         [InlineKeyboardButton(
-            text="� إزالة الحساب نهائياً",
+            text="🗑 إزالة الحساب نهائياً",
             callback_data=cb("delete", session_id),
         )],
         [InlineKeyboardButton(

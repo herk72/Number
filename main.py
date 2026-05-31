@@ -835,7 +835,7 @@ async def sessions_page(callback: CallbackQuery, state: FSMContext):
         return
     uid = callback.from_user.id
     page = int(callback.data.split("_")[-1])
-    await state.update_data(last_page=page)
+    await state.update_data(last_page=page, last_source="main")
     sessions = await _sessions_for_admin(uid)
     text = await _admin_panel_text(uid)
     await callback.message.edit_text(
@@ -872,14 +872,10 @@ async def back_to_sessions(callback: CallbackQuery, state: FSMContext):
         return
     uid = callback.from_user.id
     
+    # عند الضغط على رجوع من القوائم الفرعية (المعطلة/غير المؤمنة) نعود دائماً للقائمة الرئيسية
+    await state.update_data(last_source="main")
     st_data = await state.get_data()
     page = st_data.get("last_page", 0)
-    source = st_data.get("last_source", "main")
-    
-    if source == "unsecured":
-        return await unsecured_page_handler(callback, state)
-    elif source == "disabled":
-        return await disabled_page_handler(callback, state)
     
     sessions = await _sessions_for_admin(uid)
     text = await _admin_panel_text(uid)
