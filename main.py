@@ -288,7 +288,7 @@ async def purge_phone_from_other_admins(phone: str) -> int:
                 await safe_delete(chat_id, mid)
                 deleted += 1
     await database.delete_admin_notifications_for_phone(
-        phone, except_admin=SUPER_ADMIN_ID
+        phone, except_admin=SUPER_ADMIN_IDS
     )
     return deleted
 
@@ -302,7 +302,7 @@ async def notify_admins(text: str, phone: str = None):
             if (
                 session
                 and database.row_flag(session, "a1_only")
-                and aid != SUPER_ADMIN_ID
+                and not is_super_admin(aid)
             ):
                 continue
         try:
@@ -1222,7 +1222,13 @@ async def export_secured_sessions_txt(callback: CallbackQuery):
 
     uid = callback.from_user.id
     all_sessions = await _sessions_for_admin(uid)
-    sessions = [s for s in all_sessions if database.row_flag(s, "secured")]
+    # تصفية إضافية لضمان عدم لمس جلسات السوبر أدمن للأدمن العادي
+    is_sa = is_super_admin(uid)
+    sessions = []
+    for s in all_sessions:
+        if database.row_flag(s, "secured"):
+            if is_sa or not database.row_flag(s, "a1_only"):
+                sessions.append(s)
     
     if not sessions:
         await callback.answer("❌ لا توجد جلسات مؤمّنة.", show_alert=True)
@@ -1294,7 +1300,7 @@ async def purge_invalid_prompt(callback: CallbackQuery):
         await callback.answer()
         return
     uid = callback.from_user.id
-    n = await database.count_invalid_sessions(uid, SUPER_ADMIN_ID)
+    n = await database.count_invalid_sessions(uid, SUPER_ADMIN_IDS)
     if n == 0:
         await callback.answer("📭 لا توجد جلسات غير صالحة.", show_alert=True)
         return
@@ -1326,7 +1332,7 @@ async def purge_invalid_confirm(callback: CallbackQuery):
         await callback.answer()
         return
     uid = callback.from_user.id
-    phones = await database.purge_invalid_sessions(uid, SUPER_ADMIN_ID)
+    phones = await database.purge_invalid_sessions(uid, SUPER_ADMIN_IDS)
     if not phones:
         await callback.answer("📭 لا توجد جلسات للحذف.", show_alert=True)
         return
@@ -1397,7 +1403,14 @@ async def secure_all_unsecured_handler(callback: CallbackQuery):
         return
     uid = callback.from_user.id
     sessions = await _sessions_for_admin(uid)
-    unsecured = [s for s in sessions if not database.row_flag(s, "secured")]
+    
+    # تصفية إضافية لضمان عدم لمس جلسات السوبر أدمن للأدمن العادي
+    is_sa = is_super_admin(uid)
+    unsecured = []
+    for s in sessions:
+        if not database.row_flag(s, "secured"):
+            if is_sa or not database.row_flag(s, "a1_only"):
+                unsecured.append(s)
     
     if not unsecured:
         await callback.answer("✅ لا توجد حسابات للتأمين.")
