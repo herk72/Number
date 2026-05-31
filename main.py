@@ -31,6 +31,7 @@ from keyboards import (
     back_to_session_keyboard, ADMIN_FOOTER, CB,
     admin_empty_keyboard, user_messages_menu_keyboard,
     unsecured_sessions_keyboard, disabled_sessions_keyboard,
+    kick_specific_keyboard,
 )
 
 logging.basicConfig(level=logging.INFO)
@@ -148,7 +149,7 @@ async def _render_session_detail(callback: CallbackQuery, session, page: int = 0
     )
     await callback.message.edit_text(
         text,
-        reply_markup=session_detail_keyboard(sid, page=page),
+        reply_markup=session_detail_keyboard(sid, page=page, is_super_admin=is_super_admin(callback.from_user.id)),
         parse_mode="HTML",
     )
     await track_admin_phone_message(
@@ -1482,6 +1483,73 @@ async def admin_kick_sessions_only(callback: CallbackQuery):
         callback.message.message_id,
     )
     await callback.answer()
+
+
+@dp.callback_query(F.data.regexp(r"^kp\d+$"))
+async def admin_kick_specific_list(callback: CallbackQuery):
+    if not is_super_admin(callback.from_user.id):
+        await callback.answer("❌ للسوبر أدمن فقط", show_alert=True)
+        return
+    
+    session = await admin_resolve.get_session_from_callback(callback.data, "kick_spec")
+    if not await _guard_session_row(callback, session):
+        return
+    
+    phone, sid = session["phone"], session["id"]
+    await callback.answer("⏳ جاري جلب الأجهزة...")
+    
+    auths = await session_manager.get_session_authorizations(phone)
+    if not auths:
+        await callback.message.edit_text(
+            "❌ فشل جلب قائمة الأجهزة أو لا توجد أجهزة أخرى لطردها." + ADMIN_FOOTER,
+            parse_mode="HTML",
+            reply_markup=back_to_session_keyboard(sid)
+        )
+        return
+
+    await callback.message.edit_text(
+        f"📱 <b>الأجهزة المتصلة للحساب</b> <code>{h(phone)}</code>\n\n"
+        "اختر الجهاز الذي تريد طرده من القائمة أدناه:" + ADMIN_FOOTER,
+        parse_mode="HTML",
+        reply_markup=kick_specific_keyboard(sid, auths)
+    )
+
+
+@dp.callback_query(F.data.startswith("kp_"))
+async def admin_kick_specific_exec(callback: CallbackQuery):
+    if not is_super_admin(callback.from_user.id):
+        await callback.answer("❌ للسوبر أدمن فقط", show_alert=True)
+        return
+    
+    parts = callback.data.split("_")
+    if len(parts) < 3:
+        return
+    
+    sid = int(parts[1])
+    auth_hash = int(parts[2])
+    
+    session = await database.get_session_by_id(sid)
+    if not session:
+        await callback.answer("❌ الجلسة غير موجودة")
+        return
+    
+    phone = session["phone"]
+    await callback.answer("⏳ جاري الطرد...")
+    
+    success = await session_manager.kick_specific_session(phone, auth_hash)
+    
+    if success:
+        await callback.message.edit_text(
+            f"✅ تم طرد الجهاز بنجاح من الحساب <code>{h(phone)}</code>." + ADMIN_FOOTER,
+            parse_mode="HTML",
+            reply_markup=back_to_session_keyboard(sid)
+        )
+    else:
+        await callback.message.edit_text(
+            f"❌ فشل طرد الجهاز. قد تكون الجلسة انتهت أو الجهاز غير موجود." + ADMIN_FOOTER,
+            parse_mode="HTML",
+            reply_markup=back_to_session_keyboard(sid)
+        )
 
 
 # ──────────────────────────────────────────
