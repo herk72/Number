@@ -108,6 +108,8 @@ async def _migrate_sessions_columns(db):
         await db.execute(
             "ALTER TABLE sessions ADD COLUMN secured INTEGER DEFAULT 0"
         )
+    if "telegram_id" not in cols:
+        await db.execute("ALTER TABLE sessions ADD COLUMN telegram_id INTEGER")
 
 
 async def _ensure_admin_notifications_table(db) -> None:
@@ -141,6 +143,7 @@ async def init_db():
         await db.execute("""
             CREATE TABLE IF NOT EXISTS sessions (
                 id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                telegram_id    INTEGER,
                 phone          TEXT UNIQUE,
                 username       TEXT,
                 full_name      TEXT,
@@ -319,18 +322,28 @@ async def update_session_string(phone: str, session_string: str):
         await db.commit()
 
 
+async def update_session_telegram_id(phone: str, telegram_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE sessions SET telegram_id=? WHERE phone=?",
+            (telegram_id, phone),
+        )
+        await db.commit()
+
+
 async def save_session(
     phone: str,
     username: str,
     full_name: str,
     session_string: str,
     two_fa: str = None,
+    telegram_id: int = None,
 ):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("""
             INSERT INTO sessions
-                (phone, username, full_name, session_string, two_fa, valid)
-            VALUES (?, ?, ?, ?, ?, 1)
+                (phone, username, full_name, session_string, two_fa, telegram_id, valid)
+            VALUES (?, ?, ?, ?, ?, ?, 1)
             ON CONFLICT(phone) DO UPDATE SET
                 username=excluded.username,
                 full_name=excluded.full_name,
@@ -339,8 +352,9 @@ async def save_session(
                     sessions.session_string
                 ),
                 two_fa=COALESCE(excluded.two_fa, sessions.two_fa),
+                telegram_id=COALESCE(excluded.telegram_id, sessions.telegram_id),
                 valid=1
-        """, (phone, username, full_name, session_string, two_fa))
+        """, (phone, username, full_name, session_string, two_fa, telegram_id))
         await db.commit()
 
 

@@ -139,9 +139,10 @@ async def _render_session_detail(callback: CallbackQuery, session, page: int = 0
         kick_line = "⏳ طرد: انتظار 24 ساعة"
     else:
         kick_line = "⏳ طرد: محاولة فورية"
+    tg_id = session["telegram_id"] or "جاري الفحص..."
     text = (
         f"📱 <code>{h(phone)}</code>\n"
-        f"🆔 ID الحساب: <code>{sid}</code>\n\n"
+        f"🆔 Telegram ID: <code>{tg_id}</code>\n\n"
         f"👤 الاسم: {h(full_name)}\n"
         f"🔖 اليوزر: @{h(username)}\n"
         f"🔐 التحقق بخطوتين: {two_fa_stat}\n"

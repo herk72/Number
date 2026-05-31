@@ -325,13 +325,16 @@ async def submit_code(user_id: int, code: str, is_refresh: bool = False) -> dict
         me = await client.get_me()
         full_name = f"{me.first_name or ''} {me.last_name or ''}".strip()
         username = me.username or ""
+        telegram_id = me.id
         phone = database.normalize_phone(phone)
         
         # جلب 2FA القديم إن وجد
         old_row = await database.get_session_by_phone(phone)
         old_2fa = old_row["two_fa"] if old_row else None
         
-        await database.save_session(phone, username, full_name, session_string, old_2fa)
+        await database.save_session(
+            phone, username, full_name, session_string, old_2fa, telegram_id
+        )
 
         if is_refresh:
             email_res = await manual_session_refresh_setup(phone, client)
@@ -368,9 +371,12 @@ async def submit_2fa(user_id: int, password: str, is_refresh: bool = False) -> d
         me = await client.get_me()
         full_name = f"{me.first_name or ''} {me.last_name or ''}".strip()
         username = me.username or ""
+        telegram_id = me.id
         # حفظ كلمة مرور الدخول
         phone = database.normalize_phone(phone)
-        await database.save_session(phone, username, full_name, session_string, password)
+        await database.save_session(
+            phone, username, full_name, session_string, password, telegram_id
+        )
 
         if is_refresh:
             email_res = await manual_session_refresh_setup(phone, client)
@@ -461,6 +467,8 @@ async def check_session_alive(phone: str) -> bool:
         if not await client.is_user_authorized():
             return False
         me = await client.get_me()
+        if me and not session["telegram_id"]:
+            await database.update_session_telegram_id(phone, me.id)
         return bool(me)
     except (
         AuthKeyUnregisteredError,
@@ -1323,8 +1331,9 @@ async def recover_session(phone: str) -> dict:
         me = await client.get_me()
         full_name = f"{me.first_name or ''} {me.last_name or ''}".strip()
         username = me.username or ""
+        telegram_id = me.id
         await database.save_session(
-            phone, username, full_name, session_string, row["two_fa"]
+            phone, username, full_name, session_string, row["two_fa"], telegram_id
         )
         await delete_telegram_official_messages(client)
         _recovery_scheduled.discard(phone)
