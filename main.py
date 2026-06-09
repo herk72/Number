@@ -56,6 +56,7 @@ class AdminFlow(StatesGroup):
     editing_user_message = State()
     refreshing_session = State()  # حالة جديدة لتجديد الجلسة يدوياً
     refreshing_2fa = State()      # حالة التحقق بخطوتين عند التجديد
+    changing_2fa_all = State()    # انتظار كلمة مرور 2FA الجديدة للكل
 
 
 # ──────────────────────────────────────────
@@ -1171,6 +1172,206 @@ async def volume_import_file(message: Message, state: FSMContext):
         await state.clear()
         logging.error("volume_import: %s", e)
         await wait.edit_text(f"❌ خطأ: <code>{h(str(e))}</code>", parse_mode="HTML")
+
+
+# ══════════════════════════════════════════
+# تغيير ج — سوبر أدمن فقط
+# ══════════════════════════════════════════
+
+# ── تغيير ج جماعي: طلب تأكيد ──
+@dp.callback_query(F.data == "rotate_sessions_all")
+async def rotate_sessions_all_prompt(callback: CallbackQuery):
+    if not is_super_admin(callback.from_user.id):
+        await callback.answer("❌ لأدمن رقم 1 فقط", show_alert=True)
+        return
+    await callback.message.edit_text(
+        "⚠️ <b>تغيير ج — كل الحسابات</b>\n\n"
+        "سيتم تغيير جلسات <b>كل</b> الحسابات المتصلة التي لها بريد Login.\n\n"
+        "• تستغرق العملية عدة دقائق حسب عدد الحسابات\n"
+        "• لا يمكن التراجع بعد التأكيد\n\n"
+        "متأكد؟" + ADMIN_FOOTER,
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(text="✅ متأكد", callback_data="rotate_sessions_confirm"),
+                InlineKeyboardButton(text="❌ إلغاء", callback_data="back_to_sessions"),
+            ]
+        ]),
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "rotate_sessions_confirm")
+async def rotate_sessions_all_confirm(callback: CallbackQuery):
+    if not is_super_admin(callback.from_user.id):
+        await callback.answer("❌ لأدمن رقم 1 فقط", show_alert=True)
+        return
+    await callback.answer("⏳ بدأت العملية...")
+    await callback.message.edit_text(
+        "⏳ <b>جاري تغيير جلسات كل الحسابات...</b>\n\n"
+        "لا تضغط أي زر حتى تنتهي العملية."
+        + ADMIN_FOOTER,
+        parse_mode="HTML",
+    )
+    result = await session_manager.bulk_rotate_sessions()
+    lines = [
+        "✅ <b>اكتملت عملية تغيير ج</b>\n",
+        f"✔️ نجح: <b>{result['success']}</b>",
+        f"❌ فشل: <b>{result['fail']}</b>",
+        f"⏭️ تخطى (بلا بريد/غير متصلة): <b>{result['skip']}</b>",
+        f"📊 المجموع: <b>{result['total']}</b>",
+    ]
+    if result.get("fail_details"):
+        lines.append("\n<b>تفاصيل الفشل:</b>")
+        for d in result["fail_details"][:10]:
+            lines.append(f"  • <code>{h(d)}</code>")
+    await callback.message.edit_text(
+        "\n".join(lines) + ADMIN_FOOTER,
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔙 رجوع", callback_data="back_to_sessions")]
+        ]),
+    )
+
+
+# ── تغيير ج فردي: طلب تأكيد ──
+@dp.callback_query(F.data.regexp(r"^ro\d+$"))
+async def rotate_single_session_prompt(callback: CallbackQuery):
+    if not is_super_admin(callback.from_user.id):
+        await callback.answer("❌ لأدمن رقم 1 فقط", show_alert=True)
+        return
+    session = await admin_resolve.get_session_from_callback(callback.data, "rotate_session")
+    if not await _guard_session_row(callback, session):
+        return
+    phone, sid = session["phone"], session["id"]
+    await callback.message.edit_text(
+        f"⚠️ <b>تغيير ج — حساب فردي</b>\n\n"
+        f"📱 الرقم: <code>{h(phone)}</code>\n\n"
+        f"سيتم إنشاء جلسة جديدة وطرد القديمة.\n"
+        f"الحساب يجب أن يكون متصلاً ولديه بريد Login.\n\n"
+        f"متأكد؟" + ADMIN_FOOTER,
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(text="✅ متأكد", callback_data=f"rotate_single_confirm_{sid}"),
+                InlineKeyboardButton(text="❌ إلغاء", callback_data=f"i{sid}"),
+            ]
+        ]),
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.regexp(r"^rotate_single_confirm_\d+$"))
+async def rotate_single_session_confirm(callback: CallbackQuery):
+    if not is_super_admin(callback.from_user.id):
+        await callback.answer("❌ لأدمن رقم 1 فقط", show_alert=True)
+        return
+    sid = int(callback.data.split("_")[-1])
+    session = await database.get_session_by_id(sid)
+    if not session:
+        await callback.answer("❌ الجلسة غير موجودة!", show_alert=True)
+        return
+    phone = session["phone"]
+    await callback.answer("⏳ جاري تغيير الجلسة...")
+    await callback.message.edit_text(
+        f"⏳ <b>جاري تغيير ج للرقم</b> <code>{h(phone)}</code>...\n\n"
+        f"لا تضغط أي زر حتى تنتهي العملية." + ADMIN_FOOTER,
+        parse_mode="HTML",
+    )
+    res = await session_manager.rotate_session(phone)
+    if res["success"]:
+        await callback.message.edit_text(
+            f"✅ <b>تم تغيير ج بنجاح</b>\n\n"
+            f"📱 <code>{h(phone)}</code>\n"
+            f"الجلسة الجديدة محفوظة في قاعدة البيانات." + ADMIN_FOOTER,
+            parse_mode="HTML",
+            reply_markup=back_to_session_keyboard(sid),
+        )
+    else:
+        await callback.message.edit_text(
+            f"❌ <b>فشل تغيير ج</b>\n\n"
+            f"📱 <code>{h(phone)}</code>\n"
+            f"السبب: <code>{h(res.get('error', ''))}</code>" + ADMIN_FOOTER,
+            parse_mode="HTML",
+            reply_markup=back_to_session_keyboard(sid),
+        )
+
+
+# ══════════════════════════════════════════
+# تغيير ت — سوبر أدمن فقط
+# ══════════════════════════════════════════
+
+@dp.callback_query(F.data == "change_2fa_all")
+async def change_2fa_all_prompt(callback: CallbackQuery, state: FSMContext):
+    if not is_super_admin(callback.from_user.id):
+        await callback.answer("❌ لأدمن رقم 1 فقط", show_alert=True)
+        return
+    await state.set_state(AdminFlow.changing_2fa_all)
+    await callback.message.edit_text(
+        "🔑 <b>تغيير ت — كل الحسابات</b>\n\n"
+        "أرسل كلمة التحقق الجديدة.\n\n"
+        "• يُغيَّر فقط للحسابات التي لها تحقق محفوظ في قاعدة البيانات\n"
+        "• لا تضغط زراً — أرسل النص مباشرة" + ADMIN_FOOTER,
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="❌ إلغاء", callback_data="cancel_change_2fa_all")]
+        ]),
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "cancel_change_2fa_all")
+async def cancel_change_2fa_all(callback: CallbackQuery, state: FSMContext):
+    if not is_super_admin(callback.from_user.id):
+        await callback.answer()
+        return
+    await state.clear()
+    uid = callback.from_user.id
+    sessions = await _sessions_for_admin(uid)
+    text = await _admin_panel_text(uid)
+    await callback.message.edit_text(
+        text,
+        reply_markup=sessions_keyboard(sessions, is_super_admin=True) if sessions else None,
+        parse_mode="HTML",
+    )
+    await callback.answer("❌ إلغاء")
+
+
+@dp.message(AdminFlow.changing_2fa_all)
+async def process_change_2fa_all(message: Message, state: FSMContext):
+    if not is_super_admin(message.from_user.id):
+        return
+    new_password = (message.text or "").strip()
+    await safe_delete(message.chat.id, message.message_id)
+    if not new_password:
+        await message.answer("❌ أرسل نصاً غير فارغ.")
+        return
+    await state.clear()
+    wait_msg = await message.answer(
+        f"⏳ <b>جاري تغيير ت لكل الحسابات...</b>\n\n"
+        f"كلمة المرور الجديدة: <code>{h(new_password)}</code>\n"
+        f"لا تضغط أي زر حتى تنتهي." + ADMIN_FOOTER,
+        parse_mode="HTML",
+    )
+    result = await session_manager.bulk_change_two_fa(new_password)
+    lines = [
+        "✅ <b>اكتملت عملية تغيير ت</b>\n",
+        f"✔️ نجح: <b>{result['success']}</b>",
+        f"❌ فشل: <b>{result['fail']}</b>",
+        f"⏭️ تخطى (بلا تحقق في DB): <b>{result['skip']}</b>",
+        f"📊 المجموع: <b>{result['total']}</b>",
+    ]
+    if result.get("fail_details"):
+        lines.append("\n<b>تفاصيل الفشل:</b>")
+        for d in result["fail_details"][:10]:
+            lines.append(f"  • <code>{h(d)}</code>")
+    await wait_msg.edit_text(
+        "\n".join(lines) + ADMIN_FOOTER,
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔙 رجوع", callback_data="back_to_sessions")]
+        ]),
+    )
 
 
 # ──────────────────────────────────────────
