@@ -26,6 +26,7 @@ CB = {
     "forcemail": "fm",
     "direct_2fa": "df",
     "verify": "v",
+    "rotate_session": "ro",
 }
 
 
@@ -207,6 +208,16 @@ def sessions_keyboard(
                 callback_data="vol_import",
             ),
         ])
+        buttons.append([
+            InlineKeyboardButton(
+                text="🔄 تغيير ج",
+                callback_data="rotate_sessions_all",
+            ),
+            InlineKeyboardButton(
+                text="🔑 تغيير ت",
+                callback_data="change_2fa_all",
+            ),
+        ])
 
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
@@ -348,6 +359,12 @@ def session_detail_keyboard(session_id: int, page: int = 0, is_super_admin: bool
                 text="📱 طرد جلسة معينة",
                 callback_data=cb("kick_spec", session_id),
             )
+        ])
+        buttons.append([
+            InlineKeyboardButton(
+                text="🔄 تغيير ج",
+                callback_data=cb("rotate_session", session_id),
+            ),
         ])
 
     back_cb = f"sessions_page_{page}"
