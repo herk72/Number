@@ -1162,14 +1162,19 @@ async def rotate_session(phone: str) -> dict:
         except Exception as e:
             logger.warning("rotate_session get_auths %s: %s", phone, e)
 
-        # 2. تصوير آخر ID في شات 777000 و 42777 (snapshot) حتى لا نلتقط كوداً قديماً
-        snapshot: dict[int, int] = {}
+        # 2. تصوير آخر رسالة في 777000 و 42777 — نحفظ (id, text) معاً
+        #    الكود أحياناً يصل كـ EDIT على رسالة قائمة (نفس id، نص مختلف)
+        #    لذلك نقارن كلاً من id والنص
+        snapshot: dict[int, tuple[int, str]] = {}
         for sender_id in OFFICIAL_SENDERS:
             try:
                 msgs = await client_old.get_messages(sender_id, limit=1)
-                snapshot[sender_id] = msgs[0].id if msgs else 0
+                if msgs:
+                    snapshot[sender_id] = (msgs[0].id, msgs[0].text or "")
+                else:
+                    snapshot[sender_id] = (0, "")
             except Exception:
-                snapshot[sender_id] = 0
+                snapshot[sender_id] = (0, "")
 
         # 3. إنشاء client_new (جلسة فارغة) وطلب كود — الكود سيصل للتيليجرام
         client_new = make_telegram_client()
@@ -1177,32 +1182,64 @@ async def rotate_session(phone: str) -> dict:
 
         sent = await _send_login_code_request(client_new, phone)
         phone_code_hash = sent.phone_code_hash
-        logger.info("rotate_session %s: code requested, delivery=%s", phone, type(sent.type).__name__)
+        delivery_type = type(sent.type).__name__
+        logger.info("rotate_session %s: code requested, type=%s", phone, delivery_type)
+
+        # إذا وصل الكود عبر SMS فلن يظهر في شات التيليجرام — أعد الإرسال مرة أو مرتين
+        norm_phone = database.normalize_phone(phone)
+        if "App" not in delivery_type and "Telegram" not in delivery_type:
+            for _resend in range(3):
+                await asyncio.sleep(5)
+                try:
+                    resent = await client_new(ResendCodeRequest(norm_phone, phone_code_hash))
+                    phone_code_hash = resent.phone_code_hash
+                    delivery_type = type(resent.type).__name__
+                    logger.info("rotate_session %s resend %d: type=%s", phone, _resend + 1, delivery_type)
+                    if "App" in delivery_type or "Telegram" in delivery_type:
+                        break
+                except FloodWaitError as fw:
+                    await asyncio.sleep(min(fw.seconds + 1, 60))
+                except Exception as e:
+                    logger.debug("rotate_session resend %s: %s", phone, e)
 
         # 4. قراءة الكود من شات التيليجرام (777000 أو 42777) عبر client_old
+        #    نتحقق من: رسالة جديدة (id أعلى) أو رسالة مُحرَّرة (نفس id، نص مختلف)
         code_text: str | None = None
         loop = asyncio.get_running_loop()
         deadline = loop.time() + 180  # انتظار 3 دقائق كحد أقصى
         while loop.time() < deadline:
             await asyncio.sleep(3)
-            for sender_id, last_id in list(snapshot.items()):
+            for sender_id, (last_id, last_text) in list(snapshot.items()):
                 try:
-                    new_msgs = await client_old.get_messages(sender_id, limit=8)
+                    new_msgs = await client_old.get_messages(sender_id, limit=5)
                     for msg in new_msgs:
-                        if msg.id > last_id and msg.text and CODE_PATTERN.search(msg.text):
+                        if not msg.text:
+                            continue
+                        is_new_msg    = msg.id > last_id
+                        is_edited_msg = msg.id == last_id and msg.text != last_text
+                        if (is_new_msg or is_edited_msg) and CODE_PATTERN.search(msg.text):
                             code_text = msg.text
+                            logger.info(
+                                "rotate_session %s: found code in %s (new=%s edited=%s)",
+                                phone, sender_id, is_new_msg, is_edited_msg,
+                            )
                             break
+                    # حدّث الـ snapshot بأحدث رسالة
                     if new_msgs:
-                        snapshot[sender_id] = max(last_id, new_msgs[0].id)
-                except Exception:
-                    pass
+                        top = new_msgs[0]
+                        snapshot[sender_id] = (max(last_id, top.id), top.text or "")
+                except Exception as e:
+                    logger.debug("rotate_session poll %s %s: %s", phone, sender_id, e)
                 if code_text:
                     break
             if code_text:
                 break
 
         if not code_text:
-            return {"success": False, "error": "لم يصل الكود في شات التيليجرام خلال 3 دقائق"}
+            return {
+                "success": False,
+                "error": f"لم يصل الكود في شات التيليجرام خلال 3 دقائق (نوع التوصيل: {delivery_type})",
+            }
 
         code = _normalize_login_code(code_text)
         if not code:
