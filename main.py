@@ -1536,15 +1536,39 @@ async def export_secured_sessions_txt(callback: CallbackQuery):
 
 
 # ──────────────────────────────────────────
-# حذف جلسة فردية نهائياً
+# حذف جلسة فردية — عرض شاشة التأكيد أولاً
 # ──────────────────────────────────────────
 @dp.callback_query(F.data.regexp(r"^d\d+$"))
 async def delete_single_session(callback: CallbackQuery, state: FSMContext):
     if not is_admin(callback.from_user.id):
         await callback.answer()
         return
-    uid = callback.from_user.id
     session = await admin_resolve.get_session_from_callback(callback.data, "delete")
+    if not await _guard_session_row(callback, session):
+        return
+    phone = session["phone"]
+    session_id = session["id"]
+    from keyboards import confirm_delete_keyboard
+    await callback.message.edit_text(
+        f"⚠️ <b>تأكيد الحذف</b>\n\n"
+        f"هل أنت متأكد من حذف الحساب\n<code>{phone}</code>\nنهائياً؟\n\n"
+        f"<i>لا يمكن التراجع عن هذه العملية.</i>",
+        reply_markup=confirm_delete_keyboard(session_id, phone),
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+
+# ──────────────────────────────────────────
+# حذف جلسة فردية — تأكيد نهائي
+# ──────────────────────────────────────────
+@dp.callback_query(F.data.regexp(r"^dc\d+$"))
+async def delete_single_session_confirmed(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        await callback.answer()
+        return
+    uid = callback.from_user.id
+    session = await admin_resolve.get_session_from_callback(callback.data, "delete_confirm")
     if not await _guard_session_row(callback, session):
         return
     phone = session["phone"]
@@ -1567,7 +1591,6 @@ async def delete_single_session(callback: CallbackQuery, state: FSMContext):
         from keyboards import disabled_sessions_keyboard
         kb = disabled_sessions_keyboard(sessions, page=page) if sessions else None
     else:
-        # تأكد أن الصفحة لا تتجاوز ما هو متاح بعد الحذف
         per_page = 6
         max_page = max(0, (len(sessions) - 1) // per_page) if sessions else 0
         page = min(page, max_page)
