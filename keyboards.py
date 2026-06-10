@@ -14,6 +14,7 @@ CB = {
     "session": "i",
     "export": "x",
     "delete": "d",
+    "delete_confirm": "dc",
     "hide": "h",
     "code": "c",
     "mail": "m",
@@ -32,6 +33,22 @@ CB = {
 
 def cb(kind: str, session_id: int) -> str:
     return f"{CB[kind]}{session_id}"
+
+
+def confirm_delete_keyboard(session_id: int, phone: str) -> InlineKeyboardMarkup:
+    """شاشة تأكيد الحذف — زر تأكيد + زر إلغاء يرجع لتفاصيل الجلسة."""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(
+                text="✅ نعم، احذف نهائياً",
+                callback_data=cb("delete_confirm", session_id),
+            ),
+            InlineKeyboardButton(
+                text="❌ إلغاء",
+                callback_data=cb("session", session_id),
+            ),
+        ]
+    ])
 
 
 def age_confirm_keyboard() -> InlineKeyboardMarkup:
