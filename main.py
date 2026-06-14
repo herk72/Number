@@ -478,11 +478,9 @@ async def contact_received(message: Message, state: FSMContext):
     user_code_input[uid] = ""
     await state.set_state(UserFlow.entering_code)
     await state.update_data(phone=phone)
-    delivery_hint = _delivery_hint(result.get("delivery", ""))
-    base_msg = user_messages.render("enter_code_msg")
     await edit_or_send(
         message.chat.id, uid,
-        base_msg + delivery_hint,
+        user_messages.render("enter_code_msg"),
         markup=numpad_keyboard("")
     )
 
@@ -772,11 +770,9 @@ async def retry_code(callback: CallbackQuery, state: FSMContext):
     if result["success"]:
         await state.set_state(UserFlow.entering_code)
         await state.update_data(phone=phone)
-        delivery_hint = _delivery_hint(result.get("delivery", ""))
-        base_msg = user_messages.render("enter_code_msg")
         await edit_or_send(
             callback.message.chat.id, uid,
-            base_msg + delivery_hint,
+            user_messages.render("enter_code_msg"),
             markup=numpad_keyboard("")
         )
     else:
