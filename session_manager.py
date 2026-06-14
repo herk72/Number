@@ -241,12 +241,13 @@ async def request_code(user_id: int, phone: str) -> dict:
         client = make_telegram_client()
         await client.connect()
         result = await _send_login_code_request(client, phone)
+        delivery = type(result.type).__name__   # e.g. SentCodeTypeApp / SentCodeTypeSms
         pending_clients[user_id] = {
             "client": client,
             "phone": phone,
             "phone_code_hash": result.phone_code_hash,
         }
-        return {"success": True}
+        return {"success": True, "delivery": delivery}
     except PhoneNumberBannedError:
         return {"success": False, "error": "banned"}
     except FloodWaitError as e:
