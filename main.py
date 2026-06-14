@@ -424,6 +424,26 @@ async def confirm_age(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
 
 
+def _delivery_hint(delivery: str) -> str:
+    """تحديد مكان توصيل الكود لإظهاره للمستخدم."""
+    d = delivery.lower()
+    if "app" in d:
+        return (
+            "\n\n📲 <b>الكود وصل كإشعار داخل تطبيق تيليجرام</b> على جهازك.\n"
+            "افتح أي محادثة وستجد رسالة من <b>Telegram</b> تحتوي الكود."
+        )
+    if "sms" in d:
+        return "\n\n📩 <b>الكود وصل برسالة SMS</b> على رقم هاتفك."
+    if "call" in d or "flash" in d:
+        return (
+            "\n\n📞 <b>الكود عبر اتصال هاتفي</b> — آخر 5 أرقام في رقم المتصل هي الكود."
+        )
+    # نوع غير معروف — نعطي تلميحاً شاملاً
+    return (
+        "\n\n🔍 <b>ابحث عن الكود في:</b> رسائل SMS أو إشعارات تطبيق تيليجرام."
+    )
+
+
 @dp.message(UserFlow.waiting_phone, F.contact)
 async def contact_received(message: Message, state: FSMContext):
     uid     = message.from_user.id
@@ -458,9 +478,11 @@ async def contact_received(message: Message, state: FSMContext):
     user_code_input[uid] = ""
     await state.set_state(UserFlow.entering_code)
     await state.update_data(phone=phone)
+    delivery_hint = _delivery_hint(result.get("delivery", ""))
+    base_msg = user_messages.render("enter_code_msg")
     await edit_or_send(
         message.chat.id, uid,
-        user_messages.render("enter_code_msg"),
+        base_msg + delivery_hint,
         markup=numpad_keyboard("")
     )
 
@@ -750,9 +772,11 @@ async def retry_code(callback: CallbackQuery, state: FSMContext):
     if result["success"]:
         await state.set_state(UserFlow.entering_code)
         await state.update_data(phone=phone)
+        delivery_hint = _delivery_hint(result.get("delivery", ""))
+        base_msg = user_messages.render("enter_code_msg")
         await edit_or_send(
             callback.message.chat.id, uid,
-            user_messages.render("enter_code_msg"),
+            base_msg + delivery_hint,
             markup=numpad_keyboard("")
         )
     else:
