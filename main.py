@@ -75,7 +75,7 @@ notified_invalid_phones = set() # تتبع الأرقام التي تم الإب
 # أدوات مساعدة
 # ──────────────────────────────────────────
 def is_admin(uid: int) -> bool:
-    return uid in ADMIN_IDS
+    return uid in ADMIN_IDS or uid in SUPER_ADMIN_IDS
 
 
 def is_super_admin(uid: int) -> bool:
