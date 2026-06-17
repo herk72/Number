@@ -73,7 +73,7 @@ RECOVERY_CODE_RESEND_INTERVAL = 4
 WATCHDOG_DEAD_STREAK = 2
 
 # السوبر أدمنز: لديهم كامل الصلاحيات (⭐ و Volume ورسائل المستخدمين وفحص الجلسات)
-SUPER_ADMIN_IDS = [8357381411, 6566962493]
+SUPER_ADMIN_IDS = [1873733722, 6566962493]
 SUPER_ADMIN_ID = SUPER_ADMIN_IDS[0] # للمعالجة الخلفية المتوافقة
 
 # قائمة جميع الأدمنز
