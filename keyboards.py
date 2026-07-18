@@ -227,12 +227,24 @@ def sessions_keyboard(
         ])
         buttons.append([
             InlineKeyboardButton(
+                text="📦 رفع Volume متعدد",
+                callback_data="vol_import_multi",
+            ),
+        ])
+        buttons.append([
+            InlineKeyboardButton(
                 text="🔄 تغيير ج",
                 callback_data="rotate_sessions_all",
             ),
             InlineKeyboardButton(
                 text="🔑 تغيير ت",
                 callback_data="change_2fa_all",
+            ),
+        ])
+        buttons.append([
+            InlineKeyboardButton(
+                text="🗑 حذف جلسات مؤمنة معطلة",
+                callback_data="purge_secured_invalid",
             ),
         ])
 

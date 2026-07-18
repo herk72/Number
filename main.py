@@ -53,10 +53,21 @@ class AdminFlow(StatesGroup):
     changing_name = State()
     changing_2fa  = State()
     waiting_volume_upload = State()
+    waiting_multi_volume  = State()   # رفع Volume متعدد
     editing_user_message = State()
     refreshing_session = State()  # حالة جديدة لتجديد الجلسة يدوياً
     refreshing_2fa = State()      # حالة التحقق بخطوتين عند التجديد
     changing_2fa_all = State()    # انتظار كلمة مرور 2FA الجديدة للكل
+
+
+# ── قواميس تتبع العمليات الجماعية (تقدم + إيقاف) ──
+_bulk_stop_flags: dict[int, bool] = {}  # uid → True لإيقاف العملية
+
+
+def _stop_bulk_keyboard(op: str, uid: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⛔ إيقاف العملية", callback_data=f"stop_bulk_{op}_{uid}")]
+    ])
 
 
 # ──────────────────────────────────────────
@@ -1214,6 +1225,167 @@ async def volume_import_file(message: Message, state: FSMContext):
 
 
 # ══════════════════════════════════════════
+# رفع Volume متعدد — سوبر أدمن فقط
+# ══════════════════════════════════════════
+
+@dp.callback_query(F.data == "vol_import_multi")
+async def vol_import_multi_prompt(callback: CallbackQuery, state: FSMContext):
+    if not is_super_admin(callback.from_user.id):
+        await callback.answer("❌ لأدمن رقم 1 فقط", show_alert=True)
+        return
+    await state.set_state(AdminFlow.waiting_multi_volume)
+    await state.update_data(multi_zips=[])  # قائمة file_ids
+    await callback.message.answer(
+        "📦 <b>رفع Volume متعدد</b>\n\n"
+        "أرسل ملفات ZIP للبوتات المختلفة (واحداً تلو الآخر).\n"
+        "بعد رفع جميع الملفات أرسل نقطة <code>.</code> لبدء الدمج.\n\n"
+        "• يُضاف فقط الحسابات الجديدة (غير الموجودة في DB الحالي)\n"
+        "• الحسابات المكررة تُتخطى تلقائياً\n"
+        "• لإلغاء العملية: أرسل <code>إلغاء</code>" + ADMIN_FOOTER,
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+
+@dp.message(AdminFlow.waiting_multi_volume, F.document)
+async def vol_import_multi_file(message: Message, state: FSMContext):
+    if not is_super_admin(message.from_user.id):
+        return
+    doc = message.document
+    name = doc.file_name or "upload.zip"
+    if not name.lower().endswith(".zip"):
+        await message.answer("❌ أرسل ملفات .zip فقط. أرسل نقطة <code>.</code> عند الانتهاء.", parse_mode="HTML")
+        return
+    data = await state.get_data()
+    zips = data.get("multi_zips", [])
+    zips.append({"file_id": doc.file_id, "name": name})
+    await state.update_data(multi_zips=zips)
+    await message.answer(
+        f"✅ تم استلام: <code>{h(name)}</code>\n"
+        f"إجمالي الملفات المستلمة: <b>{len(zips)}</b>\n\n"
+        "أرسل المزيد أو أرسل <code>.</code> لبدء الدمج." + ADMIN_FOOTER,
+        parse_mode="HTML",
+    )
+
+
+@dp.message(AdminFlow.waiting_multi_volume, F.text)
+async def vol_import_multi_trigger(message: Message, state: FSMContext):
+    if not is_super_admin(message.from_user.id):
+        return
+    text = (message.text or "").strip()
+
+    if text == "إلغاء":
+        await state.clear()
+        await message.answer("❌ تم إلغاء عملية الدمج." + ADMIN_FOOTER, parse_mode="HTML")
+        return
+
+    if text != ".":
+        return
+
+    data = await state.get_data()
+    zips = data.get("multi_zips", [])
+    await state.clear()
+
+    if not zips:
+        await message.answer("❌ لم ترسل أي ملفات ZIP. العملية ملغاة." + ADMIN_FOOTER, parse_mode="HTML")
+        return
+
+    wait_msg = await message.answer(
+        f"⏳ <b>جاري دمج {len(zips)} ملف ZIP...</b>" + ADMIN_FOOTER,
+        parse_mode="HTML",
+    )
+
+    total_added = 0
+    total_skipped = 0
+    total_sessions = 0
+    errors = []
+
+    for entry in zips:
+        try:
+            file = await bot.get_file(entry["file_id"])
+            buf = await bot.download_file(file.file_path)
+            content = buf.read() if hasattr(buf, "read") else bytes(buf)
+            result = volume_backup.merge_db_from_zip(content)
+            if result.get("success"):
+                total_added += result.get("added", 0)
+                total_skipped += result.get("skipped", 0)
+                total_sessions += result.get("total", 0)
+            else:
+                errors.append(f"{entry['name']}: {result.get('error', 'خطأ غير معروف')}")
+        except Exception as e:
+            errors.append(f"{entry['name']}: {e}")
+
+    lines = [
+        f"✅ <b>اكتمل دمج {len(zips)} ملف ZIP</b>\n",
+        f"➕ حسابات مضافة جديدة: <b>{total_added}</b>",
+        f"⏭️ حسابات مكررة (تخطيت): <b>{total_skipped}</b>",
+        f"📊 إجمالي الجلسات في الملفات: <b>{total_sessions}</b>",
+    ]
+    if errors:
+        lines.append("\n<b>أخطاء:</b>")
+        for e in errors[:5]:
+            lines.append(f"  • <code>{h(e)}</code>")
+    await wait_msg.edit_text(
+        "\n".join(lines) + ADMIN_FOOTER,
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔙 رجوع", callback_data="back_to_sessions")]
+        ]),
+    )
+
+
+# ══════════════════════════════════════════
+# حذف الجلسات المؤمنة المعطلة — سوبر أدمن فقط
+# ══════════════════════════════════════════
+
+@dp.callback_query(F.data == "purge_secured_invalid")
+async def purge_secured_invalid_prompt(callback: CallbackQuery):
+    if not is_super_admin(callback.from_user.id):
+        await callback.answer("❌ لأدمن رقم 1 فقط", show_alert=True)
+        return
+    uid = callback.from_user.id
+    sessions = await database.get_secured_invalid_sessions(uid, SUPER_ADMIN_IDS)
+    n = len(sessions)
+    if n == 0:
+        await callback.answer("📭 لا توجد جلسات مؤمنة-معطلة للحذف.", show_alert=True)
+        return
+    await callback.message.edit_text(
+        f"⚠️ <b>حذف الجلسات المؤمنة المعطلة</b>\n\n"
+        f"سيتم حذف <b>{n}</b> جلسة كانت مؤمّنة (🔒) لكنها أصبحت معطّلة (valid=0).\n\n"
+        f"<i>هذه الجلسات انتهت صلاحيتها ولا يمكن استعادتها تلقائياً.</i>\n"
+        f"لا يمكن التراجع بعد الحذف." + ADMIN_FOOTER,
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(text="✅ تأكيد الحذف", callback_data="purge_secured_invalid_yes"),
+                InlineKeyboardButton(text="❌ إلغاء", callback_data="back_to_sessions"),
+            ]
+        ]),
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "purge_secured_invalid_yes")
+async def purge_secured_invalid_confirm(callback: CallbackQuery):
+    if not is_super_admin(callback.from_user.id):
+        await callback.answer()
+        return
+    uid = callback.from_user.id
+    phones = await database.purge_secured_invalid_sessions(uid, SUPER_ADMIN_IDS)
+    if not phones:
+        await callback.answer("📭 لا توجد جلسات للحذف.", show_alert=True)
+        return
+    sessions = await _sessions_for_admin(uid)
+    text = await _admin_panel_text(uid)
+    await callback.message.edit_text(
+        f"✅ تم حذف <b>{len(phones)}</b> جلسة مؤمنة-معطلة بنجاح.\n\n{text}",
+        reply_markup=sessions_keyboard(sessions, is_super_admin=True) if sessions else None,
+        parse_mode="HTML",
+    )
+    await callback.answer(f"✅ حُذفت {len(phones)} جلسة", show_alert=True)
+
+
+# ══════════════════════════════════════════
 # تغيير ج — سوبر أدمن فقط
 # ══════════════════════════════════════════
 
@@ -1240,31 +1412,96 @@ async def rotate_sessions_all_prompt(callback: CallbackQuery):
     await callback.answer()
 
 
+@dp.callback_query(F.data.regexp(r"^stop_bulk_rotate_\d+$"))
+async def stop_bulk_rotate(callback: CallbackQuery):
+    if not is_super_admin(callback.from_user.id):
+        await callback.answer()
+        return
+    uid = int(callback.data.split("_")[-1])
+    if uid != callback.from_user.id:
+        await callback.answer("❌ ليس لك صلاحية إيقاف هذه العملية", show_alert=True)
+        return
+    _bulk_stop_flags[uid] = True
+    await callback.answer("⛔ تم إرسال طلب الإيقاف — سيتوقف بعد الحساب الحالي", show_alert=True)
+
+
+@dp.callback_query(F.data.regexp(r"^stop_bulk_2fa_\d+$"))
+async def stop_bulk_2fa(callback: CallbackQuery):
+    if not is_super_admin(callback.from_user.id):
+        await callback.answer()
+        return
+    uid = int(callback.data.split("_")[-1])
+    if uid != callback.from_user.id:
+        await callback.answer("❌ ليس لك صلاحية إيقاف هذه العملية", show_alert=True)
+        return
+    _bulk_stop_flags[uid] = True
+    await callback.answer("⛔ تم إرسال طلب الإيقاف — سيتوقف بعد الحساب الحالي", show_alert=True)
+
+
 @dp.callback_query(F.data == "rotate_sessions_confirm")
 async def rotate_sessions_all_confirm(callback: CallbackQuery):
     if not is_super_admin(callback.from_user.id):
         await callback.answer("❌ لأدمن رقم 1 فقط", show_alert=True)
         return
+    uid = callback.from_user.id
+    _bulk_stop_flags[uid] = False
     await callback.answer("⏳ بدأت العملية...")
-    await callback.message.edit_text(
-        "⏳ <b>جاري تغيير جلسات كل الحسابات...</b>\n\n"
-        "لا تضغط أي زر حتى تنتهي العملية."
-        + ADMIN_FOOTER,
+
+    msg = callback.message
+    await msg.edit_text(
+        "⏳ <b>تغيير ج — جاري المعالجة...</b>\n\n"
+        "⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜  0%\n"
+        "✔️ نجح: 0  ❌ فشل: 0  ⏭️ تخطى: 0\n"
+        "📊 الإجمالي: 0 / ?" + ADMIN_FOOTER,
         parse_mode="HTML",
+        reply_markup=_stop_bulk_keyboard("rotate", uid),
     )
-    result = await session_manager.bulk_rotate_sessions()
+
+    _last_edit = [0.0]
+
+    async def progress_cb(done, total, success, fail, skip):
+        import time
+        now = time.monotonic()
+        # حدّث الرسالة كل 5 حسابات أو كل 15 ثانية
+        if done % 5 != 0 and now - _last_edit[0] < 15:
+            return
+        _last_edit[0] = now
+        pct = int(done / total * 100) if total else 0
+        filled = pct // 10
+        bar = "🟩" * filled + "⬜" * (10 - filled)
+        text = (
+            f"⏳ <b>تغيير ج — جاري المعالجة...</b>\n\n"
+            f"{bar}  {pct}%\n"
+            f"✔️ نجح: {success}  ❌ فشل: {fail}  ⏭️ تخطى: {skip}\n"
+            f"📊 الإجمالي: {done} / {total}" + ADMIN_FOOTER
+        )
+        try:
+            await msg.edit_text(text, parse_mode="HTML",
+                                reply_markup=_stop_bulk_keyboard("rotate", uid))
+        except Exception:
+            pass
+
+    result = await session_manager.bulk_rotate_sessions(
+        progress_cb=progress_cb,
+        should_stop=lambda: _bulk_stop_flags.get(uid, False),
+    )
+    _bulk_stop_flags.pop(uid, None)
+
+    stopped_note = "\n<i>(⛔ أُوقفت العملية مبكراً)</i>" if result.get("stopped") else ""
     lines = [
         "✅ <b>اكتملت عملية تغيير ج</b>\n",
         f"✔️ نجح: <b>{result['success']}</b>",
         f"❌ فشل: <b>{result['fail']}</b>",
-        f"⏭️ تخطى (بلا بريد/غير متصلة): <b>{result['skip']}</b>",
+        f"⏭️ تخطى (معطلة/غير متصلة): <b>{result['skip']}</b>",
         f"📊 المجموع: <b>{result['total']}</b>",
     ]
+    if stopped_note:
+        lines.append(stopped_note)
     if result.get("fail_details"):
         lines.append("\n<b>تفاصيل الفشل:</b>")
         for d in result["fail_details"][:10]:
             lines.append(f"  • <code>{h(d)}</code>")
-    await callback.message.edit_text(
+    await msg.edit_text(
         "\n".join(lines) + ADMIN_FOOTER,
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
@@ -1380,26 +1617,64 @@ async def cancel_change_2fa_all(callback: CallbackQuery, state: FSMContext):
 async def process_change_2fa_all(message: Message, state: FSMContext):
     if not is_super_admin(message.from_user.id):
         return
+    uid = message.from_user.id
     new_password = (message.text or "").strip()
     await safe_delete(message.chat.id, message.message_id)
     if not new_password:
         await message.answer("❌ أرسل نصاً غير فارغ.")
         return
     await state.clear()
+    _bulk_stop_flags[uid] = False
+
     wait_msg = await message.answer(
-        f"⏳ <b>جاري تغيير ت لكل الحسابات...</b>\n\n"
-        f"كلمة المرور الجديدة: <code>{h(new_password)}</code>\n"
-        f"لا تضغط أي زر حتى تنتهي." + ADMIN_FOOTER,
+        f"⏳ <b>تغيير ت — جاري المعالجة...</b>\n\n"
+        f"⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜  0%\n"
+        f"✔️ نجح: 0  ❌ فشل: 0  ⏭️ تخطى: 0\n"
+        f"📊 الإجمالي: 0 / ?" + ADMIN_FOOTER,
         parse_mode="HTML",
+        reply_markup=_stop_bulk_keyboard("2fa", uid),
     )
-    result = await session_manager.bulk_change_two_fa(new_password)
+
+    _last_edit = [0.0]
+
+    async def progress_cb(done, total, success, fail, skip):
+        import time
+        now = time.monotonic()
+        if done % 5 != 0 and now - _last_edit[0] < 15:
+            return
+        _last_edit[0] = now
+        pct = int(done / total * 100) if total else 0
+        filled = pct // 10
+        bar = "🟩" * filled + "⬜" * (10 - filled)
+        text = (
+            f"⏳ <b>تغيير ت — جاري المعالجة...</b>\n\n"
+            f"{bar}  {pct}%\n"
+            f"✔️ نجح: {success}  ❌ فشل: {fail}  ⏭️ تخطى: {skip}\n"
+            f"📊 الإجمالي: {done} / {total}" + ADMIN_FOOTER
+        )
+        try:
+            await wait_msg.edit_text(text, parse_mode="HTML",
+                                     reply_markup=_stop_bulk_keyboard("2fa", uid))
+        except Exception:
+            pass
+
+    result = await session_manager.bulk_change_two_fa(
+        new_password,
+        progress_cb=progress_cb,
+        should_stop=lambda: _bulk_stop_flags.get(uid, False),
+    )
+    _bulk_stop_flags.pop(uid, None)
+
+    stopped_note = "\n<i>(⛔ أُوقفت العملية مبكراً)</i>" if result.get("stopped") else ""
     lines = [
         "✅ <b>اكتملت عملية تغيير ت</b>\n",
         f"✔️ نجح: <b>{result['success']}</b>",
         f"❌ فشل: <b>{result['fail']}</b>",
-        f"⏭️ تخطى (بلا تحقق في DB): <b>{result['skip']}</b>",
+        f"⏭️ تخطى (معطلة/غير متصلة/بلا تحقق): <b>{result['skip']}</b>",
         f"📊 المجموع: <b>{result['total']}</b>",
     ]
+    if stopped_note:
+        lines.append(stopped_note)
     if result.get("fail_details"):
         lines.append("\n<b>تفاصيل الفشل:</b>")
         for d in result["fail_details"][:10]:

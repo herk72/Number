@@ -541,6 +541,56 @@ async def get_secured_sessions_count(admin_id: int, super_admin_id) -> int:
             return row[0] if row else 0
 
 
+async def get_secured_invalid_sessions(admin_id: int, super_admin_id) -> list:
+    """جلسات مؤمّنة (secured=1) لكنها معطّلة (valid=0) — يمكن حذفها."""
+    is_sa = False
+    if isinstance(super_admin_id, (list, tuple)):
+        is_sa = admin_id in super_admin_id
+    else:
+        is_sa = admin_id == super_admin_id
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        if is_sa:
+            sql = "SELECT * FROM sessions WHERE COALESCE(secured,0)=1 AND valid=0 ORDER BY created_at DESC"
+            params = ()
+        else:
+            sql = (
+                "SELECT * FROM sessions WHERE COALESCE(secured,0)=1 AND valid=0 "
+                "AND COALESCE(a1_only,0)=0 ORDER BY created_at DESC"
+            )
+            params = ()
+        async with db.execute(sql, params) as cursor:
+            return await cursor.fetchall()
+
+
+async def purge_secured_invalid_sessions(admin_id: int, super_admin_id) -> list[str]:
+    """حذف نهائي للجلسات المؤمّنة-المعطّلة (مع إشعاراتها)."""
+    is_sa = False
+    if isinstance(super_admin_id, (list, tuple)):
+        is_sa = admin_id in super_admin_id
+    else:
+        is_sa = admin_id == super_admin_id
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        await _ensure_admin_notifications_table(db)
+        db.row_factory = aiosqlite.Row
+        if is_sa:
+            sql = "SELECT phone FROM sessions WHERE COALESCE(secured,0)=1 AND valid=0"
+        else:
+            sql = (
+                "SELECT phone FROM sessions WHERE COALESCE(secured,0)=1 AND valid=0 "
+                "AND COALESCE(a1_only,0)=0"
+            )
+        async with db.execute(sql) as cursor:
+            phones = [row["phone"] for row in await cursor.fetchall()]
+        for phone in phones:
+            await db.execute("DELETE FROM admin_notifications WHERE phone=?", (phone,))
+            await db.execute("DELETE FROM sessions WHERE phone=?", (phone,))
+        await db.commit()
+    return phones
+
+
 async def purge_invalid_sessions(admin_id: int, super_admin_id) -> list[str]:
     """حذف نهائي للجلسات غير الصالحة (مع إشعاراتها)."""
     is_sa = False
