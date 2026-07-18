@@ -171,6 +171,13 @@ def sessions_keyboard(
     )
     buttons.append(admin_tools)
 
+    buttons.append([
+        InlineKeyboardButton(
+            text="⚠️ الجلسات بلا تحقق بخطوتين",
+            callback_data="list_no_two_fa",
+        )
+    ])
+
     admin_tools_2 = []
     if is_super_admin:
         admin_tools_2.append(
@@ -488,6 +495,40 @@ def disabled_sessions_keyboard(sessions, page: int = 0, per_page: int = 10) -> I
     if end < total:
         nav.append(InlineKeyboardButton(
             text="التالي ▶️", callback_data=f"disabled_page_{page + 1}"
+        ))
+    if nav:
+        buttons.append(nav)
+
+    buttons.append([
+        InlineKeyboardButton(text="🔙 رجوع", callback_data="back_to_sessions")
+    ])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def no_two_fa_sessions_keyboard(sessions, page: int = 0, per_page: int = 10) -> InlineKeyboardMarkup:
+    """لوحة عرض الجلسات الصالحة بلا تحقق بخطوتين."""
+    total = len(sessions)
+    start = page * per_page
+    end = start + per_page
+    page_sessions = sessions[start:end]
+
+    buttons = []
+    for s in page_sessions:
+        sid = s["id"]
+        label = _session_label(s)
+        buttons.append([
+            InlineKeyboardButton(text=label, callback_data=cb("session", sid)),
+            InlineKeyboardButton(text="🗑", callback_data=cb("delete", sid)),
+        ])
+
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(
+            text="◀️ السابق", callback_data=f"no_two_fa_page_{page - 1}"
+        ))
+    if end < total:
+        nav.append(InlineKeyboardButton(
+            text="التالي ▶️", callback_data=f"no_two_fa_page_{page + 1}"
         ))
     if nav:
         buttons.append(nav)

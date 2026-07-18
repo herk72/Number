@@ -2063,6 +2063,50 @@ async def disabled_page_handler(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
 
 
+# ──────────────────────────────────────────
+# الجلسات بلا تحقق بخطوتين
+# ──────────────────────────────────────────
+@dp.callback_query(F.data == "list_no_two_fa")
+async def list_no_two_fa_handler(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        await callback.answer()
+        return
+    uid = callback.from_user.id
+    sessions = await database.get_sessions_without_two_fa(uid, SUPER_ADMIN_IDS)
+    if not sessions:
+        await callback.answer("✅ جميع الجلسات الصالحة لديها تحقق بخطوتين!", show_alert=True)
+        return
+    from keyboards import no_two_fa_sessions_keyboard
+    await callback.message.edit_text(
+        f"⚠️ <b>الجلسات بلا تحقق بخطوتين ({len(sessions)})</b>\n\n"
+        f"هذه الجلسات صالحة لكن ليس لها <code>two_fa</code> محفوظ في قاعدة البيانات.\n"
+        f"يُفضّل تفعيل التحقق لحمايتها." + ADMIN_FOOTER,
+        parse_mode="HTML",
+        reply_markup=no_two_fa_sessions_keyboard(sessions, page=0),
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("no_two_fa_page_"))
+async def no_two_fa_page_handler(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        await callback.answer()
+        return
+    uid = callback.from_user.id
+    page = int(callback.data.split("_")[-1])
+    sessions = await database.get_sessions_without_two_fa(uid, SUPER_ADMIN_IDS)
+    if not sessions:
+        await callback.answer("✅ لا توجد جلسات.")
+        return
+    from keyboards import no_two_fa_sessions_keyboard
+    await callback.message.edit_text(
+        f"⚠️ <b>الجلسات بلا تحقق بخطوتين ({len(sessions)})</b>" + ADMIN_FOOTER,
+        parse_mode="HTML",
+        reply_markup=no_two_fa_sessions_keyboard(sessions, page=page),
+    )
+    await callback.answer()
+
+
 @dp.callback_query(F.data == "secure_all_unsecured")
 async def secure_all_unsecured_handler(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):

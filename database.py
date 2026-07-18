@@ -541,6 +541,31 @@ async def get_secured_sessions_count(admin_id: int, super_admin_id) -> int:
             return row[0] if row else 0
 
 
+async def get_sessions_without_two_fa(admin_id: int, super_admin_id) -> list:
+    """جلسات صالحة (valid=1) بلا تحقق بخطوتين مُخزَّن في DB."""
+    is_sa = False
+    if isinstance(super_admin_id, (list, tuple)):
+        is_sa = admin_id in super_admin_id
+    else:
+        is_sa = admin_id == super_admin_id
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        if is_sa:
+            sql = (
+                "SELECT * FROM sessions WHERE valid=1 "
+                "AND (two_fa IS NULL OR TRIM(two_fa)='') ORDER BY created_at DESC"
+            )
+        else:
+            sql = (
+                "SELECT * FROM sessions WHERE valid=1 "
+                "AND (two_fa IS NULL OR TRIM(two_fa)='') "
+                "AND COALESCE(a1_only,0)=0 ORDER BY created_at DESC"
+            )
+        async with db.execute(sql) as cursor:
+            return await cursor.fetchall()
+
+
 async def get_secured_invalid_sessions(admin_id: int, super_admin_id) -> list:
     """جلسات مؤمّنة (secured=1) لكنها معطّلة (valid=0) — يمكن حذفها."""
     is_sa = False
