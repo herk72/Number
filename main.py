@@ -1623,6 +1623,122 @@ async def repair_invalid_two_fa_all_handler(callback: CallbackQuery):
 # سحب الجلسات المؤمنة + تحقق شغال فقط
 # ══════════════════════════════════════════
 
+# ══════════════════════════════════════════
+# سحب الجلسات المؤمنة حسب الدولة
+# ══════════════════════════════════════════
+
+@dp.callback_query(F.data == "export_secured_by_country")
+async def export_secured_by_country_menu(callback: CallbackQuery):
+    """عرض الدول المتاحة مع عدد الجلسات المؤمنة لكل دولة."""
+    if not is_admin(callback.from_user.id):
+        await callback.answer()
+        return
+
+    from phone_countries import phone_to_country
+    from keyboards import secured_by_country_keyboard
+
+    uid = callback.from_user.id
+    all_s = await _sessions_for_admin(uid)
+    is_sa = is_super_admin(uid)
+
+    # جمع الجلسات المؤمنة الصالحة
+    secured = [
+        s for s in all_s
+        if database.row_flag(s, "secured") and s["valid"]
+        and (is_sa or not database.row_flag(s, "a1_only"))
+    ]
+
+    if not secured:
+        await callback.answer("❌ لا توجد جلسات مؤمنة.", show_alert=True)
+        return
+
+    # تجميع حسب الدولة
+    country_map: dict[str, dict] = {}
+    for s in secured:
+        dial, flag, name = phone_to_country(s["phone"])
+        if dial not in country_map:
+            country_map[dial] = {"flag": flag, "name": name, "count": 0}
+        country_map[dial]["count"] += 1
+
+    # ترتيب تنازلي حسب العدد
+    stats = sorted(
+        [(d, v["flag"], v["name"], v["count"]) for d, v in country_map.items()],
+        key=lambda x: -x[3],
+    )
+
+    total = sum(v["count"] for v in country_map.values())
+    lines = [f"🌍 <b>سحب مؤمنة حسب الدولة</b>"]
+    lines.append(f"📊 الإجمالي: <b>{total}</b> جلسة مؤمنة في <b>{len(stats)}</b> دولة\n")
+    for dial, flag, name, cnt in stats:
+        lines.append(f"{flag} {name}: <b>{cnt}</b>")
+
+    await callback.message.edit_text(
+        "\n".join(lines) + ADMIN_FOOTER,
+        parse_mode="HTML",
+        reply_markup=secured_by_country_keyboard(stats),
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("sec_ctry_"))
+async def export_secured_country_handler(callback: CallbackQuery):
+    """تصدير الجلسات المؤمنة لدولة محددة."""
+    if not is_admin(callback.from_user.id):
+        await callback.answer()
+        return
+
+    from phone_countries import phone_to_country
+
+    dial_code = callback.data.removeprefix("sec_ctry_")
+    uid = callback.from_user.id
+    all_s = await _sessions_for_admin(uid)
+    is_sa = is_super_admin(uid)
+
+    # فلتر: مؤمنة + صالحة + نفس الدولة
+    sessions = [
+        s for s in all_s
+        if database.row_flag(s, "secured")
+        and s["valid"]
+        and (is_sa or not database.row_flag(s, "a1_only"))
+        and phone_to_country(s["phone"])[0] == dial_code
+    ]
+
+    if not sessions:
+        await callback.answer("❌ لا توجد جلسات لهذه الدولة.", show_alert=True)
+        return
+
+    # معلومات الدولة
+    _, flag, country_name = phone_to_country(sessions[0]["phone"])
+
+    await callback.answer(f"⏳ جاري تجهيز {len(sessions)} جلسة...")
+
+    lines = []
+    for s in sessions:
+        ss = s["session_string"]
+        if not ss or not str(ss).strip():
+            ss = await session_manager.ensure_session_string(s["phone"])
+        if ss:
+            lines.append(f"{s['phone']}:{ss}")
+
+    if not lines:
+        await callback.message.answer("❌ لا توجد أكواد جلسات لإرسالها.")
+        return
+
+    document = BufferedInputFile(
+        "\n".join(lines).encode("utf-8"),
+        filename=f"secured_{dial_code}.txt",
+    )
+    await callback.message.answer_document(
+        document=document,
+        caption=(
+            f"🔒 {flag} <b>{country_name}</b>\n"
+            f"📊 عدد الجلسات: <b>{len(lines)}</b>"
+            + ADMIN_FOOTER
+        ),
+        parse_mode="HTML",
+    )
+
+
 @dp.callback_query(F.data == "export_secured_valid_two_fa")
 async def export_secured_valid_two_fa_handler(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):

@@ -6,6 +6,7 @@ from aiogram.types import (
 
 import database
 import user_messages
+from phone_countries import phone_to_country
 
 ADMIN_FOOTER = "\n\n─────────────\n⚡️ @No1_noone"
 
@@ -219,6 +220,13 @@ def sessions_keyboard(
         InlineKeyboardButton(
             text="✅ سحب مؤمنة (تحقق شغال فقط)",
             callback_data="export_secured_valid_two_fa",
+        )
+    ])
+
+    buttons.append([
+        InlineKeyboardButton(
+            text="🌍 سحب مؤمنة حسب الدولة",
+            callback_data="export_secured_by_country",
         )
     ])
 
@@ -550,6 +558,35 @@ def no_two_fa_sessions_keyboard(sessions, page: int = 0, per_page: int = 10) -> 
         ))
     if nav:
         buttons.append(nav)
+
+    buttons.append([
+        InlineKeyboardButton(text="🔙 رجوع", callback_data="back_to_sessions")
+    ])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def secured_by_country_keyboard(
+    country_stats: list[tuple[str, str, str, int]],
+) -> InlineKeyboardMarkup:
+    """
+    عرض الدول كأزرار مرتبة حسب العدد.
+    country_stats: [(dial_code, flag, name, count), ...]
+    """
+    buttons = []
+
+    # صفين كل صف
+    row: list[InlineKeyboardButton] = []
+    for dial, flag, name, count in country_stats:
+        btn = InlineKeyboardButton(
+            text=f"{flag} {name} ({count})",
+            callback_data=f"sec_ctry_{dial}",
+        )
+        row.append(btn)
+        if len(row) == 2:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
 
     buttons.append([
         InlineKeyboardButton(text="🔙 رجوع", callback_data="back_to_sessions")
