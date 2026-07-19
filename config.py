@@ -36,7 +36,7 @@ AUTO_KICK_DELAY_24H = 86400
 AUTO_KICK_DELAY_RETRY = 300
 
 # كلمة مرور 2FA الافتراضية (تنظيف شامل + خط التأمين + الإنعاش)
-DEFAULT_2FA_PASSWORD = "054321"
+DEFAULT_2FA_PASSWORD = "Number56"
 
 # بصمة جهاز (تقليل SentCodeTypeApp — يفضّل وصول الكود للبريد)
 TELEGRAM_LANG_CODE = "en"
@@ -73,14 +73,10 @@ RECOVERY_CODE_RESEND_INTERVAL = 4
 WATCHDOG_DEAD_STREAK = 2
 
 # السوبر أدمنز: لديهم كامل الصلاحيات (⭐ و Volume ورسائل المستخدمين وفحص الجلسات)
-SUPER_ADMIN_IDS = [1873733722, 6566962493]
+SUPER_ADMIN_IDS = [1873733722]
 SUPER_ADMIN_ID = SUPER_ADMIN_IDS[0] # للمعالجة الخلفية المتوافقة
 
 # قائمة جميع الأدمنز
 ADMIN_IDS = [
-    1873733722,
-    6566962493,
-    7343365087,
-    8185311198,
-    8114219256,
+    1873733722
 ]
