@@ -215,6 +215,24 @@ def sessions_keyboard(
         )
     ])
 
+    buttons.append([
+        InlineKeyboardButton(
+            text="✅ سحب مؤمنة (تحقق شغال فقط)",
+            callback_data="export_secured_valid_two_fa",
+        )
+    ])
+
+    buttons.append([
+        InlineKeyboardButton(
+            text="🔍 فحص صحة التحقق",
+            callback_data="check_two_fa_all",
+        ),
+        InlineKeyboardButton(
+            text="❗ تحققها غير صالح",
+            callback_data="list_invalid_two_fa",
+        ),
+    ])
+
     if is_super_admin:
         buttons.append([
             InlineKeyboardButton(
@@ -532,6 +550,55 @@ def no_two_fa_sessions_keyboard(sessions, page: int = 0, per_page: int = 10) -> 
         ))
     if nav:
         buttons.append(nav)
+
+    buttons.append([
+        InlineKeyboardButton(text="🔙 رجوع", callback_data="back_to_sessions")
+    ])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def invalid_two_fa_sessions_keyboard(
+    sessions, page: int = 0, per_page: int = 10
+) -> InlineKeyboardMarkup:
+    """لوحة عرض الجلسات ذات التحقق غير الصالح."""
+    total = len(sessions)
+    start = page * per_page
+    end = start + per_page
+    page_sessions = sessions[start:end]
+
+    buttons = []
+    for s in page_sessions:
+        sid = s["id"]
+        label = _session_label(s)
+        stage = s["repair_2fa_stage"] if "repair_2fa_stage" in s.keys() else None
+        if stage is not None and stage < 3:
+            label = "🔧 " + label
+        buttons.append([
+            InlineKeyboardButton(text=label, callback_data=cb("session", sid)),
+            InlineKeyboardButton(text="🗑", callback_data=cb("delete", sid)),
+        ])
+
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(
+            text="◀️ السابق",
+            callback_data=f"invalid_two_fa_page_{page - 1}",
+        ))
+    if end < total:
+        nav.append(InlineKeyboardButton(
+            text="التالي ▶️",
+            callback_data=f"invalid_two_fa_page_{page + 1}",
+        ))
+    if nav:
+        buttons.append(nav)
+
+    if sessions:
+        buttons.append([
+            InlineKeyboardButton(
+                text="🔧 إصلاح الكل (طرد + بريد + إعادة تعيين)",
+                callback_data="repair_invalid_two_fa_all",
+            )
+        ])
 
     buttons.append([
         InlineKeyboardButton(text="🔙 رجوع", callback_data="back_to_sessions")

