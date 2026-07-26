@@ -80,3 +80,20 @@ SUPER_ADMIN_ID = SUPER_ADMIN_IDS[0] # للمعالجة الخلفية المتو
 ADMIN_IDS = [
     1873733722
 ]
+
+# ═══════════════════════════════════════════
+# إعدادات نظام مراقبة الأمان
+# ═══════════════════════════════════════════
+
+# الجهاز الموثوق — أي جلسة من جهاز آخر تُطرد فوراً
+TRUSTED_DEVICE_MODEL = "samsungSM-S918B"  # Samsung Galaxy S23 Ultra
+
+# الفترة بين دورات الفحص الأمني (ثوانٍ) — افتراضياً 12 ساعة
+SECURITY_CHECK_INTERVAL = int(os.getenv("SECURITY_CHECK_INTERVAL", 43200))
+
+# نافذة الرسائل المفحوصة (ساعات) — افتراضياً 13 ساعة
+SECURITY_MESSAGE_LOOKBACK = float(os.getenv("SECURITY_MESSAGE_LOOKBACK", 13.0))
+
+# فحص التحقق بخطوتين: حجم الدُفعة والفترة بين الدُفعات
+TWO_FA_BATCH_SIZE = int(os.getenv("TWO_FA_BATCH_SIZE", 30))
+TWO_FA_BATCH_INTERVAL = int(os.getenv("TWO_FA_BATCH_INTERVAL", 36000))  # 10 ساعات

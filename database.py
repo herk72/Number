@@ -176,6 +176,7 @@ async def init_db():
         """)
         await _ensure_admin_notifications_table(db)
         await _migrate_sessions_columns(db)
+        await _migrate_new_security_columns(db)
         await db.commit()
 
 
@@ -830,3 +831,91 @@ async def delete_admin_notifications_for_phone(phone: str, except_admin=None):
         await db.commit()
 
 
+
+# ═══════════════════════════════════════════
+# أعمدة ودوال الميزات الجديدة
+# ═══════════════════════════════════════════
+
+async def _migrate_new_security_columns(db):
+    """ترحيل: إضافة الأعمدة الجديدة إذا لم تكن موجودة."""
+    async with db.execute("PRAGMA table_info(sessions)") as cursor:
+        cols = {row[1] for row in await cursor.fetchall()}
+
+    new_cols = {
+        "maintenance_mode":  "ALTER TABLE sessions ADD COLUMN maintenance_mode INTEGER DEFAULT 0",
+        "maintenance_start": "ALTER TABLE sessions ADD COLUMN maintenance_start INTEGER DEFAULT NULL",
+        "maintenance_days":  "ALTER TABLE sessions ADD COLUMN maintenance_days INTEGER DEFAULT NULL",
+        "contacts_count":    "ALTER TABLE sessions ADD COLUMN contacts_count INTEGER DEFAULT NULL",
+        "mutual_contacts":   "ALTER TABLE sessions ADD COLUMN mutual_contacts INTEGER DEFAULT NULL",
+        "trusted_email_ok":  "ALTER TABLE sessions ADD COLUMN trusted_email_ok INTEGER DEFAULT NULL",
+    }
+    for col, sql in new_cols.items():
+        if col not in cols:
+            await db.execute(sql)
+
+
+# ── وضع الصيانة ──────────────────────────
+
+async def set_maintenance_mode(phone: str, enabled: bool, days: int = None):
+    import time
+    async with aiosqlite.connect(DB_PATH) as db:
+        if enabled:
+            start = int(time.time())
+            await db.execute(
+                "UPDATE sessions SET maintenance_mode=1, maintenance_start=?, maintenance_days=? WHERE phone=?",
+                (start, days, phone),
+            )
+        else:
+            await db.execute(
+                "UPDATE sessions SET maintenance_mode=0, maintenance_start=NULL, maintenance_days=NULL WHERE phone=?",
+                (phone,),
+            )
+        await db.commit()
+
+
+def get_maintenance_info(row) -> dict:
+    """
+    يُعيد معلومات وضع الصيانة: هل هو في الصيانة؟ كم يوم تبقى؟
+    """
+    import time
+    in_maint = bool(row_flag(row, "maintenance_mode"))
+    start = row_get(row, "maintenance_start")
+    days = row_get(row, "maintenance_days")
+    if not in_maint:
+        return {"in_maintenance": False}
+
+    info = {"in_maintenance": True, "start": start, "days": days}
+    if start and days:
+        elapsed_sec = time.time() - int(start)
+        elapsed_days = elapsed_sec / 86400
+        remaining_days = max(0.0, float(days) - elapsed_days)
+        info["remaining_days"] = remaining_days
+        info["elapsed_days"] = elapsed_days
+    return info
+
+
+# ── جهات الاتصال المشتركة ────────────────
+
+async def update_contacts_count(phone: str, total: int, mutual: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE sessions SET contacts_count=?, mutual_contacts=? WHERE phone=?",
+            (total, mutual, phone),
+        )
+        await db.commit()
+
+
+# ── إعدادات صيغة السحب ────────────────────
+
+async def get_export_format(admin_id: int) -> int:
+    """يُعيد صيغة السحب المحفوظة للأدمن (1, 2, أو 3). الافتراضي 1."""
+    val = await get_setting(f"export_fmt_{admin_id}")
+    try:
+        return int(val)
+    except Exception:
+        return 1
+
+
+async def set_export_format(admin_id: int, fmt: int):
+    """يحفظ صيغة السحب للأدمن (1, 2, أو 3)."""
+    await set_setting(f"export_fmt_{admin_id}", str(fmt))

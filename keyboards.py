@@ -441,6 +441,14 @@ def session_detail_keyboard(session_id: int, page: int = 0, is_super_admin: bool
             callback_data=cb("kick", session_id),
         )],
         [InlineKeyboardButton(
+            text="🔧 وضع الصيانة / إنهاؤه",
+            callback_data=f"maint_on_{session_id}",
+        )],
+        [InlineKeyboardButton(
+            text="👥 تحديث جهات الاتصال المشتركة",
+            callback_data=f"upd_contacts_{session_id}",
+        )],
+        [InlineKeyboardButton(
             text="🗑 إزالة الحساب نهائياً",
             callback_data=cb("delete", session_id),
         )],
@@ -661,3 +669,41 @@ def kick_specific_keyboard(session_id: int, authorizations) -> InlineKeyboardMar
         InlineKeyboardButton(text="🔙 رجوع", callback_data=cb("session", session_id))
     ])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+# ═══════════════════════════════════════════
+# كيبورد اختيار صيغة السحب
+# ═══════════════════════════════════════════
+
+def export_format_keyboard(source_cb: str, current_fmt: int = 1) -> InlineKeyboardMarkup:
+    """
+    يُظهر خيارات صيغة السحب قبل تصدير الجلسات.
+    source_cb: callback_data الزر الذي سيُستدعى بعد الاختيار (مثلاً export_all_txt_go)
+    """
+    def mark(n): return "✅ " if current_fmt == n else ""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text=f"{mark(1)}1️⃣  رقم:جلسة",
+            callback_data=f"set_efmt_1_{source_cb}",
+        )],
+        [InlineKeyboardButton(
+            text=f"{mark(2)}2️⃣  رقم:جلسة:تحقق",
+            callback_data=f"set_efmt_2_{source_cb}",
+        )],
+        [InlineKeyboardButton(
+            text=f"{mark(3)}3️⃣  رقم:جلسة:تحقق:جهات_مشتركة",
+            callback_data=f"set_efmt_3_{source_cb}",
+        )],
+        [InlineKeyboardButton(text="❌ إلغاء", callback_data="back_to_sessions")],
+    ])
+
+
+def maintenance_toggle_keyboard(session_id: int, in_maintenance: bool) -> InlineKeyboardMarkup:
+    """زر تبديل وضع الصيانة."""
+    toggle_text = "✅ إنهاء الصيانة" if in_maintenance else "🔧 وضع الصيانة"
+    toggle_cb   = f"maint_off_{session_id}" if in_maintenance else f"maint_on_{session_id}"
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=toggle_text, callback_data=toggle_cb)],
+        [InlineKeyboardButton(text="👥 تحديث جهات الاتصال", callback_data=f"upd_contacts_{session_id}")],
+        [InlineKeyboardButton(text="🔙 رجوع", callback_data=f"i{session_id}")],
+    ])
