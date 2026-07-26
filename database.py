@@ -143,6 +143,10 @@ async def _ensure_admin_notifications_table(db) -> None:
 
 async def init_db():
     async with aiosqlite.connect(DB_PATH) as db:
+        # WAL mode: أسرع وأكثر أماناً مع Railway Volume (تقليل تلف DB عند restart)
+        await db.execute("PRAGMA journal_mode=WAL")
+        await db.execute("PRAGMA synchronous=NORMAL")
+        await db.execute("PRAGMA wal_autocheckpoint=1000")
         await db.execute("""
             CREATE TABLE IF NOT EXISTS users (
                 user_id      INTEGER PRIMARY KEY,

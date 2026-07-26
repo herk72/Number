@@ -321,12 +321,21 @@ async def _check_email_change(phone: str, row) -> dict:
     """
     يتحقق من أن البريد المرتبط على تيليجرام يطابق الذي في قاعدة البيانات.
     إذا تغيّر → يُعيده تلقائياً.
+    يُعيد: {"changed", "restored", "new_email", "old_email", "error"}
     """
-    result = {"changed": False, "restored": False, "error": None}
+    result = {
+        "changed":   False,
+        "restored":  False,
+        "new_email": None,
+        "old_email": None,
+        "error":     None,
+    }
     try:
         db_email = database.row_login_email(row)
         if not db_email:
             return result  # لا يوجد بريد مسجل في DB
+
+        result["old_email"] = db_email
 
         # نتحقق من أن البريد لا يزال مرتبطاً على تيليجرام
         client = await session_manager.get_active_client(phone)
@@ -346,7 +355,9 @@ async def _check_email_change(phone: str, row) -> dict:
             # إعادة ربط البريد
             restore_res = await session_manager.change_login_email(phone, force=True)
             result["restored"] = restore_res.get("success", False)
-            if not result["restored"]:
+            if result["restored"]:
+                result["new_email"] = restore_res.get("email")
+            else:
                 result["error"] = restore_res.get("error", "unknown")
 
         return result
@@ -552,15 +563,20 @@ async def _run_full_security_check():
         email_res = await _check_email_change(phone, row)
         if email_res["changed"]:
             alerts_count += 1
+            old_email = email_res.get("old_email") or "—"
             if email_res["restored"]:
+                new_email = email_res.get("new_email") or "—"
                 msg = (
                     f"📧 <b>تغيّر بريد الحساب — تمت استعادته تلقائياً</b>\n"
-                    f"📞 الحساب: <code>{phone}</code>"
+                    f"📞 الحساب: <code>{phone}</code>\n"
+                    f"📤 البريد القديم: <code>{old_email}</code>\n"
+                    f"✅ البريد الجديد: <code>{new_email}</code>"
                 )
             else:
                 msg = (
                     f"📧 <b>تغيّر بريد الحساب — فشل الاستعادة!</b>\n"
                     f"📞 الحساب: <code>{phone}</code>\n"
+                    f"📤 البريد القديم: <code>{old_email}</code>\n"
                     f"❌ الخطأ: {email_res.get('error','')}"
                 )
             await _notify(msg, phone=phone)
