@@ -7,6 +7,7 @@
 4. فحص تغيير البريد              → يُعيد البريد تلقائياً إذا تغيّر
 5. فحص الجهاز (بصمة الجهاز)    → يطرد أي جهاز غير الجهاز الموثوق
 6. فحص التحقق بخطوتين (دوري)   → 30 حساب كل 10 ساعات
+7. تجديد جهات الاتصال المشتركة  → يُحدِّث mutual_contacts لكل الحسابات مع كل دورة فحص
 """
 
 import asyncio
@@ -566,7 +567,11 @@ async def _run_full_security_check():
 
         await asyncio.sleep(1)
 
-    # 4) فحص التحقق بخطوتين الدوري
+        # 4) تجديد جهات الاتصال المشتركة (يحدث مع كل دورة فحص)
+        await _update_mutual_contacts(phone, row)
+        await asyncio.sleep(0.5)
+
+    # 5) فحص التحقق بخطوتين الدوري
     two_fa_changed = await _run_two_fa_batch_check()
     for item in two_fa_changed:
         alerts_count += 1

@@ -13,27 +13,73 @@ from config import BOT_ID
 logger = logging.getLogger(__name__)
 
 
+def _safe_db_copy(src_path: str, dst_path: str) -> None:
+    """
+    نسخ آمن لقاعدة بيانات SQLite مع مراعاة WAL mode.
+    يستخدم SQLite Backup API بدلاً من نسخ الملف مباشرة.
+    """
+    import sqlite3
+    src = sqlite3.connect(src_path)
+    try:
+        dst = sqlite3.connect(dst_path)
+        try:
+            src.backup(dst)
+        finally:
+            dst.close()
+    finally:
+        src.close()
+
+
 def build_volume_zip() -> tuple[bytes, str]:
-    """ضغط كل ملفات DATA_DIR (قواعد بيانات كل البوتات) في ZIP."""
+    """
+    ضغط كل ملفات DATA_DIR في ZIP.
+    يستخدم SQLite Backup API لملفات .db لضمان نسخة متسقة حتى مع WAL mode.
+    """
+    import sqlite3
+    import tempfile
+
     buffer = io.BytesIO()
     root = Path(DATA_DIR)
-    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as zf:
-        for file_path in root.rglob("*"):
-            if file_path.is_file():
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+            for file_path in root.rglob("*"):
+                if not file_path.is_file():
+                    continue
                 arcname = file_path.relative_to(root).as_posix()
-                zf.write(file_path, arcname)
+                name_lower = file_path.name.lower()
+                # تجاهل ملفات WAL والمساعدة (تُضمَّن تلقائياً في النسخة)
+                if name_lower.endswith("-wal") or name_lower.endswith("-shm"):
+                    continue
+                if name_lower.endswith(".db"):
+                    # نسخ آمنة عبر SQLite Backup API
+                    tmp_db = os.path.join(tmp_dir, arcname.replace("/", "_"))
+                    try:
+                        _safe_db_copy(str(file_path), tmp_db)
+                        zf.write(tmp_db, arcname)
+                    except Exception as e:
+                        logger.warning("db backup fallback for %s: %s", arcname, e)
+                        zf.write(str(file_path), arcname)
+                else:
+                    zf.write(str(file_path), arcname)
+
     buffer.seek(0)
     filename = f"volume_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
     return buffer.getvalue(), filename
 
 
 def _backup_current_db():
+    """نسخ احتياطي للـ DB الحالية قبل الاستعادة — يستخدم SQLite Backup API."""
     if not os.path.exists(DB_PATH):
         return
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     dest = os.path.join(DATA_DIR, f"bot.db.bak_{ts}")
-    shutil.copy2(DB_PATH, dest)
-    logger.info("db backup before restore: %s", dest)
+    try:
+        _safe_db_copy(DB_PATH, dest)
+        logger.info("db backup before restore (safe): %s", dest)
+    except Exception as e:
+        logger.warning("safe db backup failed (%s), falling back to shutil: %s", dest, e)
+        shutil.copy2(DB_PATH, dest)
 
 
 def merge_db_from_zip(content: bytes) -> dict:
@@ -60,7 +106,14 @@ def merge_db_from_zip(content: bytes) -> dict:
                     dst.write(src.read())
 
             # اقرأ الجلسات من DB المستورد
-            src_conn = sqlite3.connect(extracted_db)
+            # نسخ آمن من الملف المستخرج قبل القراءة
+            safe_extracted = extracted_db + ".safe.db"
+            try:
+                _safe_db_copy(extracted_db, safe_extracted)
+            except Exception:
+                safe_extracted = extracted_db  # fallback للملف الأصلي
+
+            src_conn = sqlite3.connect(safe_extracted)
             src_conn.row_factory = sqlite3.Row
             try:
                 src_rows = src_conn.execute("SELECT * FROM sessions").fetchall()

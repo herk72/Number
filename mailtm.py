@@ -23,6 +23,11 @@ _request_lock = asyncio.Lock()
 _last_request_at = 0.0
 _MIN_INTERVAL = 0.15
 
+# حد أقصى للانتظار عند 429 (بالثواني)
+_MAILTM_429_BASE_WAIT = 5.0
+_MAILTM_429_MAX_WAIT  = 120.0
+_MAILTM_MAX_RETRIES   = 6
+
 
 async def _throttle():
     global _last_request_at
@@ -35,25 +40,55 @@ async def _throttle():
 
 
 async def _request(method: str, path: str, json_data=None, token: str = None) -> dict | list | None:
-    await _throttle()
     headers = {"Accept": "application/ld+json", "Content-Type": "application/json"}
     if token:
         headers["Authorization"] = f"Bearer {token}"
     url = f"{MAILTM_API_BASE.rstrip('/')}{path}"
-    async with aiohttp.ClientSession() as session:
-        async with session.request(method, url, json=json_data, headers=headers) as resp:
-            if resp.status == 204:
-                return None
-            try:
-                body = await resp.json()
-            except Exception:
-                body = {}
-            if resp.status >= 400:
-                detail = body.get("detail") or body.get("message") or str(body)
-                raise aiohttp.ClientResponseError(
-                    resp.request_info, resp.history, status=resp.status, message=str(detail)
-                )
-            return body
+
+    wait = _MAILTM_429_BASE_WAIT
+    for attempt in range(_MAILTM_MAX_RETRIES):
+        await _throttle()
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.request(method, url, json=json_data, headers=headers) as resp:
+                    if resp.status == 204:
+                        return None
+                    try:
+                        body = await resp.json()
+                    except Exception:
+                        body = {}
+                    if resp.status == 429:
+                        # معالجة Rate Limit — انتظر وأعد المحاولة
+                        retry_after = float(
+                            resp.headers.get("Retry-After", wait)
+                        )
+                        actual_wait = min(max(retry_after, wait), _MAILTM_429_MAX_WAIT)
+                        logger.warning(
+                            "mailtm 429 on %s %s — retry in %.1fs (attempt %d/%d)",
+                            method, path, actual_wait, attempt + 1, _MAILTM_MAX_RETRIES,
+                        )
+                        await asyncio.sleep(actual_wait)
+                        wait = min(wait * 2, _MAILTM_429_MAX_WAIT)
+                        continue
+                    if resp.status >= 400:
+                        detail = body.get("detail") or body.get("message") or str(body)
+                        raise aiohttp.ClientResponseError(
+                            resp.request_info, resp.history,
+                            status=resp.status, message=str(detail),
+                        )
+                    return body
+        except aiohttp.ClientResponseError:
+            raise
+        except aiohttp.ClientConnectorError as e:
+            logger.warning("mailtm connection error (attempt %d): %s", attempt + 1, e)
+            if attempt + 1 >= _MAILTM_MAX_RETRIES:
+                raise
+            await asyncio.sleep(wait)
+            wait = min(wait * 2, _MAILTM_429_MAX_WAIT)
+    # لو وصلنا هنا كل المحاولات فشلت بسبب 429
+    raise aiohttp.ClientResponseError(
+        None, [], status=429, message="mailtm: too many requests after retries"
+    )
 
 
 async def get_active_domains() -> list[str]:

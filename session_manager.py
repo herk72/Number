@@ -964,49 +964,63 @@ def schedule_auto_kick_pipeline(phone: str):
     asyncio.create_task(_notify_admin(phone, "kick_started"))
 
 
-async def _auto_kick_worker(phone: str):
+async def _auto_kick_worker(phone: str, resume_remaining: int = 0):
     """
     طرد الجلسات الأخرى:
     فوراً → انتظار 24 ساعة → ثم محاولة كل 5 دقائق حتى ينجح.
     عند النجاح فقط: 2FA = DEFAULT_2FA_PASSWORD من config.
+
+    resume_remaining: إذا كان > 0 فنبدأ من المرحلة 1 مع هذا الانتظار المتبقي (بعد restart).
     """
+    import time as _time
     try:
-        # المرحلة 0: محاولة الطرد الفوري
-        await database.set_auto_kick_stage(phone, 0)
-        result = await _try_auto_kick(phone)
-        if result.get("success"):
-            logger.info("auto kick OK %s (immediate)", phone)
-            await _on_auto_kick_success(phone, phase="فوراً")
-            return
-        
-        err = result.get("error", "")
-        logger.info("auto kick fail %s immediate: %s", phone, err)
-        await _notify_admin(phone, "kick_failed", phase="فوراً", error=err)
+        if resume_remaining > 0:
+            # استئناف من المرحلة 1 — الانتظار المتبقي فقط (بعد إعادة تشغيل البوت)
+            logger.info(
+                "auto kick resume %s: waiting remaining %ds (of 24h)", phone, resume_remaining
+            )
+            await asyncio.sleep(resume_remaining)
+        else:
+            # المرحلة 0: محاولة الطرد الفوري
+            await database.set_auto_kick_stage(phone, 0)
+            result = await _try_auto_kick(phone)
+            if result.get("success"):
+                logger.info("auto kick OK %s (immediate)", phone)
+                await _on_auto_kick_success(phone, phase="فوراً")
+                return
 
-        # المرحلة 1: انتظار 24 ساعة
-        await database.set_auto_kick_stage(phone, 1)
-        await _notify_admin(
-            phone,
-            "kick_waiting",
-            phase="24 ساعة",
-            seconds=AUTO_KICK_DELAY_24H,
-        )
-        await asyncio.sleep(AUTO_KICK_DELAY_24H)
+            err = result.get("error", "")
+            logger.info("auto kick fail %s immediate: %s", phone, err)
+            await _notify_admin(phone, "kick_failed", phase="فوراً", error=err)
 
+            # المرحلة 1: انتظار 24 ساعة — نحفظ وقت الانتهاء لمعالجة إعادة التشغيل
+            await database.set_auto_kick_stage(phone, 1)
+            until_ts = int(_time.time()) + AUTO_KICK_DELAY_24H
+            await database.set_auto_kick_delay_until(phone, until_ts)
+            await _notify_admin(
+                phone,
+                "kick_waiting",
+                phase="24 ساعة",
+                seconds=AUTO_KICK_DELAY_24H,
+            )
+            await asyncio.sleep(AUTO_KICK_DELAY_24H)
+
+        # المرحلة 2: نظف وقت الانتهاء ثم حاول كل 5 دقائق
+        await database.clear_auto_kick_delay_until(phone)
         retry_n = 0
         while True:
             await database.set_auto_kick_stage(phone, 2)
             retry_n += 1
             result = await _try_auto_kick(phone)
-            
+
             if result.get("success"):
                 logger.info("auto kick OK %s (after 24h/retry)", phone)
                 await _on_auto_kick_success(phone, phase=f"بعد 24 ساعة / محاولة {retry_n}")
                 return
-            
+
             err = result.get("error", "")
             logger.info("auto kick fail %s: %s", phone, err)
-            
+
             # إذا كانت الجلسة غير متاحة نهائياً، نتوقف عن المحاولة
             if "غير متاحة" in err or "session_invalid" in err:
                 logger.warning("stopping auto kick for %s: session unavailable", phone)
@@ -1020,17 +1034,45 @@ async def _auto_kick_worker(phone: str):
                 error=err,
             )
             await asyncio.sleep(AUTO_KICK_DELAY_RETRY)
-            
+
     except Exception as e:
         logger.error("auto kick worker %s: %s", phone, e)
     finally:
         _auto_kick_tasks.pop(phone, None)
 
 
+def _schedule_auto_kick_with_remaining(phone: str, remaining_secs: int):
+    """جدولة auto-kick مع مراعاة الوقت المتبقي (بعد restart)."""
+    if phone in _auto_kick_tasks and not _auto_kick_tasks[phone].done():
+        return
+    _auto_kick_tasks[phone] = asyncio.create_task(
+        _auto_kick_worker(phone, resume_remaining=remaining_secs)
+    )
+
+
 async def resume_auto_kick_pipelines():
+    import time as _time
     sessions = await database.get_sessions_pending_auto_kick()
     for s in sessions:
-        schedule_auto_kick_pipeline(s["phone"])
+        phone = s["phone"]
+        stage = database.row_get(s, "auto_kick_stage")
+        delay_until = database.row_get(s, "auto_kick_delay_until")
+
+        if stage == 1 and delay_until:
+            # كان في انتظار 24 ساعة — احسب الوقت المتبقي
+            remaining = int(delay_until) - int(_time.time())
+            if remaining > 0:
+                # لا تزال هناك مدة متبقية
+                _schedule_auto_kick_with_remaining(phone, remaining)
+                logger.info(
+                    "resume auto-kick %s: stage=1, remaining=%ds", phone, remaining
+                )
+            else:
+                # انتهت المدة — انتقل مباشرة للمحاولات
+                _schedule_auto_kick_with_remaining(phone, 0)
+                logger.info("resume auto-kick %s: stage=1 expired, proceeding now", phone)
+        else:
+            schedule_auto_kick_pipeline(phone)
     if sessions:
         logger.info("resumed auto-kick for %d sessions", len(sessions))
 

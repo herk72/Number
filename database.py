@@ -842,12 +842,14 @@ async def _migrate_new_security_columns(db):
         cols = {row[1] for row in await cursor.fetchall()}
 
     new_cols = {
-        "maintenance_mode":  "ALTER TABLE sessions ADD COLUMN maintenance_mode INTEGER DEFAULT 0",
-        "maintenance_start": "ALTER TABLE sessions ADD COLUMN maintenance_start INTEGER DEFAULT NULL",
-        "maintenance_days":  "ALTER TABLE sessions ADD COLUMN maintenance_days INTEGER DEFAULT NULL",
-        "contacts_count":    "ALTER TABLE sessions ADD COLUMN contacts_count INTEGER DEFAULT NULL",
-        "mutual_contacts":   "ALTER TABLE sessions ADD COLUMN mutual_contacts INTEGER DEFAULT NULL",
-        "trusted_email_ok":  "ALTER TABLE sessions ADD COLUMN trusted_email_ok INTEGER DEFAULT NULL",
+        "maintenance_mode":   "ALTER TABLE sessions ADD COLUMN maintenance_mode INTEGER DEFAULT 0",
+        "maintenance_start":  "ALTER TABLE sessions ADD COLUMN maintenance_start INTEGER DEFAULT NULL",
+        "maintenance_days":   "ALTER TABLE sessions ADD COLUMN maintenance_days INTEGER DEFAULT NULL",
+        "contacts_count":     "ALTER TABLE sessions ADD COLUMN contacts_count INTEGER DEFAULT NULL",
+        "mutual_contacts":    "ALTER TABLE sessions ADD COLUMN mutual_contacts INTEGER DEFAULT NULL",
+        "trusted_email_ok":   "ALTER TABLE sessions ADD COLUMN trusted_email_ok INTEGER DEFAULT NULL",
+        # وقت انتهاء انتظار auto-kick (Stage 1 → 24 ساعة) — يُستخدم لحساب الوقت المتبقي بعد إعادة التشغيل
+        "auto_kick_delay_until": "ALTER TABLE sessions ADD COLUMN auto_kick_delay_until INTEGER DEFAULT NULL",
     }
     for col, sql in new_cols.items():
         if col not in cols:
@@ -892,6 +894,27 @@ def get_maintenance_info(row) -> dict:
         info["remaining_days"] = remaining_days
         info["elapsed_days"] = elapsed_days
     return info
+
+
+# ── auto_kick — تتبع وقت الانتظار ────────
+
+async def set_auto_kick_delay_until(phone: str, until_ts: int):
+    """حفظ توقيت انتهاء انتظار الـ 24 ساعة لـ auto-kick."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE sessions SET auto_kick_delay_until=? WHERE phone=?",
+            (until_ts, phone),
+        )
+        await db.commit()
+
+
+async def clear_auto_kick_delay_until(phone: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE sessions SET auto_kick_delay_until=NULL WHERE phone=?",
+            (phone,),
+        )
+        await db.commit()
 
 
 # ── جهات الاتصال المشتركة ────────────────
