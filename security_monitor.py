@@ -51,10 +51,14 @@ _CANCEL_BTN_TEXT = re.compile(
 
 # نشرة الأجهزة الموثوقة — قابلة للتوسع
 TRUSTED_DEVICE_KEYWORDS = [
-    "SM-S918B",  # Samsung S23 Ultra الاسم التقني
-    "s918",
-    "s23 ultra",
-    "samsungs23ultra",
+    "SM-S918B",          # الاسم التقني القصير
+    "samsungSM-S918B",   # الاسم التقني الكامل
+    "s918",              # جزء من الاسم التقني
+    "s23 ultra",         # اسم السوق
+    "s23ultra",          # بدون مسافة
+    "samsungs23ultra",   # كامل بدون مسافة
+    "galaxy s23 ultra",  # الاسم الكامل مع galaxy
+    "galaxys23ultra",    # بدون مسافات
 ]
 
 # حالة الفحص الدوري للـ 2FA
