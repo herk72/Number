@@ -135,6 +135,11 @@ def merge_db_from_zip(content: bytes) -> dict:
                 dst_info = dst_conn.execute("PRAGMA table_info(sessions)").fetchall()
                 dst_cols = {row[1] for row in dst_info}
 
+                # حساب الأعمدة المشتركة مرة واحدة خارج الحلقة
+                # sorted() يضمن ترتيباً ثابتاً بين col_list و vals
+                # إصلاح خطأ الأولوية: (dst_cols & src_cols) - {"id"} وليس dst_cols & (src_cols - {"id"})
+                common = sorted((dst_cols & src_cols) - {"id"})
+
                 added = skipped = 0
                 for row in src_rows:
                     phone = row["phone"]
@@ -146,8 +151,13 @@ def merge_db_from_zip(content: bytes) -> dict:
                         skipped += 1
                         continue
 
+                    # رفض أي صف session_string فيه فارغ — يمنع إدخال جلسات معطوبة
+                    session_str = row["session_string"] if "session_string" in row.keys() else None
+                    if not session_str or not str(session_str).strip():
+                        skipped += 1
+                        continue
+
                     # بناء INSERT ديناميكي بالأعمدة المشتركة
-                    common = dst_cols & src_cols - {"id"}
                     col_list = ", ".join(common)
                     placeholders = ", ".join("?" for _ in common)
                     vals = tuple(row[c] for c in common)
