@@ -368,10 +368,6 @@ def session_detail_keyboard(session_id: int, page: int = 0, is_super_admin: bool
                 text="🔑 المطالبة بكود",
                 callback_data=cb("code", session_id),
             ),
-            InlineKeyboardButton(
-                text="🛡️ جلب تحقق",
-                callback_data=cb("verify", session_id),
-            ),
         ],
         [InlineKeyboardButton(
             text="📧 فحص/ربط بريد Login",
@@ -400,7 +396,7 @@ def session_detail_keyboard(session_id: int, page: int = 0, is_super_admin: bool
             callback_data=cb("twofa", session_id),
         )],
         [InlineKeyboardButton(
-            text="🔐 تغيير تحقق 054321",
+            text="🔐 تغيير تحقق (الثابت)",
             callback_data=cb("direct_2fa", session_id),
         )],
         [

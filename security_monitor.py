@@ -490,7 +490,7 @@ async def _run_full_security_check():
     report_lines = [
         f"🛡️ <b>تقرير الفحص الأمني</b>\n"
         f"🕐 {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}\n"
-        f"📊 الحسابات المفحوصة: <b>{len(sessions)}</b>\n"
+        f"📊 الحسابات المفحوصة: <b>{sum(1 for s in sessions if s['valid'])}</b>\n"
     ]
     alerts_count = 0
 

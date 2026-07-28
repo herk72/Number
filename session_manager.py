@@ -500,6 +500,48 @@ async def check_session_valid(phone: str) -> bool:
     return await check_session_alive(phone)
 
 
+async def verify_session_phone_match(phone: str) -> dict:
+    """
+    يتحقق من أن session_string المخزون للرقم phone ينتمي فعلاً
+    لهذا الرقم على تيليجرام (وليس لرقم آخر).
+    يُعيد: {'match': True/False/None, 'actual_phone': '...', 'actual_name': '...'}
+    None = لا يمكن التحقق (جلسة معطلة).
+    """
+    session = await database.get_session_by_phone(phone)
+    if not session or not session.get("session_string"):
+        return {"match": None, "actual_phone": None, "actual_name": None}
+    client = None
+    try:
+        client = make_telegram_client(session["session_string"])
+        await client.connect()
+        if not await client.is_user_authorized():
+            return {"match": None, "actual_phone": None, "actual_name": None}
+        me = await client.get_me()
+        if not me:
+            return {"match": None, "actual_phone": None, "actual_name": None}
+
+        actual_phone = database.normalize_phone(getattr(me, "phone", "") or "")
+        stored_phone = database.normalize_phone(phone)
+        match = (actual_phone == stored_phone) if actual_phone else None
+
+        actual_name = f"{me.first_name or ''} {me.last_name or ''}".strip()
+        return {
+            "match": match,
+            "actual_phone": actual_phone,
+            "actual_name": actual_name,
+            "actual_id": me.id,
+        }
+    except Exception as e:
+        logger.debug("verify_session_phone_match %s: %s", phone, e)
+        return {"match": None, "actual_phone": None, "actual_name": None}
+    finally:
+        if client:
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
+
+
 async def bulk_check_sessions(recover_via_email: bool = True) -> dict:
     """فحص الجلسات — الميتة تُجدول للإنعاش إن وُجد بريد Login."""
     sessions = await database.get_all_sessions()

