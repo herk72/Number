@@ -675,7 +675,11 @@ def kick_specific_keyboard(session_id: int, authorizations) -> InlineKeyboardMar
 # كيبورد اختيار صيغة السحب
 # ═══════════════════════════════════════════
 
-def export_format_keyboard(source_cb: str, current_fmt: int = 1) -> InlineKeyboardMarkup:
+def export_format_keyboard(
+    source_cb: str,
+    current_fmt: int = 1,
+    cancel_cb: str = "back_to_sessions",
+) -> InlineKeyboardMarkup:
     """
     يُظهر خيارات صيغة السحب قبل تصدير الجلسات.
     source_cb: callback_data الزر الذي سيُستدعى بعد الاختيار (مثلاً export_all_txt_go)
@@ -694,7 +698,7 @@ def export_format_keyboard(source_cb: str, current_fmt: int = 1) -> InlineKeyboa
             text=f"{mark(3)}3️⃣  رقم:جلسة:تحقق:جهات_مشتركة",
             callback_data=f"set_efmt_3_{source_cb}",
         )],
-        [InlineKeyboardButton(text="❌ إلغاء", callback_data="back_to_sessions")],
+        [InlineKeyboardButton(text="❌ إلغاء", callback_data=cancel_cb)],
     ])
 
 

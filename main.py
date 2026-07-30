@@ -1225,14 +1225,72 @@ async def a1_hide_session(callback: CallbackQuery, state: FSMContext):
 
 @dp.callback_query(F.data.regexp(r"^x\d+$"))
 async def export_session_text(callback: CallbackQuery):
+    """سحب جلسة واحدة — اختيار الصيغة ثم التصدير."""
     if not is_admin(callback.from_user.id):
         await callback.answer()
         return
     session = await admin_resolve.get_session_from_callback(callback.data, "export")
     if not await _guard_session_row(callback, session):
         return
-    await _export_session_message(callback, session)
+    uid = callback.from_user.id
+    sid = session["id"]
+    current_fmt = await database.get_export_format(uid)
+    from keyboards import export_format_keyboard
+    await callback.message.edit_text(
+        f"📋 <b>اختر صيغة سحب الجلسة</b>\n"
+        f"📱 <code>{h(session['phone'])}</code>\n\n"
+        f"1️⃣  رقم:جلسة\n"
+        f"2️⃣  رقم:جلسة:تحقق\n"
+        f"3️⃣  رقم:جلسة:تحقق:جهات_مشتركة"
+        + ADMIN_FOOTER,
+        parse_mode="HTML",
+        reply_markup=export_format_keyboard(
+            f"export_one_go_{sid}", current_fmt, cancel_cb=f"i{sid}"
+        ),
+    )
     await callback.answer()
+
+
+async def export_one_session_go(
+    callback: CallbackQuery, session_id: int, fmt: int | None = None
+):
+    """تصدير جلسة واحدة بعد اختيار الصيغة."""
+    if not is_admin(callback.from_user.id):
+        try:
+            await callback.answer()
+        except Exception:
+            pass
+        return
+    session = await database.get_session_by_id(session_id)
+    if not session:
+        await callback.message.answer("❌ الجلسة غير موجودة!" + ADMIN_FOOTER, parse_mode="HTML")
+        return
+    uid = callback.from_user.id
+    if not await database.can_admin_access_session(uid, session["phone"], SUPER_ADMIN_IDS):
+        await callback.message.answer("❌ هذا الحساب غير متاح." + ADMIN_FOOTER, parse_mode="HTML")
+        return
+    if fmt is None:
+        fmt = await database.get_export_format(uid)
+    line = await _build_export_line(session, fmt)
+    phone = session["phone"]
+    if not line:
+        await callback.message.answer(
+            f"❌ لا يوجد session_string للرقم <code>{h(phone)}</code>.\n"
+            f"الجلسة غير متصلة أو منتهية — جرّب «فحص الجلسات»." + ADMIN_FOOTER,
+            parse_mode="HTML",
+        )
+        return
+    msg = await callback.message.answer(
+        f"📦 <b>سحب الجلسة — صيغة {fmt}</b>\n"
+        f"📱 <code>{h(phone)}</code>\n\n"
+        f"<code>{h(line)}</code>" + ADMIN_FOOTER,
+        parse_mode="HTML",
+    )
+    await track_admin_phone_message(uid, phone, msg.chat.id, msg.message_id)
+    try:
+        await _render_session_detail(callback, session)
+    except Exception:
+        pass
 
 
 # ──────────────────────────────────────────
@@ -1415,7 +1473,6 @@ async def volume_export_handler(callback: CallbackQuery):
     except Exception as e:
         logging.error("vol_export: %s", e)
         await callback.message.answer(f"❌ فشل التصدير: <code>{h(str(e))}</code>")
-    await callback.answer()
 
 
 @dp.callback_query(F.data == "vol_import")
@@ -1914,7 +1971,9 @@ async def export_secured_country_handler(callback: CallbackQuery):
     await callback.answer()
 
 
-async def export_secured_country_go(callback: CallbackQuery, dial_code: str | None = None):
+async def export_secured_country_go(
+    callback: CallbackQuery, dial_code: str | None = None, fmt: int | None = None
+):
     """تصدير الجلسات المؤمنة لدولة محددة بعد اختيار الصيغة."""
     if not is_admin(callback.from_user.id):
         try:
@@ -1931,7 +1990,8 @@ async def export_secured_country_go(callback: CallbackQuery, dial_code: str | No
     uid = callback.from_user.id
     all_s = await _sessions_for_admin(uid)
     is_sa = is_super_admin(uid)
-    fmt = await database.get_export_format(uid)
+    if fmt is None:
+        fmt = await database.get_export_format(uid)
 
     sessions = [
         s for s in all_s
@@ -1985,7 +2045,8 @@ async def export_secured_valid_two_fa_prompt(callback: CallbackQuery):
     current_fmt = await database.get_export_format(uid)
     from keyboards import export_format_keyboard
     await callback.message.edit_text(
-        "📋 <b>اختر صيغة سحب مؤمنة (تحقق شغال):</b>" + ADMIN_FOOTER,
+        "📋 <b>اختر صيغة سحب مؤمنة (تحقق شغال):</b>\n"
+        "1️⃣ رقم:جلسة · 2️⃣ +تحقق · 3️⃣ +جهات مشتركة" + ADMIN_FOOTER,
         parse_mode="HTML",
         reply_markup=export_format_keyboard(
             "export_secured_valid_two_fa_go", current_fmt
@@ -1994,7 +2055,7 @@ async def export_secured_valid_two_fa_prompt(callback: CallbackQuery):
     await callback.answer()
 
 
-async def export_secured_valid_two_fa_go(callback: CallbackQuery):
+async def export_secured_valid_two_fa_go(callback: CallbackQuery, fmt: int | None = None):
     if not is_admin(callback.from_user.id):
         try:
             await callback.answer()
@@ -2011,7 +2072,8 @@ async def export_secured_valid_two_fa_go(callback: CallbackQuery):
         )
         return
 
-    fmt = await database.get_export_format(uid)
+    if fmt is None:
+        fmt = await database.get_export_format(uid)
     await callback.message.edit_text(
         f"⏳ جاري تجهيز ملف الجلسات المؤمنة (تحقق شغال — صيغة {fmt})...",
         parse_mode="HTML",
@@ -3559,16 +3621,19 @@ async def set_export_fmt_handler(callback: CallbackQuery):
 
     try:
         if source_cb == "export_all_txt_go":
-            await export_all_sessions_txt_go(callback)
+            await export_all_sessions_txt_go(callback, fmt=fmt)
         elif source_cb == "export_secured_txt_go":
-            await export_secured_sessions_txt_go(callback)
+            await export_secured_sessions_txt_go(callback, fmt=fmt)
         elif source_cb == "export_star_txt_go":
-            await export_star_sessions_txt_go(callback)
+            await export_star_sessions_txt_go(callback, fmt=fmt)
         elif source_cb == "export_secured_valid_two_fa_go":
-            await export_secured_valid_two_fa_go(callback)
+            await export_secured_valid_two_fa_go(callback, fmt=fmt)
         elif source_cb.startswith("sec_ctry_go_"):
             dial = source_cb.removeprefix("sec_ctry_go_")
-            await export_secured_country_go(callback, dial_code=dial)
+            await export_secured_country_go(callback, dial_code=dial, fmt=fmt)
+        elif source_cb.startswith("export_one_go_"):
+            sid = int(source_cb.removeprefix("export_one_go_"))
+            await export_one_session_go(callback, session_id=sid, fmt=fmt)
         else:
             await callback.message.answer(
                 f"❌ مصدر سحب غير معروف: <code>{h(source_cb)}</code>" + ADMIN_FOOTER,
@@ -3586,16 +3651,21 @@ async def set_export_fmt_handler(callback: CallbackQuery):
 
 
 async def _build_export_line(s, fmt: int) -> str | None:
-    """يبني سطر جلسة واحدة حسب الصيغة المختارة."""
-    phone = s["phone"]
+    """يبني سطر جلسة واحدة حسب الصيغة المختارة.
+    1) رقم:جلسة
+    2) رقم:جلسة:تحقق
+    3) رقم:جلسة:تحقق:جهات_مشتركة
+    """
+    phone = str(s["phone"] or "").strip()
     ss = database.row_get(s, "session_string")
     if not ss or not str(ss).strip():
         ss = await session_manager.ensure_session_string(phone)
     if not ss:
         return None
+    ss = str(ss).strip()
     if fmt == 1:
         return f"{phone}:{ss}"
-    two_fa = database.row_get(s, "two_fa") or ""
+    two_fa = str(database.row_get(s, "two_fa") or "").strip()
     if fmt == 2:
         return f"{phone}:{ss}:{two_fa}"
     # fmt == 3
@@ -3615,20 +3685,22 @@ async def export_all_sessions_txt_prompt(callback: CallbackQuery):
     current_fmt = await database.get_export_format(uid)
     from keyboards import export_format_keyboard
     await callback.message.edit_text(
-        "📋 <b>اختر صيغة سحب الكل:</b>" + ADMIN_FOOTER,
+        "📋 <b>اختر صيغة سحب الكل:</b>\n"
+        "1️⃣ رقم:جلسة · 2️⃣ +تحقق · 3️⃣ +جهات مشتركة" + ADMIN_FOOTER,
         parse_mode="HTML",
         reply_markup=export_format_keyboard("export_all_txt_go", current_fmt),
     )
     await callback.answer()
 
 
-async def export_all_sessions_txt_go(callback: CallbackQuery):
+async def export_all_sessions_txt_go(callback: CallbackQuery, fmt: int | None = None):
     uid = callback.from_user.id
     sessions = await _sessions_for_admin(uid)
     if not sessions:
         await callback.message.answer("❌ لا توجد جلسات." + ADMIN_FOOTER, parse_mode="HTML")
         return
-    fmt = await database.get_export_format(uid)
+    if fmt is None:
+        fmt = await database.get_export_format(uid)
     await callback.message.edit_text(f"⏳ جاري تجهيز ملف الجلسات (صيغة {fmt})...", parse_mode="HTML")
     lines = []
     for s in sessions:
@@ -3657,14 +3729,15 @@ async def export_secured_sessions_txt_prompt(callback: CallbackQuery):
     current_fmt = await database.get_export_format(uid)
     from keyboards import export_format_keyboard
     await callback.message.edit_text(
-        "📋 <b>اختر صيغة سحب المؤمّنة:</b>" + ADMIN_FOOTER,
+        "📋 <b>اختر صيغة سحب المؤمّنة:</b>\n"
+        "1️⃣ رقم:جلسة · 2️⃣ +تحقق · 3️⃣ +جهات مشتركة" + ADMIN_FOOTER,
         parse_mode="HTML",
         reply_markup=export_format_keyboard("export_secured_txt_go", current_fmt),
     )
     await callback.answer()
 
 
-async def export_secured_sessions_txt_go(callback: CallbackQuery):
+async def export_secured_sessions_txt_go(callback: CallbackQuery, fmt: int | None = None):
     uid = callback.from_user.id
     all_sessions = await _sessions_for_admin(uid)
     is_sa = is_super_admin(uid)
@@ -3672,7 +3745,8 @@ async def export_secured_sessions_txt_go(callback: CallbackQuery):
     if not sessions:
         await callback.message.answer("❌ لا توجد جلسات مؤمّنة." + ADMIN_FOOTER, parse_mode="HTML")
         return
-    fmt = await database.get_export_format(uid)
+    if fmt is None:
+        fmt = await database.get_export_format(uid)
     await callback.message.edit_text(f"⏳ جاري تجهيز ملف المؤمّنة (صيغة {fmt})...", parse_mode="HTML")
     lines = []
     for s in sessions:
@@ -3697,20 +3771,22 @@ async def export_star_sessions_txt_prompt(callback: CallbackQuery):
     current_fmt = await database.get_export_format(uid)
     from keyboards import export_format_keyboard
     await callback.message.edit_text(
-        "📋 <b>اختر صيغة سحب النجمة:</b>" + ADMIN_FOOTER,
+        "📋 <b>اختر صيغة سحب النجمة:</b>\n"
+        "1️⃣ رقم:جلسة · 2️⃣ +تحقق · 3️⃣ +جهات مشتركة" + ADMIN_FOOTER,
         parse_mode="HTML",
         reply_markup=export_format_keyboard("export_star_txt_go", current_fmt),
     )
     await callback.answer()
 
 
-async def export_star_sessions_txt_go(callback: CallbackQuery):
+async def export_star_sessions_txt_go(callback: CallbackQuery, fmt: int | None = None):
     sessions = await database.get_a1_only_sessions()
     if not sessions:
         await callback.message.answer("❌ لا توجد جلسات ⭐." + ADMIN_FOOTER, parse_mode="HTML")
         return
     uid = callback.from_user.id
-    fmt = await database.get_export_format(uid)
+    if fmt is None:
+        fmt = await database.get_export_format(uid)
     await callback.message.edit_text(f"⏳ جاري تجهيز جلسات النجمة (صيغة {fmt})...", parse_mode="HTML")
     lines = []
     for s in sessions:
