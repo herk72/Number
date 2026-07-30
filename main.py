@@ -1225,72 +1225,14 @@ async def a1_hide_session(callback: CallbackQuery, state: FSMContext):
 
 @dp.callback_query(F.data.regexp(r"^x\d+$"))
 async def export_session_text(callback: CallbackQuery):
-    """سحب جلسة واحدة — اختيار الصيغة ثم التصدير."""
     if not is_admin(callback.from_user.id):
         await callback.answer()
         return
     session = await admin_resolve.get_session_from_callback(callback.data, "export")
     if not await _guard_session_row(callback, session):
         return
-    uid = callback.from_user.id
-    sid = session["id"]
-    current_fmt = await database.get_export_format(uid)
-    from keyboards import export_format_keyboard
-    await callback.message.edit_text(
-        f"📋 <b>اختر صيغة سحب الجلسة</b>\n"
-        f"📱 <code>{h(session['phone'])}</code>\n\n"
-        f"1️⃣  رقم:جلسة\n"
-        f"2️⃣  رقم:جلسة:تحقق\n"
-        f"3️⃣  رقم:جلسة:تحقق:جهات_مشتركة"
-        + ADMIN_FOOTER,
-        parse_mode="HTML",
-        reply_markup=export_format_keyboard(
-            f"export_one_go_{sid}", current_fmt, cancel_cb=f"i{sid}"
-        ),
-    )
+    await _export_session_message(callback, session)
     await callback.answer()
-
-
-async def export_one_session_go(
-    callback: CallbackQuery, session_id: int, fmt: int | None = None
-):
-    """تصدير جلسة واحدة بعد اختيار الصيغة."""
-    if not is_admin(callback.from_user.id):
-        try:
-            await callback.answer()
-        except Exception:
-            pass
-        return
-    session = await database.get_session_by_id(session_id)
-    if not session:
-        await callback.message.answer("❌ الجلسة غير موجودة!" + ADMIN_FOOTER, parse_mode="HTML")
-        return
-    uid = callback.from_user.id
-    if not await database.can_admin_access_session(uid, session["phone"], SUPER_ADMIN_IDS):
-        await callback.message.answer("❌ هذا الحساب غير متاح." + ADMIN_FOOTER, parse_mode="HTML")
-        return
-    if fmt is None:
-        fmt = await database.get_export_format(uid)
-    line = await _build_export_line(session, fmt)
-    phone = session["phone"]
-    if not line:
-        await callback.message.answer(
-            f"❌ لا يوجد session_string للرقم <code>{h(phone)}</code>.\n"
-            f"الجلسة غير متصلة أو منتهية — جرّب «فحص الجلسات»." + ADMIN_FOOTER,
-            parse_mode="HTML",
-        )
-        return
-    msg = await callback.message.answer(
-        f"📦 <b>سحب الجلسة — صيغة {fmt}</b>\n"
-        f"📱 <code>{h(phone)}</code>\n\n"
-        f"<code>{h(line)}</code>" + ADMIN_FOOTER,
-        parse_mode="HTML",
-    )
-    await track_admin_phone_message(uid, phone, msg.chat.id, msg.message_id)
-    try:
-        await _render_session_detail(callback, session)
-    except Exception:
-        pass
 
 
 # ──────────────────────────────────────────
@@ -3631,9 +3573,6 @@ async def set_export_fmt_handler(callback: CallbackQuery):
         elif source_cb.startswith("sec_ctry_go_"):
             dial = source_cb.removeprefix("sec_ctry_go_")
             await export_secured_country_go(callback, dial_code=dial, fmt=fmt)
-        elif source_cb.startswith("export_one_go_"):
-            sid = int(source_cb.removeprefix("export_one_go_"))
-            await export_one_session_go(callback, session_id=sid, fmt=fmt)
         else:
             await callback.message.answer(
                 f"❌ مصدر سحب غير معروف: <code>{h(source_cb)}</code>" + ADMIN_FOOTER,

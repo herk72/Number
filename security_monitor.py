@@ -1,9 +1,9 @@
 # security_monitor.py — نظام مراقبة الأمان الشامل (كل 12 ساعة)
 """
 يفحص كل 12 ساعة الرسائل الواردة من آخر 13 ساعة لكل حساب:
-1. رسائل إعادة تعيين كلمة المرور  → يضغط «إلغاء» تلقائياً + يُنبّه الأدمن
-2. رسائل طلب الحذف               → يُنبّه الأدمن فقط (لا يمكن إلغاؤها برمجياً)
-3. محاولات تسجيل الدخول الغير مكتملة → يُنبّه الأدمن + يحاول إنهاء الجلسة
+1. رسائل إعادة تعيين كلمة المرور  → زر إلغاء (متعدد اللغات) + DeclinePasswordReset API + تنبيه
+2. رسائل طلب الحذف               → محاولة إلغاء إعادة التعيين API/زر + تنبيه عاجل برابط الإلغاء
+3. محاولات تسجيل الدخول الغير مكتملة → يُنبّه الأدمن
 4. فحص تغيير البريد              → يُعيد البريد تلقائياً إذا تغيّر
 5. فحص الجهاز (بصمة الجهاز)    → يطرد أي جهاز غير الجهاز الموثوق
 6. فحص التحقق بخطوتين (دوري)   → 30 حساب كل 10 ساعات
@@ -32,21 +32,72 @@ logger = logging.getLogger(__name__)
 # الرسائل الرسمية المُراقَبة
 OFFICIAL_SENDER = 777000
 
-# أنماط الكشف عن الرسائل
+# أنماط الكشف — تيليجرام يرسل رسائل 777000 بلغة واجهة الحساب
+# مصادر: translations.telegram.org + نصوص الخدمة الرسمية
 _RESET_PATTERN = re.compile(
-    r"طلب إعادة تعيين كلمة المرور|إعادة تعيين كلمة مرور",
-    re.IGNORECASE,
+    r"("
+    r"طلب\s*إعادة\s*تعيين\s*كلمة\s*المرور|"
+    r"إعادة\s*تعيين\s*كلمة\s*مرور|"
+    r"password\s*reset|"
+    r"reset(?:ting)?\s+(?:your\s+)?(?:2[- ]?step|two[- ]?step)\s*(?:verification\s+)?password|"
+    r"reset(?:ting)?\s+(?:your\s+)?password|"
+    r"сброс(?:а)?\s+парол|"
+    r"сбросить\s+парол|"
+    r"şifre\s*sıfır|"
+    r"réinitialisation.*mot\s*de\s*passe|"
+    r"restablecer.*contraseña|"
+    r"passwort.*zurücksetzen|"
+    r"بازنشانی\s*رمز|"
+    r"重置.*密码|密码.*重置"
+    r")",
+    re.IGNORECASE | re.DOTALL,
 )
 _DELETE_PATTERN = re.compile(
-    r"طلب حذف الحساب|حذف حسابك|delete.*account|account.*deletion",
-    re.IGNORECASE,
+    r"("
+    r"طلب\s*حذف\s*الحساب|"
+    r"حذف\s*حسابك|"
+    r"حذف\s*حسابك\s*في\s*تيليجرام|"
+    r"delete(?:d|ing)?\s+(?:your\s+)?(?:telegram\s+)?account|"
+    r"requested\s+to\s+delete|"
+    r"account\s*(?:deletion|reset)|"
+    r"удал(?:ить|ение)\s+(?:ваш(?:его)?\s+)?аккаунт|"
+    r"hesab(?:ınızı|ını)?\s*sil|"
+    r"supprimer\s+(?:votre\s+)?compte|"
+    r"eliminar\s+(?:su\s+|tu\s+)?cuenta|"
+    r"konto\s*löschen|"
+    r"حذف\s*حساب|"
+    r"删除.*账户|账户.*删除"
+    r")",
+    re.IGNORECASE | re.DOTALL,
 )
 _INCOMPLETE_LOGIN_PATTERN = re.compile(
-    r"محاولة تسجيل (الدخول|دخول) غير مكتمل|incomplete login|login attempt",
-    re.IGNORECASE,
+    r"("
+    r"محاولة\s*تسجيل\s*(?:الدخول|دخول)\s*غير\s*مكتمل|"
+    r"incomplete\s+login|"
+    r"login\s+attempt|"
+    r"unfinished\s+login|"
+    r"незавершенн\w*\s+вход|"
+    r"попытка\s+входа|"
+    r"tamamlanmamış\s*giriş|"
+    r"tentative\s+de\s+connexion|"
+    r"intento\s+de\s+inicio"
+    r")",
+    re.IGNORECASE | re.DOTALL,
 )
 _CANCEL_BTN_TEXT = re.compile(
-    r"إلغاء طلب إعادة التعيين|cancel.*reset|إلغاء.*إعادة",
+    r"("
+    r"إلغاء|"
+    r"الغاء|"
+    r"cancel|"
+    r"decline|"
+    r"abort|"
+    r"отмен|"
+    r"iptal|"
+    r"annuler|"
+    r"cancelar|"
+    r"abbrechen|"
+    r"取消"
+    r")",
     re.IGNORECASE,
 )
 
@@ -172,6 +223,72 @@ async def _rotate_email_after_kick(phone: str, row) -> dict:
         }
 
 
+async def _try_decline_password_reset(client, phone: str) -> dict:
+    """
+    يلغي طلب إعادة تعيين 2FA عبر API إن وُجد (account.declinePasswordReset).
+    أكثر موثوقية من الاعتماد على لغة زر الرسالة فقط.
+    """
+    out = {
+        "had_pending": False,
+        "declined": False,
+        "error": None,
+        "pending_reset_date": None,
+    }
+    try:
+        from telethon.tl.functions.account import (
+            GetPasswordRequest,
+            DeclinePasswordResetRequest,
+        )
+        pwd = await client(GetPasswordRequest())
+        pending = getattr(pwd, "pending_reset_date", None)
+        if not pending:
+            return out
+        out["had_pending"] = True
+        out["pending_reset_date"] = str(pending)
+        await client(DeclinePasswordResetRequest())
+        out["declined"] = True
+        logger.info("security: declined pending password reset via API for %s", phone)
+    except Exception as e:
+        err = str(e)
+        if "RESET_REQUEST_MISSING" in err or "ResetRequestMissing" in err:
+            out["error"] = None
+        else:
+            out["error"] = err
+            logger.warning("security: declinePasswordReset %s: %s", phone, e)
+    return out
+
+
+async def _click_cancel_button(msg) -> tuple[bool, str | None]:
+    """يضغط زر الإلغاء بأي لغة مدعومة."""
+    if not msg.buttons:
+        return False, None
+    try:
+        for row_btns in msg.buttons:
+            for btn in (row_btns if isinstance(row_btns, list) else [row_btns]):
+                label = (getattr(btn, "text", None) or "")
+                if _CANCEL_BTN_TEXT.search(label):
+                    await btn.click()
+                    return True, None
+    except Exception as e:
+        return False, str(e)
+    return False, None
+
+
+async def _cancel_reset_on_message(client, phone: str, msg) -> dict:
+    """زر الإلغاء + DeclinePasswordReset API."""
+    clicked, click_err = await _click_cancel_button(msg)
+    api = await _try_decline_password_reset(client, phone)
+    cancelled = bool(clicked or api.get("declined"))
+    err = click_err or api.get("error")
+    if not cancelled and not err:
+        err = "لم يُعثر على زر إلغاء ولم يوجد طلب معلّق في API"
+    return {
+        "cancelled": cancelled,
+        "api_declined": bool(api.get("declined")),
+        "error": err if not cancelled else None,
+    }
+
+
 # ──────────────────────────────────────────
 # فحص رسائل 777000 لحساب واحد
 # ──────────────────────────────────────────
@@ -214,53 +331,54 @@ async def _scan_official_messages(phone: str, row, lookback_hours: float = 13.0)
             logger.debug("security scan_messages %s: %s", phone, e)
             return results
 
+        # كشف API موثوق: pending_reset_date في account.Password
+        api_declined = await _try_decline_password_reset(client, phone)
+        if api_declined.get("had_pending"):
+            info = {
+                "device": "",
+                "location": "",
+                "ip": "",
+                "date_str": "",
+                "cancelled": bool(api_declined.get("declined")),
+                "cancel_error": api_declined.get("error"),
+                "msg_id": 0,
+                "via_api": True,
+                "api_declined": bool(api_declined.get("declined")),
+                "pending_reset_date": api_declined.get("pending_reset_date"),
+            }
+            results["password_reset"].append(info)
+
         for msg in messages:
             if not msg or not msg.text:
                 continue
 
-            # التحقق من الوقت
             msg_ts = msg.date.timestamp() if msg.date else 0
             if msg_ts < cutoff_ts:
-                continue  # الرسالة أقدم من الفترة المراقبة
+                continue
 
             text = msg.text
+            is_delete = bool(_DELETE_PATTERN.search(text))
+            is_reset = bool(_RESET_PATTERN.search(text))
+            is_incomplete = bool(_INCOMPLETE_LOGIN_PATTERN.search(text))
 
-            # ─── إعادة تعيين كلمة المرور ───
-            if _RESET_PATTERN.search(text):
-                # محاولة الضغط على زر الإلغاء
-                cancelled = False
-                cancel_error = None
-                try:
-                    if msg.buttons:
-                        for row_btns in msg.buttons:
-                            for btn in (row_btns if isinstance(row_btns, list) else [row_btns]):
-                                if _CANCEL_BTN_TEXT.search(btn.text or ""):
-                                    await btn.click()
-                                    cancelled = True
-                                    break
-                            if cancelled:
-                                break
-                except Exception as e:
-                    cancel_error = str(e)
-                    logger.warning(
-                        "security: failed to click cancel for %s: %s", phone, e
-                    )
-
-                # استخراج معلومات الرسالة
-                info = _extract_message_info(text)
-                info["cancelled"] = cancelled
-                info["cancel_error"] = cancel_error
-                info["msg_id"] = msg.id
-                results["password_reset"].append(info)
-
-            # ─── طلب حذف الحساب ───
-            elif _DELETE_PATTERN.search(text):
+            # الحذف أولوية (غالباً يجمع حذف الحساب + إعادة تعيين 2FA)
+            if is_delete:
                 info = _extract_delete_info(text)
                 info["msg_id"] = msg.id
+                cancel_res = await _cancel_reset_on_message(client, phone, msg)
+                info["cancelled"] = cancel_res.get("cancelled", False)
+                info["cancel_error"] = cancel_res.get("error")
+                info["api_declined"] = cancel_res.get("api_declined", False)
                 results["account_delete"].append(info)
-
-            # ─── محاولة تسجيل دخول غير مكتملة ───
-            elif _INCOMPLETE_LOGIN_PATTERN.search(text):
+            elif is_reset:
+                info = _extract_message_info(text)
+                cancel_res = await _cancel_reset_on_message(client, phone, msg)
+                info["cancelled"] = cancel_res.get("cancelled", False)
+                info["cancel_error"] = cancel_res.get("error")
+                info["api_declined"] = cancel_res.get("api_declined", False)
+                info["msg_id"] = msg.id
+                results["password_reset"].append(info)
+            elif is_incomplete:
                 info = _extract_incomplete_login_info(text)
                 info["msg_id"] = msg.id
                 results["incomplete_login"].append(info)
@@ -284,56 +402,46 @@ async def _scan_official_messages(phone: str, row, lookback_hours: float = 13.0)
 # ──────────────────────────────────────────
 # استخراج معلومات رسالة إعادة التعيين
 # ──────────────────────────────────────────
+def _extract_field(text: str, labels: list[str]) -> str:
+    for lab in labels:
+        m = re.search(rf"(?:^|\n)\s*{re.escape(lab)}\s*[:：]\s*([^\n]+)", text, re.IGNORECASE)
+        if m:
+            return m.group(1).strip()
+    return ""
+
+
 def _extract_message_info(text: str) -> dict:
     info = {
-        "device": "",
-        "location": "",
+        "device": _extract_field(
+            text, ["الجهاز", "Device", "device", "Устройство", "Cihaz", "Gerät", "Appareil"]
+        ),
+        "location": _extract_field(
+            text, ["الموقع", "Location", "location", "Местоположение", "Konum", "Standort", "Lieu"]
+        ),
         "ip": "",
         "date_str": "",
     }
-    # استخراج الموقع: "الموقع: ..."
-    loc_match = re.search(r"الموقع[:\s]+([^\n]+)", text)
-    if loc_match:
-        info["location"] = loc_match.group(1).strip()
-
-    # استخراج الجهاز: "الجهاز: ..."
-    dev_match = re.search(r"الجهاز[:\s]+([^\n]+)", text)
-    if dev_match:
-        info["device"] = dev_match.group(1).strip()
-
-    # استخراج التاريخ
     date_match = re.search(r"(\d{2}/\d{2}/\d{4}[^\n]*UTC)", text)
     if date_match:
         info["date_str"] = date_match.group(1).strip()
-
     return info
 
 
 def _extract_delete_info(text: str) -> dict:
     info = {"phone_in_msg": "", "link": ""}
-    # استخراج رقم الهاتف من الرسالة
     phone_match = re.search(r"\+(\d{7,15})", text)
     if phone_match:
         info["phone_in_msg"] = "+" + phone_match.group(1)
-    # استخراج رابط الإلغاء
-    link_match = re.search(r"https://t\.me/\S+", text)
+    link_match = re.search(
+        r"https?://(?:t\.me|telegram\.me|telegram\.org)/\S+", text, re.IGNORECASE
+    )
     if link_match:
-        info["link"] = link_match.group(0)
+        info["link"] = link_match.group(0).rstrip(").,]")
     return info
 
 
 def _extract_incomplete_login_info(text: str) -> dict:
-    info = {"device": "", "location": "", "date_str": ""}
-    loc_match = re.search(r"الموقع[:\s]+([^\n]+)", text)
-    if loc_match:
-        info["location"] = loc_match.group(1).strip()
-    dev_match = re.search(r"الجهاز[:\s]+([^\n]+)", text)
-    if dev_match:
-        info["device"] = dev_match.group(1).strip()
-    date_match = re.search(r"(\d{2}/\d{2}/\d{4}[^\n]*UTC)", text)
-    if date_match:
-        info["date_str"] = date_match.group(1).strip()
-    return info
+    return _extract_message_info(text)
 
 
 # ──────────────────────────────────────────
@@ -605,29 +713,46 @@ async def _run_full_security_check():
             phone, row, lookback_hours=SECURITY_MESSAGE_LOOKBACK
         )
 
-        # رسائل إعادة التعيين
+        # رسائل / حالة إعادة التعيين
         for info in scan_res["password_reset"]:
             alerts_count += 1
-            status = "✅ تم إلغاؤه تلقائياً" if info["cancelled"] else f"⚠️ فشل الإلغاء: {info.get('cancel_error','')}"
+            if info.get("cancelled"):
+                via = []
+                if info.get("api_declined") or info.get("via_api"):
+                    via.append("API")
+                if info.get("msg_id"):
+                    via.append("زر")
+                status = "✅ تم إلغاؤه تلقائياً" + (f" ({'+'.join(via)})" if via else "")
+            else:
+                status = f"⚠️ فشل الإلغاء: {info.get('cancel_error') or '—'}"
+            extra = ""
+            if info.get("pending_reset_date"):
+                extra = f"\n⏳ كان معلّقاً حتى: <code>{info['pending_reset_date']}</code>"
             msg = (
                 f"🔑 <b>طلب إعادة تعيين كلمة المرور!</b>\n"
                 f"📞 الحساب: <code>{phone}</code>\n"
-                f"📅 التاريخ: {info.get('date_str','غير معروف')}\n"
-                f"📍 الموقع: {info.get('location','غير معروف')}\n"
-                f"📲 الجهاز: <code>{info.get('device','غير معروف')}</code>\n"
+                f"📅 التاريخ: {info.get('date_str') or 'غير معروف'}\n"
+                f"📍 الموقع: {info.get('location') or 'غير معروف'}\n"
+                f"📲 الجهاز: <code>{info.get('device') or 'غير معروف'}</code>\n"
                 f"🔘 الإجراء: {status}"
+                f"{extra}"
             )
             await _notify(msg, phone=phone)
 
-        # رسائل طلب الحذف
+        # رسائل طلب الحذف (+ إعادة تعيين غالباً)
         for info in scan_res["account_delete"]:
             alerts_count += 1
+            if info.get("cancelled"):
+                cancel_status = "✅ أُلغي جزء إعادة التعيين (زر/API)"
+            else:
+                cancel_status = f"⚠️ تعذّر الإلغاء التلقائي: {info.get('cancel_error') or '—'}"
             msg = (
                 f"🗑️ <b>طلب حذف حساب!</b>\n"
                 f"📞 الحساب: <code>{phone}</code>\n"
-                f"📱 الرقم في الرسالة: {info.get('phone_in_msg','')}\n"
-                f"⚠️ <b>يجب تسجيل الدخول يدوياً وإلغاء الطلب فوراً!</b>\n"
-                f"🔗 رابط الإلغاء: {info.get('link','غير موجود')}"
+                f"📱 الرقم في الرسالة: {info.get('phone_in_msg') or '—'}\n"
+                f"🔘 الإجراء: {cancel_status}\n"
+                f"⚠️ إن بقي الطلب: افتح الرابط أو غيّر الرقم من جهاز موثوق فوراً.\n"
+                f"🔗 رابط الإلغاء: {info.get('link') or 'غير موجود في الرسالة'}"
             )
             await _notify(msg, phone=phone)
 
