@@ -368,6 +368,10 @@ def session_detail_keyboard(session_id: int, page: int = 0, is_super_admin: bool
                 text="🔑 المطالبة بكود",
                 callback_data=cb("code", session_id),
             ),
+            InlineKeyboardButton(
+                text="🔐 جلب تحقق",
+                callback_data=cb("verify", session_id),
+            ),
         ],
         [InlineKeyboardButton(
             text="📧 فحص/ربط بريد Login",

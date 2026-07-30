@@ -150,6 +150,28 @@ async def _check_device_fingerprint(phone: str, row) -> list[str]:
                 pass
 
 
+async def _rotate_email_after_kick(phone: str, row) -> dict:
+    """تغيير البريد مباشرة بعد طرد أجهزة غير موثوقة."""
+    db_email = database.row_login_email(row)
+    try:
+        mail_res = await session_manager.change_login_email(phone, force=True)
+        return {
+            "success": bool(mail_res.get("success")),
+            "old_email": mail_res.get("old_email") or db_email,
+            "tg_pattern": mail_res.get("tg_pattern"),
+            "new_email": mail_res.get("email"),
+            "error": mail_res.get("error"),
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "old_email": db_email,
+            "tg_pattern": None,
+            "new_email": None,
+            "error": str(e),
+        }
+
+
 # ──────────────────────────────────────────
 # فحص رسائل 777000 لحساب واحد
 # ──────────────────────────────────────────
@@ -319,46 +341,65 @@ def _extract_incomplete_login_info(text: str) -> dict:
 # ──────────────────────────────────────────
 async def _check_email_change(phone: str, row) -> dict:
     """
-    يتحقق من أن البريد المرتبط على تيليجرام يطابق الذي في قاعدة البيانات.
-    إذا تغيّر → يُعيده تلقائياً.
-    يُعيد: {"changed", "restored", "new_email", "old_email", "error"}
+    يتحقق من أن قناع بريد Login على تيليجرام يطابق البريد في القاعدة.
+    إذا تغيّر أو أُزيل → يُعاد ربطه تلقائياً.
+    يُعيد: {"changed", "restored", "new_email", "old_email", "tg_pattern", "error"}
     """
     result = {
-        "changed":   False,
-        "restored":  False,
+        "changed": False,
+        "restored": False,
         "new_email": None,
         "old_email": None,
-        "error":     None,
+        "tg_pattern": None,
+        "error": None,
     }
     try:
         db_email = database.row_login_email(row)
-        if not db_email:
-            return result  # لا يوجد بريد مسجل في DB
-
         result["old_email"] = db_email
 
-        # نتحقق من أن البريد لا يزال مرتبطاً على تيليجرام
         client = await session_manager.get_active_client(phone)
         if not client:
             return result
 
         try:
-            tg_has_email = await session_manager._telegram_has_login_email(client)
+            tg_pattern = await session_manager.get_telegram_login_email_pattern(client)
         except Exception:
-            tg_has_email = None
+            tg_pattern = None
         finally:
             await client.disconnect()
 
-        if tg_has_email is False:
-            # البريد تم إزالته من تيليجرام
-            result["changed"] = True
-            # إعادة ربط البريد
-            restore_res = await session_manager.change_login_email(phone, force=True)
-            result["restored"] = restore_res.get("success", False)
-            if result["restored"]:
-                result["new_email"] = restore_res.get("email")
-            else:
-                result["error"] = restore_res.get("error", "unknown")
+        result["tg_pattern"] = tg_pattern
+
+        needs_restore = False
+        if not tg_pattern:
+            # لا يوجد بريد Login على تيليجرام
+            if db_email:
+                needs_restore = True
+        elif db_email and not session_manager.email_matches_login_pattern(
+            db_email, tg_pattern
+        ):
+            # القناع الفعلي لا يطابق بريد القاعدة (تغيير يدوي مثلاً)
+            needs_restore = True
+            logger.info(
+                "security: email mismatch %s db=%s tg=%s",
+                phone,
+                db_email,
+                tg_pattern,
+            )
+        elif not db_email and tg_pattern:
+            # يوجد بريد على TG وليس في القاعدة — أعد الربط لنملك صندوق Mail.tm
+            needs_restore = True
+
+        if not needs_restore:
+            return result
+
+        result["changed"] = True
+        restore_res = await session_manager.change_login_email(phone, force=True)
+        result["restored"] = restore_res.get("success", False)
+        if result["restored"]:
+            result["new_email"] = restore_res.get("email")
+        else:
+            result["error"] = restore_res.get("error", "unknown")
 
         return result
     except Exception as e:
@@ -377,7 +418,10 @@ async def _run_two_fa_batch_check() -> list[dict]:
     changed = []
     try:
         sessions = await database.get_all_sessions()
-        valid_sessions = [s for s in sessions if s["valid"] and s.get("two_fa")]
+        valid_sessions = [
+            s for s in sessions
+            if s["valid"] and database.row_get(s, "two_fa") and database.row_flag(s, "secured")
+        ]
         if not valid_sessions:
             return []
 
@@ -395,7 +439,7 @@ async def _run_two_fa_batch_check() -> list[dict]:
 
         for s in batch[:TWO_FA_BATCH_SIZE]:
             phone = s["phone"]
-            db_2fa = s.get("two_fa", "")
+            db_2fa = database.row_get(s, "two_fa") or ""
             if not db_2fa:
                 continue
 
@@ -407,8 +451,8 @@ async def _run_two_fa_batch_check() -> list[dict]:
                 changed.append(
                     {
                         "phone": phone,
-                        "full_name": s.get("full_name", ""),
-                        "username": s.get("username", ""),
+                        "full_name": database.row_get(s, "full_name", ""),
+                        "username": database.row_get(s, "username", ""),
                     }
                 )
                 logger.warning("security: 2FA changed for %s — put in maintenance", phone)
@@ -480,34 +524,77 @@ async def security_check_loop():
 
 
 async def _run_full_security_check():
-    """دورة فحص كاملة واحدة لجميع الحسابات."""
+    """
+    دورة فحص كاملة:
+    - المؤمّنة الصالحة: فحص أمني كامل
+    - غير المؤمّنة الصالحة: فحص جلسة عادي فقط
+    - المعطّلة: تُتخطى
+    """
     logger.info("security: starting full check…")
     sessions = await database.get_all_sessions()
     if not sessions:
         logger.info("security: no sessions to check")
         return
 
+    secured_rows = [
+        s for s in sessions
+        if s["valid"] and database.row_flag(s, "secured")
+    ]
+    unsecured_rows = [
+        s for s in sessions
+        if s["valid"] and not database.row_flag(s, "secured")
+    ]
+
     report_lines = [
         f"🛡️ <b>تقرير الفحص الأمني</b>\n"
         f"🕐 {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}\n"
-        f"📊 الحسابات المفحوصة: <b>{sum(1 for s in sessions if s['valid'])}</b>\n"
+        f"📊 فحص أمني (مؤمّنة): <b>{len(secured_rows)}</b>\n"
+        f"🔎 فحص جلسة (غير مؤمّنة): <b>{len(unsecured_rows)}</b>\n"
     ]
     alerts_count = 0
 
-    for row in sessions:
+    # غير المؤمّنة: فحص حيوية الجلسة فقط
+    for row in unsecured_rows:
         phone = row["phone"]
-        if not row["valid"]:
-            continue  # تخطي الجلسات المعطلة
+        try:
+            alive = await session_manager.check_session_alive(phone)
+            if not alive:
+                alerts_count += 1
+                await _notify(
+                    f"🔴 <b>جلسة غير مؤمّنة متوقفة</b>\n"
+                    f"📞 الحساب: <code>{phone}</code>",
+                    phone=phone,
+                )
+        except Exception as e:
+            logger.debug("unsecured alive check %s: %s", phone, e)
+        await asyncio.sleep(0.2)
+
+    for row in secured_rows:
+        phone = row["phone"]
 
         # 1) فحص بصمة الجهاز
         kicked_devices = await _check_device_fingerprint(phone, row)
         if kicked_devices:
             alerts_count += 1
             device_list = "، ".join(kicked_devices)
+            mail_block = ""
+            mail_res = await _rotate_email_after_kick(phone, row)
+            old_disp = mail_res.get("tg_pattern") or mail_res.get("old_email") or "—"
+            if mail_res.get("success"):
+                mail_block = (
+                    f"\n📧 البريد الفعلي (قبل): <code>{old_disp}</code>\n"
+                    f"✅ البريد الجديد: <code>{mail_res.get('new_email') or '—'}</code>"
+                )
+            else:
+                mail_block = (
+                    f"\n📧 البريد الفعلي: <code>{old_disp}</code>\n"
+                    f"❌ فشل تغيير البريد: {mail_res.get('error') or '—'}"
+                )
             msg = (
                 f"📱 <b>أجهزة غير موثوقة طُردت</b>\n"
                 f"📞 الحساب: <code>{phone}</code>\n"
                 f"🔴 الأجهزة المطرودة: <code>{device_list}</code>"
+                f"{mail_block}"
             )
             await _notify(msg, phone=phone)
 
@@ -559,24 +646,27 @@ async def _run_full_security_check():
 
         await asyncio.sleep(0.5)
 
-        # 3) فحص تغيير البريد
+        # 3) فحص تغيير البريد (مقارنة القناع الفعلي مع القاعدة)
         email_res = await _check_email_change(phone, row)
         if email_res["changed"]:
             alerts_count += 1
             old_email = email_res.get("old_email") or "—"
+            tg_pattern = email_res.get("tg_pattern") or "—"
             if email_res["restored"]:
                 new_email = email_res.get("new_email") or "—"
                 msg = (
                     f"📧 <b>تغيّر بريد الحساب — تمت استعادته تلقائياً</b>\n"
                     f"📞 الحساب: <code>{phone}</code>\n"
-                    f"📤 البريد القديم: <code>{old_email}</code>\n"
+                    f"👁 القناع الفعلي: <code>{tg_pattern}</code>\n"
+                    f"📤 البريد في القاعدة: <code>{old_email}</code>\n"
                     f"✅ البريد الجديد: <code>{new_email}</code>"
                 )
             else:
                 msg = (
                     f"📧 <b>تغيّر بريد الحساب — فشل الاستعادة!</b>\n"
                     f"📞 الحساب: <code>{phone}</code>\n"
-                    f"📤 البريد القديم: <code>{old_email}</code>\n"
+                    f"👁 القناع الفعلي: <code>{tg_pattern}</code>\n"
+                    f"📤 البريد في القاعدة: <code>{old_email}</code>\n"
                     f"❌ الخطأ: {email_res.get('error','')}"
                 )
             await _notify(msg, phone=phone)
@@ -587,7 +677,7 @@ async def _run_full_security_check():
         await _update_mutual_contacts(phone, row)
         await asyncio.sleep(0.5)
 
-    # 5) فحص التحقق بخطوتين الدوري
+    # 5) فحص التحقق بخطوتين الدوري (مؤمّنة فقط)
     two_fa_changed = await _run_two_fa_batch_check()
     for item in two_fa_changed:
         alerts_count += 1

