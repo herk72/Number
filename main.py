@@ -1914,16 +1914,20 @@ async def export_secured_country_handler(callback: CallbackQuery):
     await callback.answer()
 
 
-async def export_secured_country_go(callback: CallbackQuery):
+async def export_secured_country_go(callback: CallbackQuery, dial_code: str | None = None):
     """تصدير الجلسات المؤمنة لدولة محددة بعد اختيار الصيغة."""
     if not is_admin(callback.from_user.id):
-        await callback.answer()
+        try:
+            await callback.answer()
+        except Exception:
+            pass
         return
 
     from phone_countries import phone_to_country
 
-    raw = callback.data or ""
-    dial_code = raw.removeprefix("sec_ctry_go_")
+    if not dial_code:
+        raw = callback.data or ""
+        dial_code = raw.removeprefix("sec_ctry_go_").removeprefix("sec_ctry_")
     uid = callback.from_user.id
     all_s = await _sessions_for_admin(uid)
     is_sa = is_super_admin(uid)
@@ -1938,7 +1942,7 @@ async def export_secured_country_go(callback: CallbackQuery):
     ]
 
     if not sessions:
-        await callback.answer("❌ لا توجد جلسات لهذه الدولة.", show_alert=True)
+        await callback.message.answer("❌ لا توجد جلسات لهذه الدولة." + ADMIN_FOOTER, parse_mode="HTML")
         return
 
     _, flag, country_name = phone_to_country(sessions[0]["phone"])
@@ -1992,15 +1996,18 @@ async def export_secured_valid_two_fa_prompt(callback: CallbackQuery):
 
 async def export_secured_valid_two_fa_go(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
-        await callback.answer()
+        try:
+            await callback.answer()
+        except Exception:
+            pass
         return
     uid = callback.from_user.id
     sessions = await database.get_secured_sessions_valid_two_fa(uid, SUPER_ADMIN_IDS)
     if not sessions:
-        await callback.answer(
+        await callback.message.answer(
             "❌ لا توجد جلسات مؤمنة بتحقق شغال.\n"
-            "قم بفحص التحقق أولاً من زر «فحص صحة التحقق».",
-            show_alert=True,
+            "قم بفحص التحقق أولاً من زر «فحص صحة التحقق»." + ADMIN_FOOTER,
+            parse_mode="HTML",
         )
         return
 
@@ -3523,39 +3530,59 @@ async def export_fmt_choose_handler(callback: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("set_efmt_"))
 async def set_export_fmt_handler(callback: CallbackQuery):
-    """يحفظ الصيغة المختارة ثم يُنفّذ السحب."""
+    """يحفظ الصيغة المختارة ثم يُنفّذ السحب فوراً."""
     if not is_admin(callback.from_user.id):
         await callback.answer()
         return
     uid = callback.from_user.id
-    # بيانات: set_efmt_<fmt>_<source_cb>
-    rest = callback.data.removeprefix("set_efmt_")
+    rest = (callback.data or "").removeprefix("set_efmt_")
     parts = rest.split("_", 1)
     if len(parts) != 2:
-        await callback.answer("❌ خطأ في البيانات")
+        await callback.answer("❌ خطأ في البيانات", show_alert=True)
         return
     fmt_str, source_cb = parts
     try:
         fmt = int(fmt_str)
     except ValueError:
-        await callback.answer("❌ صيغة غير صالحة")
+        await callback.answer("❌ صيغة غير صالحة", show_alert=True)
         return
+    if fmt not in (1, 2, 3):
+        await callback.answer("❌ صيغة غير مدعومة", show_alert=True)
+        return
+
     await database.set_export_format(uid, fmt)
-    await callback.answer(f"✅ تم حفظ الصيغة {fmt}", show_alert=False)
-    # إعادة توجيه للسحب الفعلي
-    callback.data = source_cb
-    if source_cb == "export_all_txt_go":
-        await export_all_sessions_txt_go(callback)
-    elif source_cb == "export_secured_txt_go":
-        await export_secured_sessions_txt_go(callback)
-    elif source_cb == "export_star_txt_go":
-        await export_star_sessions_txt_go(callback)
-    elif source_cb == "export_secured_valid_two_fa_go":
-        await export_secured_valid_two_fa_go(callback)
-    elif source_cb.startswith("sec_ctry_go_"):
-        await export_secured_country_go(callback)
-    else:
-        await callback.answer("❌ مصدر سحب غير معروف", show_alert=True)
+    # لا نعدّل callback.data (مجمّد في aiogram 3) — نمرّر المصدر مباشرة
+    try:
+        await callback.answer(f"⏳ جاري السحب بالصيغة {fmt}...")
+    except Exception:
+        pass
+
+    try:
+        if source_cb == "export_all_txt_go":
+            await export_all_sessions_txt_go(callback)
+        elif source_cb == "export_secured_txt_go":
+            await export_secured_sessions_txt_go(callback)
+        elif source_cb == "export_star_txt_go":
+            await export_star_sessions_txt_go(callback)
+        elif source_cb == "export_secured_valid_two_fa_go":
+            await export_secured_valid_two_fa_go(callback)
+        elif source_cb.startswith("sec_ctry_go_"):
+            dial = source_cb.removeprefix("sec_ctry_go_")
+            await export_secured_country_go(callback, dial_code=dial)
+        else:
+            await callback.message.answer(
+                f"❌ مصدر سحب غير معروف: <code>{h(source_cb)}</code>" + ADMIN_FOOTER,
+                parse_mode="HTML",
+            )
+    except Exception as e:
+        logging.exception("export after set_efmt %s/%s: %s", fmt, source_cb, e)
+        try:
+            await callback.message.answer(
+                f"❌ فشل السحب (صيغة {fmt}): <code>{h(str(e))}</code>" + ADMIN_FOOTER,
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
 
 
 async def _build_export_line(s, fmt: int) -> str | None:
@@ -3599,7 +3626,7 @@ async def export_all_sessions_txt_go(callback: CallbackQuery):
     uid = callback.from_user.id
     sessions = await _sessions_for_admin(uid)
     if not sessions:
-        await callback.answer("❌ لا توجد جلسات.", show_alert=True)
+        await callback.message.answer("❌ لا توجد جلسات." + ADMIN_FOOTER, parse_mode="HTML")
         return
     fmt = await database.get_export_format(uid)
     await callback.message.edit_text(f"⏳ جاري تجهيز ملف الجلسات (صيغة {fmt})...", parse_mode="HTML")
@@ -3643,7 +3670,7 @@ async def export_secured_sessions_txt_go(callback: CallbackQuery):
     is_sa = is_super_admin(uid)
     sessions = [s for s in all_sessions if database.row_flag(s, "secured") and (is_sa or not database.row_flag(s, "a1_only"))]
     if not sessions:
-        await callback.answer("❌ لا توجد جلسات مؤمّنة.", show_alert=True)
+        await callback.message.answer("❌ لا توجد جلسات مؤمّنة." + ADMIN_FOOTER, parse_mode="HTML")
         return
     fmt = await database.get_export_format(uid)
     await callback.message.edit_text(f"⏳ جاري تجهيز ملف المؤمّنة (صيغة {fmt})...", parse_mode="HTML")
@@ -3680,7 +3707,7 @@ async def export_star_sessions_txt_prompt(callback: CallbackQuery):
 async def export_star_sessions_txt_go(callback: CallbackQuery):
     sessions = await database.get_a1_only_sessions()
     if not sessions:
-        await callback.answer("❌ لا توجد جلسات ⭐.", show_alert=True)
+        await callback.message.answer("❌ لا توجد جلسات ⭐." + ADMIN_FOOTER, parse_mode="HTML")
         return
     uid = callback.from_user.id
     fmt = await database.get_export_format(uid)
